@@ -2,10 +2,6 @@
 //
 #include "resource.h"
 
-// Application manifest — enables Visual Styles (comctl32 v6)
-// and proper DPI awareness. Required for SetWindowTheme to work.
-CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "Nintendulator.manifest"
-
 #define APSTUDIO_READONLY_SYMBOLS
 /////////////////////////////////////////////////////////////////////////////
 //

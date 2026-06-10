@@ -74,6 +74,51 @@ INT_PTR CALLBACK DebugWnd(HWND, UINT, WPARAM, LPARAM);
 TCHAR TitlebarBuffer[256];
 int TitlebarDelay;
 
+// Theme subclass for the main window WndProc to handle dark mode colors
+static LRESULT CALLBACK ThemeMainSubclass(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+{
+        if (Theme::IsDark())
+        {
+                switch (uMsg)
+                {
+                case WM_ERASEBKGND:
+                {
+                        HDC hdc = (HDC)wParam;
+                        RECT rc;
+                        GetClientRect(hWnd, &rc);
+                        FillRect(hdc, &rc, Theme::GetBackgroundBrush());
+                        return TRUE;
+                }
+                case WM_CTLCOLORDLG:
+                case WM_CTLCOLORSTATIC:
+                {
+                        HDC hdc = (HDC)wParam;
+                        SetTextColor(hdc, Theme::GetTextColor());
+                        SetBkColor(hdc, Theme::GetBgColor());
+                        SetBkMode(hdc, TRANSPARENT);
+                        return (LRESULT)Theme::GetBackgroundBrush();
+                }
+                case WM_CTLCOLORBTN:
+                {
+                        HDC hdc = (HDC)wParam;
+                        SetTextColor(hdc, Theme::GetTextColor());
+                        SetBkColor(hdc, Theme::GetBgColor());
+                        SetBkMode(hdc, TRANSPARENT);
+                        return (LRESULT)Theme::GetBackgroundBrush();
+                }
+                case WM_CTLCOLOREDIT:
+                case WM_CTLCOLORLISTBOX:
+                {
+                        HDC hdc = (HDC)wParam;
+                        SetTextColor(hdc, Theme::GetControlTextColor());
+                        SetBkColor(hdc, Theme::GetControlBgColor());
+                        return (LRESULT)Theme::GetControlBrush();
+                }
+                }
+        }
+        return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
 void BuildLanguageMenu(HMENU hMainMenu)
 {
         int cnt = GetMenuItemCount(hMainMenu);
@@ -157,7 +202,6 @@ int APIENTRY _tWinMain (HINSTANCE hInstance, HINSTANCE hPrevInstance, LPTSTR lpC
 
         // Apply the loaded theme to main window and debug dialog
         Theme::ApplyToMainWindow(hMainWnd);
-        Theme::RebuildOwnerDrawMenu(GetMenu(hMainWnd));
         if (hDebug)
                 Theme::ApplyToDialog(hDebug);
 
@@ -300,6 +344,9 @@ BOOL InitInstance (HINSTANCE hInstance, int nCmdShow)
         // Defer ShowWindow until after all initialization (Lang, menu updates)
         // to prevent window flickering on startup
         DragAcceptFiles(hMainWnd, TRUE);
+
+        // Apply theme subclass to main window for dark mode support
+        SetWindowSubclass(hMainWnd, ThemeMainSubclass, 0, 0);
 
         hDebug = CreateDialog(hInst, MAKEINTRESOURCE(IDD_DEBUG), hMainWnd, DebugWnd);
 
@@ -787,7 +834,6 @@ case ID_SOUND_ENABLED:
                                         // Lang::UpdateMenu also resets MF_GRAYED — restore menu states
                                         NES::SyncMenuStates();
                                         BuildLanguageMenu(hM);
-                                        Theme::RebuildOwnerDrawMenu(hM);
                                         // Update controller mappings after language change
                                         Controllers::StdPort_SetMappings();
                                         Controllers::ExpPort_SetMappings();
@@ -880,100 +926,7 @@ case WM_CLOSE:
                 // disallow screen saver while emulating (doesn't work if password protected)
                 if (running && (((wParam & 0xFFF0) == SC_SCREENSAVE) || ((wParam & 0xFFF0) == SC_MONITORPOWER)))
                         return 0;
-                return DefWindowProc(hWnd, message, wParam, lParam);
-        case WM_MEASUREITEM:
-        {
-                MEASUREITEMSTRUCT* pMIS = (MEASUREITEMSTRUCT*)lParam;
-                if (pMIS && pMIS->CtlType == ODT_MENU)
-                {
-                        Theme::HandleMeasureItem(hWnd, pMIS);
-                        return TRUE;
-                }
-                return DefWindowProc(hWnd, message, wParam, lParam);
-        }
-        case WM_DRAWITEM:
-        {
-                DRAWITEMSTRUCT* pDIS = (DRAWITEMSTRUCT*)lParam;
-                if (pDIS && pDIS->CtlType == ODT_MENU)
-                {
-                        Theme::HandleDrawItem(hWnd, pDIS);
-                        return TRUE;
-                }
-                return DefWindowProc(hWnd, message, wParam, lParam);
-        }
-        case WM_CTLCOLORDLG:
-        case WM_CTLCOLORSTATIC:
-                if (Theme::IsDark())
-                {
-                        HDC hdc = (HDC)wParam;
-                        SetTextColor(hdc, Theme::GetTextColor());
-                        SetBkColor(hdc, Theme::GetBgColor());
-                        SetBkMode(hdc, TRANSPARENT);
-                        return (LRESULT)Theme::GetBackgroundBrush();
-                }
-                return DefWindowProc(hWnd, message, wParam, lParam);
-        case WM_CTLCOLORBTN:
-                if (Theme::IsDark())
-                {
-                        HDC hdc = (HDC)wParam;
-                        SetTextColor(hdc, Theme::GetTextColor());
-                        SetBkColor(hdc, Theme::GetBgColor());
-                        SetBkMode(hdc, TRANSPARENT);
-                        return (LRESULT)Theme::GetBackgroundBrush();
-                }
-                return DefWindowProc(hWnd, message, wParam, lParam);
-        case WM_CTLCOLOREDIT:
-        case WM_CTLCOLORLISTBOX:
-                if (Theme::IsDark())
-                {
-                        HDC hdc = (HDC)wParam;
-                        SetTextColor(hdc, Theme::GetControlTextColor());
-                        SetBkColor(hdc, Theme::GetControlBgColor());
-                        return (LRESULT)Theme::GetControlBrush();
-                }
-                return DefWindowProc(hWnd, message, wParam, lParam);
-        case WM_ERASEBKGND:
-                if (Theme::IsDark())
-                {
-                        HDC hdc = (HDC)wParam;
-                        RECT rc;
-                        GetClientRect(hWnd, &rc);
-                        FillRect(hdc, &rc, Theme::GetBackgroundBrush());
-                        return TRUE;
-                }
-                return DefWindowProc(hWnd, message, wParam, lParam);
-        case WM_NCPAINT:
-        {
-                // Сначала даём системе нарисовать рамку и заголовок
-                DefWindowProc(hWnd, message, wParam, lParam);
-                if (Theme::IsDark())
-                {
-                        // Закрашиваем незанятую часть menu bar
-                        HDC dc = GetWindowDC(hWnd);
-                        if (dc)
-                        {
-                                RECT wr, cr;
-                                GetWindowRect(hWnd, &wr);
-                                GetClientRect(hWnd, &cr);
-                                // Смещение клиентской области
-                                POINT pt = {0, 0};
-                                ClientToScreen(hWnd, &pt);
-                                int frameX  = pt.x - wr.left;
-                                int frameTop = pt.y - wr.top;
-                                int menuH = GetSystemMetrics(SM_CYMENU);
-                                // Прямоугольник menu bar в оконных координатах
-                                RECT rcMenu = {
-                                        frameX,
-                                        frameTop - menuH,
-                                        wr.right - wr.left - frameX,
-                                        frameTop
-                                };
-                                FillRect(dc, &rcMenu, Theme::GetBackgroundBrush());
-                                ReleaseDC(hWnd, dc);
-                        }
-                }
-                return 0;
-        }
+                // else fall through
         default:
                 return DefWindowProc(hWnd, message, wParam, lParam);
                 break;
