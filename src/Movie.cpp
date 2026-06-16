@@ -125,7 +125,16 @@ INT_PTR CALLBACK        MoviePlayProc (HWND hDlg, UINT uMsg, WPARAM wParam, LPAR
                         ofn.lpTemplateName = NULL;
 
                         if (!GetOpenFileName(&ofn))
+                        {
+                                // Re-apply theme - GetOpenFileName can reset dark mode state
+                                if (Theme::IsDark())
+                                        Theme::Reapply();
                                 break;
+                        }
+
+                        // Re-apply theme - GetOpenFileName can reset dark mode state
+                        if (Theme::IsDark())
+                                Theme::Reapply();
 
                         _tcscpy(Path_NMV, filename);
                         Path_NMV[ofn.nFileOffset-1] = 0;

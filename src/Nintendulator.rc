@@ -60,6 +60,12 @@ IDI_NINTENDULATOR       ICON                    "Nintendulator.ICO"
 
 IDI_SMALL               ICON                    "SMALL.ICO"
 
+/////////////////////////////////////////////////////////////////////////////
+//
+// Manifest - enables Common Controls v6 for proper dark mode API support
+//
+1 RT_MANIFEST "Nintendulator.manifest"
+
 
 /////////////////////////////////////////////////////////////////////////////
 //

@@ -2324,6 +2324,9 @@ INT_PTR CALLBACK        PaletteConfigProc (HWND hDlg, UINT uMsg, WPARAM wParam, 
                                 }
                                 else    MessageBox(hDlg, Lang::GetString(LANG_ERR_GFX_INVALID_PALETTE), Lang::GetString(LANG_DLG_NINTENDULATOR), MB_OK | MB_ICONERROR);
                         }
+                        // Re-apply theme - GetOpenFileName can reset dark mode state
+                        if (Theme::IsDark())
+                                Theme::Reapply();
                         return TRUE;
                 }
                 case IDC_PAL_ER:
