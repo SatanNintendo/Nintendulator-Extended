@@ -57,7 +57,7 @@ static const double     drc_max_adjust  = 0.05;
 // === MOVED HERE ===
 #define FREQ            44100
 #define BITS            16
-#define FRAMEBUF        2
+#define FRAMEBUF        4
 const unsigned int      LOCK_SIZE = FREQ * (BITS / 8);
 
 static DWORD            drc_play_freq   = FREQ;  // now it's fine
