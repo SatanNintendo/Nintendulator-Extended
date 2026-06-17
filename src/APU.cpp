@@ -20,6 +20,7 @@
 # include "Controllers.h"
 # include "Lang.h"
 # include "Theme.h"
+# include "GFX.h"
 
 # pragma comment(lib, "dsound.lib")
 # pragma comment(lib, "dxguid.lib")
@@ -1541,6 +1542,9 @@ void    UpdateDRC (void)
         if (!Buffer || !isEnabled)
                 return;
 
+        // Сглаженная ошибка (Шаг 6)
+        static double avgError = 0.0;
+
         // Get current buffer positions
         unsigned long rpos, wpos;
         if (FAILED(Buffer->GetCurrentPosition(&rpos, &wpos)))
@@ -1566,16 +1570,31 @@ void    UpdateDRC (void)
         // negative = buffer too empty → slow down
         double error = fillRatio - drc_target_fill;
 
-        // Smooth correction: coefficient 0.1 means we eliminate 10% of the error
-        // per call. At 10% deviation, frequency changes by 1% of 44100.
-        double adjustment = error * 0.1;
+        // Шаг 6: сглаженная ошибка
+        avgError =
+                avgError * 0.97 +
+                error * 0.03;
 
-        // Limit maximum deviation to ±5%
-        if (adjustment >  drc_max_adjust) adjustment =  drc_max_adjust;
-        if (adjustment < -drc_max_adjust) adjustment = -drc_max_adjust;
+        // Шаг 7: gain уменьшен с 0.1 до 0.03
+        double adjustment = avgError * 0.03;
+
+        // Шаг 9: мягкая поправка по реальной частоте кадров
+        // (GFX::WantFPS - GFX::RealFPS): если эмулятор отстаёт (RealFPS < WantFPS),
+        // надо чуть ускорить аудио, чтобы оно не накапливало отрыв.
+        double fpsError =
+                GFX::WantFPS -
+                GFX::RealFPS;
+        adjustment +=
+                fpsError *
+                (FREQ * 0.0005);
+
+        // Шаг 8: ограничение изменения частоты ±0.15% (±66 Гц для 44100)
+        double maxAdjust = FREQ * 0.0015;
+        if (adjustment >  maxAdjust) adjustment =  maxAdjust;
+        if (adjustment < -maxAdjust) adjustment = -maxAdjust;
 
         // Calculate new playback frequency
-        DWORD newFreq = (DWORD)((double)FREQ * (1.0 + adjustment) + 0.5);
+        DWORD newFreq = (DWORD)((double)FREQ + adjustment + 0.5);
 
         // Hard limits as a safety measure (±5% of 44100)
         if (newFreq < 39690) newFreq = 39690;

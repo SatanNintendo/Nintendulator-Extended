@@ -50,10 +50,11 @@ BOOL AlwaysOnTop, ExclusiveFullscreen;
 
 LARGE_INTEGER ClockFreq;
 LARGE_INTEGER LastClockVal;
+LARGE_INTEGER FrameStatLast = {0};
+double AvgFrameTime = 0.0;
+double RealFPS = 0.0;
 int FPSnum, FPSCnt, FSkip;
 BOOL aFSkip;
-
-LARGE_INTEGER TargetClockVal;
 
 int Pitch;
 int WantFPS;
@@ -402,7 +403,9 @@ void    Init (void)
         Depth = 0;
         ClockFreq.QuadPart = 0;
         LastClockVal.QuadPart = 0;
-        TargetClockVal.QuadPart = 0;
+        FrameStatLast.QuadPart = 0;
+        AvgFrameTime = 0.0;
+        RealFPS = 0.0;
         DefaultPalette[NES::REGION_NONE] = Palette[NES::REGION_NONE] = PALETTE_NTSC; // just in case
         DefaultPalette[NES::REGION_NTSC] = Palette[NES::REGION_NTSC] = PALETTE_NTSC;
         DefaultPalette[NES::REGION_PAL] = Palette[NES::REGION_PAL] = PALETTE_PAL;
@@ -521,8 +524,10 @@ void    SyncMenuChecks (void)
 
 void    Start (void)
 {
-        // Сброс frame pacing-таймера при старте/рестарте эмуляции (по рекомендации Клода)
-        TargetClockVal.QuadPart = 0;
+        // Сброс статистики времени кадров при старте/рестарте эмуляции
+        FrameStatLast.QuadPart = 0;
+        AvgFrameTime = 0.0;
+        RealFPS = 0.0;
 
         if (UseOpenGL())
         {
@@ -1040,35 +1045,6 @@ void    LoadSettings (HKEY SettingsBase)
 int TitleDelay = 0;
 void    DrawScreen (void)
 {
-        // --- Frame pacing: ждём точного момента следующего кадра ---
-        if (MatchMonitorRate && ClockFreq.QuadPart > 0)
-        {
-                LARGE_INTEGER now;
-                if (TargetClockVal.QuadPart == 0)
-                        QueryPerformanceCounter(&TargetClockVal);
-
-                // Шаг = 1 / WantFPS секунды в тиках QPC
-                LONGLONG frameStep = ClockFreq.QuadPart / WantFPS;
-
-                // Ждём — сначала Sleep пока > 2 мс до цели, потом spin
-                for (;;)
-                {
-                        QueryPerformanceCounter(&now);
-                        LONGLONG remaining = TargetClockVal.QuadPart - now.QuadPart;
-                        if (remaining <= 0)
-                                break;
-                        if (remaining > ClockFreq.QuadPart / 500)  // > 2 мс
-                                Sleep(1);
-                        // иначе spin (busy-wait последние ~2 мс)
-                }
-                TargetClockVal.QuadPart += frameStep;
-                // Защита от накопленного отставания (если эмулятор завис)
-                QueryPerformanceCounter(&now);
-                if (TargetClockVal.QuadPart < now.QuadPart - frameStep * 2)
-                        TargetClockVal = now;
-        }
-        // --- конец frame pacing ---
-
         LARGE_INTEGER TmpClockVal;
         if (AVI::IsActive())
                 AVI::AddVideo();
@@ -1082,7 +1058,6 @@ void    DrawScreen (void)
         QueryPerformanceCounter(&TmpClockVal);
         aFPSnum += TmpClockVal.QuadPart - LastClockVal.QuadPart;
         LastClockVal = TmpClockVal;
-        // DRC интервал уменьшен с 20 до 5 кадров (по рекомендации Клода, Fix 3)
         if (++aFPScnt >= 5)
         {
                 FPSnum = (int)((ClockFreq.QuadPart * aFPScnt) / aFPSnum);
@@ -1099,6 +1074,36 @@ void    DrawScreen (void)
                 // Dynamic Rate Control: adjust audio frequency to match real speed
                 if (MatchMonitorRate)
                         APU::UpdateDRC();
+        }
+        // --- Шаг 5: Статистика времени кадров (НЕ лимитер, никаких Sleep) ---
+        {
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+
+                if (FrameStatLast.QuadPart != 0)
+                {
+                        double delta =
+                                (double)
+                                (now.QuadPart -
+                                 FrameStatLast.QuadPart);
+
+                        if (AvgFrameTime <= 0.0)
+                                AvgFrameTime = delta;
+                        else
+                                AvgFrameTime =
+                                        AvgFrameTime * 0.98 +
+                                        delta * 0.02;
+
+                        if (AvgFrameTime > 0.0)
+                        {
+                                RealFPS =
+                                        (double)
+                                        ClockFreq.QuadPart /
+                                        AvgFrameTime;
+                        }
+                }
+
+                FrameStatLast = now;
         }
         if (!TitleDelay--)
         {
