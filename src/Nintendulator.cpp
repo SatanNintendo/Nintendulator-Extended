@@ -427,12 +427,12 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         {
                                 _tcscpy(Path_ROM, FileName);
                                 Path_ROM[ofn.nFileOffset-1] = 0;
+                                Theme::Reapply();
                                 NES::Stop();
                                 NES::OpenFile(FileName);
                         }
-                        // Re-apply theme - GetOpenFileName can reset dark mode state
-                        if (Theme::IsDark())
-                                Theme::Reapply();
+                        // Re-apply theme - GetOpenFileName can reset dark/light mode state
+                        Theme::Reapply();
                         break;
                 }
                 case ID_FILE_CLOSE:
@@ -473,9 +473,8 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                                 Path_ROM[ofn.nFileOffset-1] = 0;
                                 HeaderEdit::Open(FileName);
                         }
-                        // Re-apply theme - GetOpenFileName can reset dark mode state
-                        if (Theme::IsDark())
-                                Theme::Reapply();
+                        // Re-apply theme - GetOpenFileName can reset dark/light mode state
+                        Theme::Reapply();
                         break;
                 }
                 case ID_FILE_AUTORUN:
