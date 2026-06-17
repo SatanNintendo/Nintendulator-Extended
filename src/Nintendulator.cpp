@@ -77,18 +77,21 @@ int TitlebarDelay;
 // Theme subclass for the main window WndProc to handle dark mode colors
 static LRESULT CALLBACK ThemeMainSubclass(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
+        // Handle background erase for both themes to prevent flicker on ROM load.
+        // hbrBackground is NULL in WNDCLASSEX, so this is the only place it's painted.
+        if (uMsg == WM_ERASEBKGND)
+        {
+                HDC hdc = (HDC)wParam;
+                RECT rc;
+                GetClientRect(hWnd, &rc);
+                FillRect(hdc, &rc, Theme::GetBackgroundBrush());
+                return TRUE;
+        }
+
         if (Theme::IsDark())
         {
                 switch (uMsg)
                 {
-                case WM_ERASEBKGND:
-                {
-                        HDC hdc = (HDC)wParam;
-                        RECT rc;
-                        GetClientRect(hWnd, &rc);
-                        FillRect(hdc, &rc, Theme::GetBackgroundBrush());
-                        return TRUE;
-                }
                 case WM_CTLCOLORDLG:
                 case WM_CTLCOLORSTATIC:
                 {
@@ -305,7 +308,7 @@ ATOM MyRegisterClass (HINSTANCE hInstance)
         wcex.hInstance = hInstance;
         wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_NINTENDULATOR));
         wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wcex.hbrBackground = (HBRUSH)(COLOR_APPWORKSPACE+1);
+        wcex.hbrBackground = NULL;  // WM_ERASEBKGND handled manually in WndProc/Theme subclass
         wcex.lpszMenuName = MAKEINTRESOURCE(IDC_NINTENDULATOR);
         wcex.lpszClassName = szWindowClass;
         wcex.hIconSm = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_SMALL));
