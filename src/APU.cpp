@@ -58,13 +58,12 @@ static const double     drc_max_adjust  = 0.05;
 #define FREQ            44100
 #define BITS            16
 // FRAMEBUF = number of audio frame-blocks in the DirectSound ring buffer.
-// Reduced from 4 to 2 to tighten the DRC feedback loop:
-//   4 frames @ 60 Hz ~ 66 ms latency  (DRC reacts slowly)
-//   2 frames @ 60 Hz ~ 33 ms latency  (DRC reacts ~2x faster, matches Mesen/Nestopia)
-// Trade-off: smaller safety margin against OS scheduling jitter, but on modern
-// hardware this is a non-issue and the audio stays noticeably more in-sync
-// with the video frame pacing.
-#define FRAMEBUF        2
+// Kept at 4 (original value) for safety: combined with the new QPC frame-pacing
+// in DrawScreen, a smaller buffer (2) risks cascading underflow because the
+// pacing loop blocks the emulation thread for ~16 ms per frame, during which
+// DirectSound drains the buffer. With FRAMEBUF=4 we keep ~66 ms of headroom,
+// which comfortably absorbs the pacing wait without starving the audio path.
+#define FRAMEBUF        4
 const unsigned int      LOCK_SIZE = FREQ * (BITS / 8);
 
 static DWORD            drc_play_freq   = FREQ;  // now it's fine
