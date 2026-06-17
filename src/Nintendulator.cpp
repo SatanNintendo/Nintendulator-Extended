@@ -301,7 +301,7 @@ ATOM MyRegisterClass (HINSTANCE hInstance)
 
         wcex.cbSize = sizeof(WNDCLASSEX);
 
-        wcex.style = CS_HREDRAW | CS_VREDRAW;
+        wcex.style = 0;  // No CS_HREDRAW|CS_VREDRAW — GFX manages repaints; avoids intermediate erase/paint states on resize
         wcex.lpfnWndProc = WndProc;
         wcex.cbClsExtra = 0;
         wcex.cbWndExtra = 0;

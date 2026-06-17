@@ -1364,9 +1364,12 @@ void    UpdateInterface (void)
         RECT client, window, desktop;
         if (IsWine())   // Workaround for Wine bug #50410
                 ShowWindow(hWnd, SW_HIDE);
-        SetWindowPos(hWnd, hWnd, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
+        LockWindowUpdate(hWnd);
+        SetWindowPos(hWnd, hWnd, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOREDRAW);
         GetClientRect(hWnd, &client);
-        SetWindowPos(hWnd, hWnd, 0, 0, 2 * w - client.right, 2 * h - client.bottom, SWP_NOMOVE | SWP_NOZORDER);
+        SetWindowPos(hWnd, hWnd, 0, 0, 2 * w - client.right, 2 * h - client.bottom, SWP_NOMOVE | SWP_NOZORDER | SWP_NOREDRAW);
+        LockWindowUpdate(NULL);
+        RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
 
         // try to make sure the window is completely visible on the desktop
         desktop.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -1405,7 +1408,7 @@ void    UpdateInterface (void)
         // it's still technically possible for the window to get lost if the desktop is not rectangular (e.g. one monitor is rotated)
         // but this should take care of most of the complaints about the window getting lost
         if (moved)
-                SetWindowPos(hWnd, hWnd, window.left, window.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+                SetWindowPos(hWnd, hWnd, window.left, window.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOREDRAW);
         if (IsWine())   // Workaround for Wine bug #50410
                 ShowWindow(hWnd, SW_SHOW);
 }
