@@ -53,6 +53,13 @@ LARGE_INTEGER LastClockVal;
 int FPSnum, FPSCnt, FSkip;
 BOOL aFSkip;
 
+// Frame-pacing state (used by DrawScreen when MatchMonitorRate is enabled).
+// TargetClockVal = absolute QPC tick at which the next frame should be presented.
+// FramePacingInit = FALSE means we need to re-baseline TargetClockVal on the
+// next DrawScreen call (first frame after enable, after stop, after AVI, etc.).
+LARGE_INTEGER TargetClockVal;
+BOOL FramePacingInit = FALSE;
+
 int Pitch;
 int WantFPS;
 int aFPScnt;
@@ -400,6 +407,8 @@ void    Init (void)
         Depth = 0;
         ClockFreq.QuadPart = 0;
         LastClockVal.QuadPart = 0;
+        TargetClockVal.QuadPart = 0;
+        FramePacingInit = FALSE;
         DefaultPalette[NES::REGION_NONE] = Palette[NES::REGION_NONE] = PALETTE_NTSC; // just in case
         DefaultPalette[NES::REGION_NTSC] = Palette[NES::REGION_NTSC] = PALETTE_NTSC;
         DefaultPalette[NES::REGION_PAL] = Palette[NES::REGION_PAL] = PALETTE_PAL;
@@ -1035,6 +1044,60 @@ int TitleDelay = 0;
 void    DrawScreen (void)
 {
         LARGE_INTEGER TmpClockVal;
+
+        // --- Frame pacing: wait for the exact moment the next frame should be presented ---
+        // This is the key fix for smooth scrolling. Without it, the emulator's frame
+        // timing is at the mercy of Sleep(1) granularity in APU::Run() (±2 ms on Windows,
+        // ~12% of a 16.7 ms frame at 60 fps), which causes the irregular frame-pacing
+        // stutters every 10-15 seconds that the user observed.
+        //
+        // Approach (same as Mesen / Nestopia):
+        //   * Sleep(1) while we're more than ~2 ms away from the target time (saves CPU)
+        //   * Busy-wait (spin) for the last ~2 ms to get sub-millisecond precision
+        // Pacing is bypassed during AVI capture so AVI runs at full emulator speed.
+        if (MatchMonitorRate && !AVI::IsActive() && ClockFreq.QuadPart > 0 && WantFPS > 0)
+        {
+                if (!FramePacingInit)
+                {
+                        // First frame after enabling (or after a non-paced period):
+                        // establish the baseline target time as "now" and skip the wait,
+                        // so we don't stall the very first frame.
+                        QueryPerformanceCounter(&TargetClockVal);
+                        FramePacingInit = TRUE;
+                }
+                else
+                {
+                        LONGLONG frameStep = ClockFreq.QuadPart / WantFPS;
+                        LARGE_INTEGER now;
+                        // Hybrid wait loop: coarse Sleep(1) for the bulk, then spin for precision.
+                        for (;;)
+                        {
+                                QueryPerformanceCounter(&now);
+                                LONGLONG remaining = TargetClockVal.QuadPart - now.QuadPart;
+                                if (remaining <= 0)
+                                        break;
+                                if (remaining > ClockFreq.QuadPart / 500)  // > 2 ms
+                                        Sleep(1);  // coarse wait, frees CPU
+                                // else: busy-wait (spin) for the last ~2 ms - this is what
+                                // gives us the sub-millisecond precision Sleep(1) cannot.
+                        }
+                        TargetClockVal.QuadPart += frameStep;
+                        // Safety: if we fell way behind (debugger pause, modal dialog, OS hiccup),
+                        // resync TargetClockVal to "now" to avoid a burst of catch-up frames that
+                        // would otherwise be rendered back-to-back.
+                        QueryPerformanceCounter(&now);
+                        if (TargetClockVal.QuadPart < now.QuadPart - frameStep * 2)
+                                TargetClockVal = now;
+                }
+        }
+        else
+        {
+                // Pacing is disabled (MatchMonitorRate off, AVI active, or no QPC):
+                // reset state so the next enable re-baselines cleanly.
+                FramePacingInit = FALSE;
+        }
+        // --- end frame pacing ---
+
         if (AVI::IsActive())
                 AVI::AddVideo();
         if (SlowDown)
@@ -1047,7 +1110,11 @@ void    DrawScreen (void)
         QueryPerformanceCounter(&TmpClockVal);
         aFPSnum += TmpClockVal.QuadPart - LastClockVal.QuadPart;
         LastClockVal = TmpClockVal;
-        if (++aFPScnt >= 20)
+        // Reduced from 20 to 5 frames: makes the auto-frameskip measurement AND the
+        // DRC audio adjustment react ~4x faster (~83 ms instead of ~333 ms), which
+        // is critical for keeping the DirectSound ring buffer centered around 50%
+        // when the NES rate (60.099 Hz NTSC) drifts against a 60.000 Hz monitor.
+        if (++aFPScnt >= 5)
         {
                 FPSnum = (int)((ClockFreq.QuadPart * aFPScnt) / aFPSnum);
                 if (aFSkip && !forceNoSkip)

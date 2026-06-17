@@ -57,7 +57,14 @@ static const double     drc_max_adjust  = 0.05;
 // === MOVED HERE ===
 #define FREQ            44100
 #define BITS            16
-#define FRAMEBUF        4
+// FRAMEBUF = number of audio frame-blocks in the DirectSound ring buffer.
+// Reduced from 4 to 2 to tighten the DRC feedback loop:
+//   4 frames @ 60 Hz ~ 66 ms latency  (DRC reacts slowly)
+//   2 frames @ 60 Hz ~ 33 ms latency  (DRC reacts ~2x faster, matches Mesen/Nestopia)
+// Trade-off: smaller safety margin against OS scheduling jitter, but on modern
+// hardware this is a non-issue and the audio stays noticeably more in-sync
+// with the video frame pacing.
+#define FRAMEBUF        2
 const unsigned int      LOCK_SIZE = FREQ * (BITS / 8);
 
 static DWORD            drc_play_freq   = FREQ;  // now it's fine
@@ -1589,6 +1596,23 @@ void    UpdateDRC (void)
                 drc_play_freq = newFreq;
                 Buffer->SetFrequency(newFreq);
         }
+#endif /* !NSFPLAYER */
+}
+
+// Reset DRC: force playback frequency back to the standard 44100 Hz.
+// Called when Match Monitor Rate is disabled (toggled off by the user),
+// so that any accumulated DRC adjustment is cleared and audio plays at
+// the original sample rate. This is intentionally NOT the same as calling
+// UpdateDRC(), because UpdateDRC measures the current buffer fill and may
+// keep the frequency shifted if the buffer happens to be off-center at
+// the moment of disable.
+void    ResetDRC (void)
+{
+#ifndef NSFPLAYER
+        if (!Buffer || !isEnabled)
+                return;
+        drc_play_freq = FREQ;
+        Buffer->SetFrequency(FREQ);
 #endif /* !NSFPLAYER */
 }
 

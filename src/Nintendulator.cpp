@@ -704,8 +704,10 @@ case ID_PPU_MATCHRATE:
                         GFX::MatchMonitorRate = !GFX::MatchMonitorRate;
         if (!GFX::MatchMonitorRate)
         {
-                // On disable - reset playback frequency to standard
-                APU::UpdateDRC();
+                // On disable - explicitly reset playback frequency to standard 44100 Hz.
+                // UpdateDRC() would just measure current buffer fill and may leave the
+                // frequency shifted; ResetDRC() forces it back to FREQ unconditionally.
+                APU::ResetDRC();
         }
         if (GFX::MatchMonitorRate)
                                 CheckMenuItem(hMenu, ID_PPU_MATCHRATE, MF_CHECKED);
