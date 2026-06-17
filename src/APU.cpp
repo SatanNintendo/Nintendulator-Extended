@@ -18,6 +18,7 @@
 # include "PPU.h"
 # include "AVI.h"
 # include "Controllers.h"
+# include "GFX.h"
 # include "Lang.h"
 # include "Theme.h"
 
@@ -61,6 +62,14 @@ static const double     drc_max_adjust  = 0.05;
 const unsigned int      LOCK_SIZE = FREQ * (BITS / 8);
 
 static DWORD            drc_play_freq   = FREQ;  // now it's fine
+
+// High-resolution waitable timer for frame throttle (used when MatchMonitorRate is on).
+// CreateWaitableTimerExW with CREATE_WAITABLE_TIMER_HIGH_RESOLUTION is available
+// since Windows 10 1803. We load it dynamically so the binary still runs on Win7/8.
+static HANDLE           hFrameTimer     = NULL;
+typedef HANDLE (WINAPI *PFN_CreateWaitableTimerExW)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
+static PFN_CreateWaitableTimerExW pfnCreateWaitableTimerExW = NULL;
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG 0x00000002
 #endif
 
 const   unsigned char   LengthCounts[32] = {
@@ -1101,12 +1110,35 @@ void    Start (void)
                 return;
         }
         EI.DbgOut(Lang::GetString(LANG_MSG_APU_STARTED));
+
+        // Try to create a high-resolution waitable timer (Win10 1803+).
+        // Used instead of Sleep(1) when Match Monitor Rate is active for more
+        // precise frame throttling. Falls back to Sleep(1) if unavailable.
+        if (!pfnCreateWaitableTimerExW)
+        {
+                HMODULE hKernel = GetModuleHandleW(L"kernel32.dll");
+                if (hKernel)
+                        pfnCreateWaitableTimerExW = (PFN_CreateWaitableTimerExW)
+                                GetProcAddress(hKernel, "CreateWaitableTimerExW");
+        }
+        if (pfnCreateWaitableTimerExW && !hFrameTimer)
+        {
+                hFrameTimer = pfnCreateWaitableTimerExW(
+                        NULL, NULL,
+                        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG,
+                        TIMER_ALL_ACCESS);
+        }
 #endif  /* !NSFPLAYER */
 }
 
 void    Stop (void)
 {
 #ifndef NSFPLAYER
+        if (hFrameTimer)
+        {
+                CloseHandle(hFrameTimer);
+                hFrameTimer = NULL;
+        }
         if (Buffer)
         {
                 SoundOFF();
@@ -1626,7 +1658,20 @@ void    Run (void)
                 {
                         if (!isEnabled)
                                 break;
-                        Sleep(1);
+                        // When Match Monitor Rate is active and a high-resolution
+                        // waitable timer is available, use it instead of Sleep(1).
+                        // SetWaitableTimer with a relative delay of -500µs (in 100ns units)
+                        // gives ~0.5ms precision vs ~15ms for Sleep(1), which eliminates
+                        // the coarse timing that causes micro-stutters in the video output.
+                        if (GFX::MatchMonitorRate && hFrameTimer)
+                        {
+                                LARGE_INTEGER due;
+                                due.QuadPart = -5000LL; // 500 microseconds in 100ns units
+                                SetWaitableTimer(hFrameTimer, &due, 0, NULL, NULL, FALSE);
+                                WaitForSingleObject(hFrameTimer, 2); // 2ms safety timeout
+                        }
+                        else
+                                Sleep(1);
                         Try(Buffer->GetCurrentPosition(&rpos, &wpos), Lang::GetString(LANG_ERR_APU_BUFFER));
                         rpos /= LockSize;
                         wpos /= LockSize;
