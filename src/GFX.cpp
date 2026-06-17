@@ -50,11 +50,9 @@ BOOL AlwaysOnTop, ExclusiveFullscreen;
 
 LARGE_INTEGER ClockFreq;
 LARGE_INTEGER LastClockVal;
-LARGE_INTEGER FrameStatLast = {0};
-double AvgFrameTime = 0.0;
-double RealFPS = 0.0;
 int FPSnum, FPSCnt, FSkip;
 BOOL aFSkip;
+
 
 int Pitch;
 int WantFPS;
@@ -403,9 +401,6 @@ void    Init (void)
         Depth = 0;
         ClockFreq.QuadPart = 0;
         LastClockVal.QuadPart = 0;
-        FrameStatLast.QuadPart = 0;
-        AvgFrameTime = 0.0;
-        RealFPS = 0.0;
         DefaultPalette[NES::REGION_NONE] = Palette[NES::REGION_NONE] = PALETTE_NTSC; // just in case
         DefaultPalette[NES::REGION_NTSC] = Palette[NES::REGION_NTSC] = PALETTE_NTSC;
         DefaultPalette[NES::REGION_PAL] = Palette[NES::REGION_PAL] = PALETTE_PAL;
@@ -524,10 +519,13 @@ void    SyncMenuChecks (void)
 
 void    Start (void)
 {
-        // Сброс статистики времени кадров при старте/рестарте эмуляции
-        FrameStatLast.QuadPart = 0;
-        AvgFrameTime = 0.0;
-        RealFPS = 0.0;
+        // Reset per-session timing state so the first DrawScreen frame
+        // doesn't produce a bogus QPC delta (LastClockVal == 0 guard in DrawScreen).
+        LastClockVal.QuadPart = 0;
+        aFPScnt = 0;
+        aFPSnum = 0;
+        FPSCnt  = 0;
+        FSkip   = 0;
 
         if (UseOpenGL())
         {
@@ -1056,11 +1054,16 @@ void    DrawScreen (void)
                 FPSCnt = 0;
         }
         QueryPerformanceCounter(&TmpClockVal);
-        aFPSnum += TmpClockVal.QuadPart - LastClockVal.QuadPart;
+        // Guard: on the very first DrawScreen call after ROM load, LastClockVal is 0.
+        // Without this check, aFPSnum gets a huge initial value (QPC ticks since boot),
+        // causing FPSnum to read near 0 and FSkip to spike to max for the first 20 frames.
+        if (LastClockVal.QuadPart != 0)
+                aFPSnum += TmpClockVal.QuadPart - LastClockVal.QuadPart;
         LastClockVal = TmpClockVal;
-        if (++aFPScnt >= 5)
+        if (++aFPScnt >= 20)
         {
-                FPSnum = (int)((ClockFreq.QuadPart * aFPScnt) / aFPSnum);
+                if (aFPSnum > 0)
+                        FPSnum = (int)((ClockFreq.QuadPart * aFPScnt) / aFPSnum);
                 if (aFSkip && !forceNoSkip)
                 {
                         if ((FSkip < 9) && (FPSnum <= (WantFPS * 9 / 10)))
@@ -1074,36 +1077,6 @@ void    DrawScreen (void)
                 // Dynamic Rate Control: adjust audio frequency to match real speed
                 if (MatchMonitorRate)
                         APU::UpdateDRC();
-        }
-        // --- Шаг 5: Статистика времени кадров (НЕ лимитер, никаких Sleep) ---
-        {
-                LARGE_INTEGER now;
-                QueryPerformanceCounter(&now);
-
-                if (FrameStatLast.QuadPart != 0)
-                {
-                        double delta =
-                                (double)
-                                (now.QuadPart -
-                                 FrameStatLast.QuadPart);
-
-                        if (AvgFrameTime <= 0.0)
-                                AvgFrameTime = delta;
-                        else
-                                AvgFrameTime =
-                                        AvgFrameTime * 0.98 +
-                                        delta * 0.02;
-
-                        if (AvgFrameTime > 0.0)
-                        {
-                                RealFPS =
-                                        (double)
-                                        ClockFreq.QuadPart /
-                                        AvgFrameTime;
-                        }
-                }
-
-                FrameStatLast = now;
         }
         if (!TitleDelay--)
         {

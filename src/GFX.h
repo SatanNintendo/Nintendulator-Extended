@@ -27,7 +27,6 @@ extern BOOL aFSkip;
 extern int forceNoSkip;
 
 extern int WantFPS;
-extern double RealFPS;
 
 extern BOOL SlowDown;
 extern int SlowRate;
