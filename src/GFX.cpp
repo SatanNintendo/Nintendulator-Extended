@@ -1078,23 +1078,50 @@ void    DrawScreen (void)
         if (LastClockVal.QuadPart != 0)
                 aFPSnum += TmpClockVal.QuadPart - LastClockVal.QuadPart;
         LastClockVal = TmpClockVal;
+
+        // Dynamic Rate Control: when Match Monitor Rate is active, call UpdateDRC
+        // every single frame. Previously it was called once per 20-frame window,
+        // introducing up to ~330ms of correction lag. The DirectSound buffer
+        // (FRAMEBUF = 4 slots * ~16.67ms = ~67ms) can drift noticeably within that
+        // window, and a tardy correction then overshoots, producing the periodic
+        // stutter. Calling UpdateDRC every frame keeps the feedback loop tight
+        // and the per-call overhead is negligible (one GetCurrentPosition query).
+        if (MatchMonitorRate)
+                APU::UpdateDRC();
+
         if (++aFPScnt >= 20)
         {
                 if (aFPSnum > 0)
                         FPSnum = (int)((ClockFreq.QuadPart * aFPScnt) / aFPSnum);
-                if (aFSkip && !forceNoSkip)
+                if (aFSkip && !forceNoSkip && !MatchMonitorRate)
                 {
+                        // When Match Monitor Rate is on, OpenGL vsync already
+                        // throttles the emulator to the monitor refresh rate.
+                        // The auto-frameskip logic compares FPSnum against the
+                        // integer WantFPS (60 or 50) but the measured FPS with
+                        // vsync on is the monitor rate — typically not an integer
+                        // (e.g. 59.94 or 60.000 vs WantFPS=60). This causes the
+                        // auto-skip logic to occasionally decide a frame must be
+                        // dropped, which appears as a visible stutter even though
+                        // the emulator is running perfectly. Disabling auto-skip
+                        // when MatchMonitorRate is active avoids this entirely;
+                        // vsync is the sole frame-rate governor in that mode.
                         if ((FSkip < 9) && (FPSnum <= (WantFPS * 9 / 10)))
                                 FSkip++;
                         if ((FSkip > 0) && (FPSnum >= (WantFPS - 1)))
                                 FSkip--;
                         SetFrameskip(-1);
                 }
+                else if (MatchMonitorRate && FSkip != 0)
+                {
+                        // If we just enabled Match Monitor Rate while auto-skip
+                        // had already set a non-zero FSkip, clear it now so we
+                        // don't keep dropping frames unnecessarily.
+                        FSkip = 0;
+                        SetFrameskip(0);
+                }
                 aFPScnt = 0;
                 aFPSnum = 0;
-                // Dynamic Rate Control: adjust audio frequency to match real speed
-                if (MatchMonitorRate)
-                        APU::UpdateDRC();
         }
         if (!TitleDelay--)
         {

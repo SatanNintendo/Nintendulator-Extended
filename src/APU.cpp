@@ -1602,12 +1602,15 @@ void    UpdateDRC (void)
         double fillRatio = (double)fill / (double)totalSize;
         double error = fillRatio - drc_target_fill;
 
-        // Smaller coefficient than before because the base target already
-        // removes the systematic drift; we only need to correct residual
-        // jitter. 5% of the error per call, capped at ±2%.
-        double adjustment = error * 0.05;
-        if (adjustment >  0.02) adjustment =  0.02;
-        if (adjustment < -0.02) adjustment = -0.02;
+        // UpdateDRC is now called every frame (previously once per 20 frames).
+        // The correction coefficient is scaled down accordingly: 0.05/20 = 0.0025
+        // per-frame gives the same convergence speed as the old 0.05/20-frame
+        // scheme, but without the 330ms lag that allowed the buffer to drift
+        // far before the correction kicked in. The per-frame ±0.5% cap prevents
+        // any single bad fill reading from making an audible step change.
+        double adjustment = error * 0.0025;
+        if (adjustment >  0.005) adjustment =  0.005;
+        if (adjustment < -0.005) adjustment = -0.005;
 
         double newFreqD = baseFreq * (1.0 + adjustment);
 
@@ -1621,10 +1624,14 @@ void    UpdateDRC (void)
 
         DWORD newFreq = (DWORD)(newFreqD + 0.5);
 
-        // Apply only if the change is significant (≥10 Hz) to avoid
-        // hammering SetFrequency with no-op calls.
+        // Apply only if the change is significant (≥2 Hz) to avoid
+        // hammering SetFrequency with no-op calls. The old threshold was
+        // 10 Hz, which was appropriate when UpdateDRC ran every 20 frames;
+        // with per-frame calls the incremental steps are much smaller and
+        // 2 Hz is enough hysteresis to avoid redundant driver calls while
+        // still tracking the buffer fill smoothly.
         if (newFreq != drc_play_freq &&
-            (newFreq > drc_play_freq + 10 || newFreq + 10 < drc_play_freq))
+            (newFreq > drc_play_freq + 2 || newFreq + 2 < drc_play_freq))
         {
                 drc_play_freq = newFreq;
                 Buffer->SetFrequency(newFreq);

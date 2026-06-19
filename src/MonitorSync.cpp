@@ -257,14 +257,30 @@ namespace MonitorSync
                 }
                 else
                 {
-                        // When disabled, do NOT touch vsync. The original emulator
-                        // left vsync under driver control, and forcing it on or off
-                        // here would surprise users whose driver defaults differ.
+                        // Disable OpenGL vsync so SwapBuffers no longer blocks
+                        // on the vblank. This is essential for correctness: if
+                        // we only set g_VSyncActive = false without actually
+                        // calling wglSwapIntervalEXT(0), SwapBuffers continues
+                        // to block until the next vblank even though the rest of
+                        // the code thinks vsync is off. The result is:
+                        //   - PaceFrame switches to Sleep(0) (busy-yield)
+                        //   - SwapBuffers still throttles to ~16.67ms per frame
+                        //   - DRC is reset to 44100 Hz but the 0.0988 Hz drift
+                        //     accumulates uncorrected while vsync is "disabled"
+                        //   - When the user re-enables Match Monitor Rate the
+                        //     audio buffer is already badly drifted and the DRC
+                        //     overcorrects, producing the severe stutter seen
+                        //     on hot-toggle.
                         //
-                        // We do, however, reset the DRC frequency back to the
-                        // standard 44100 Hz so any accumulated adjustment from the
-                        // MatchMonitorRate session is cleared.
+                        // We explicitly turn vsync off here so the physical state
+                        // matches g_VSyncActive. A user whose driver has vsync
+                        // forced on globally will see no change, but that's a
+                        // driver override outside our control anyway.
+                        if (pfnWglSwapIntervalEXT && GFX::hGLDC && GFX::hGLRC)
+                                SetOpenGLVSync(0);
+
                         g_VSyncActive = false;
+                        g_CalibActive = false;
                         APU::ResetDRC();
                 }
         }
@@ -361,11 +377,32 @@ namespace MonitorSync
                                                 double measuredHz = (double)g_CalibCount / elapsedSec;
                                                 if (measuredHz >= 30.0 && measuredHz <= 1000.0)
                                                 {
-                                                        // Low-pass filter: blend 50/50 with the
-                                                        // previous value so a single bad sample
-                                                        // (e.g. window drag) can't yank the DRC
-                                                        // target around.
-                                                        g_MonitorHz = 0.5 * g_MonitorHz + 0.5 * measuredHz;
+                                                        // Outlier rejection: if this sample
+                                                        // deviates from the running estimate by
+                                                        // more than 2 Hz, it was almost certainly
+                                                        // produced by a system hiccup (window drag,
+                                                        // DWM stall, scheduler jitter). Discard it
+                                                        // and restart the calibration window so we
+                                                        // don't corrupt the DRC target.
+                                                        if (fabs(measuredHz - g_MonitorHz) > 2.0)
+                                                        {
+                                                                g_CalibCount    = 0;
+                                                                g_CalibStartQPC = now;
+                                                                return;
+                                                        }
+
+                                                        // Heavy low-pass filter: 90% old value,
+                                                        // 10% new sample. Previously 50/50, which
+                                                        // let a single borderline-valid sample shift
+                                                        // g_MonitorHz by ~1 Hz, causing UpdateDRC
+                                                        // to overcorrect the audio frequency and
+                                                        // produce audible/visible stutter for
+                                                        // several seconds until subsequent samples
+                                                        // pulled it back. With 90/10 the maximum
+                                                        // shift from one sample is ~0.2 Hz, which
+                                                        // the buffer-fill correction in UpdateDRC
+                                                        // absorbs invisibly.
+                                                        g_MonitorHz = 0.9 * g_MonitorHz + 0.1 * measuredHz;
                                                 }
                                         }
                                         g_CalibCount = 0;
