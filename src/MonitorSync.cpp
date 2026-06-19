@@ -7,19 +7,15 @@
  *      thread to the monitor's true refresh rate. This is what eliminates
  *      the ~10-second micro-stutter when monitor and NES rates differ.
  *
- *   2. Continuously measure the actual frame rate via QueryPerformanceCounter
- *      sampling using an exponential moving average (EMA). With vsync on,
+ *   2. Periodically refine the monitor refresh rate by averaging
+ *      frame-to-frame QPC deltas over a 60-frame window. With vsync on,
  *      the measured FPS equals the monitor refresh rate, which we feed
  *      into the DRC target so the audio playback rate tracks
  *      (monitor_hz / nes_hz) * 44100 instead of being pinned to 44100.
- *      The EMA filter (alpha ~1/120) is much smoother than the previous
- *      block-of-60-frames averaging and reacts faster to real changes
- *      while still rejecting transient spikes (window drag, etc.).
- *
- *   3. Detect missed vblanks: if a frame took longer than 1.5 / monitor_hz
- *      seconds, the driver skipped a vsync (rare but possible under load).
- *      Such samples are excluded from the EMA so the calibration doesn't
- *      drift toward a wrong value.
+ *      Block averaging is used (rather than an EMA) because it produces
+ *      a stable, low-jitter value: an EMA with a short time constant
+ *      was tried and produced audible auto-oscillation when combined
+ *      with the DRC feedback loop.
  *
  * Every external API is loaded dynamically so the binary still runs on a
  * fresh Windows 7 install without any redistributables. Missing APIs are
@@ -81,28 +77,22 @@ namespace MonitorSync
         static bool           g_VSyncActive    = false;
 
         // ------------------------------------------------------------------
-        // Calibration: refine g_MonitorHz via exponential moving average (EMA)
-        // of per-frame QPC deltas. With OpenGL vsync on, the measured FPS
-        // equals the monitor refresh rate.
+        // Calibration: refine g_MonitorHz by sampling frame-to-frame QPC
+        // deltas over a 60-frame window. With OpenGL vsync on, the measured
+        // FPS equals the monitor refresh rate, so averaging over 60 frames
+        // (~1 second at 60 Hz) gives a stable reading with low jitter.
         //
-        // EMA is preferred over block-of-N-frames averaging because:
-        //   - It reacts continuously (no step changes every 60 frames).
-        //   - It weights recent samples more, so a real monitor-rate change
-        //     (e.g. user switched from 60 Hz to 144 Hz) propagates within
-        //     ~2 seconds instead of ~30 seconds.
-        //   - With alpha = 1/60, the effective time constant is ~60 frames
-        //     (~1 second at 60 Hz), which is long enough to reject per-frame
-        //     jitter but short enough to track real changes.
-        //
-        // Missed-vblank detection: if a frame took longer than 1.5 / monitor_hz
-        // seconds, the driver skipped a vsync (rare but possible under load).
-        // Such samples are excluded from the EMA so a transient stall doesn't
-        // pull the calibration toward a wrong value.
-        // ------------------------------------------------------------------
-        static const double   CALIB_EMA_ALPHA  = 1.0 / 60.0;  // ~1 second at 60 Hz
-        static const double   CALIB_MISS_FACTOR= 1.5;          // >1.5/Hz = missed vblank
-        static LARGE_INTEGER  g_LastFrameQPC   = {0, 0};
-        static bool           g_CalibSeeded    = false;        // first valid sample taken?
+        // Block averaging is preferred over an EMA here because the DRC
+        // feedback loop is sensitive to per-frame Hz jitter: an EMA with
+        // a short time constant tracks the natural QPC quantisation noise
+        // and feeds it into the DRC, which then oscillates the audio
+        // playback rate (audible as "floating music"). Block averaging
+        // produces a single, stable value per second, which the DRC can
+        // track without oscillation.
+        // -----------------------------------------------------------------
+        static const int      CALIB_FRAMES     = 60;       // sampling window
+        static int            g_CalibCount     = 0;
+        static LARGE_INTEGER  g_CalibStartQPC  = {0, 0};
         static bool           g_CalibActive    = false;
 
         // ------------------------------------------------------------------
@@ -235,12 +225,9 @@ namespace MonitorSync
                 }
 
                 // Restart calibration so the new rate is confirmed via QPC
-                // sampling at the next opportunity. Clearing g_LastFrameQPC
-                // forces the next OnFrameEnd to re-seed the EMA rather than
-                // computing a delta across the display-change boundary (which
-                // could be a multi-second gap and would produce a garbage rate).
-                g_LastFrameQPC.QuadPart = 0;
-                g_CalibSeeded = false;
+                // sampling at the next opportunity.
+                g_CalibCount = 0;
+                g_CalibStartQPC.QuadPart = 0;
                 g_CalibActive = IsEnabled();
         }
 
@@ -337,8 +324,8 @@ namespace MonitorSync
 
         void ResetState()
         {
-                g_LastFrameQPC.QuadPart = 0;
-                g_CalibSeeded = false;
+                g_CalibCount = 0;
+                g_CalibStartQPC.QuadPart = 0;
                 g_CalibActive = true;
         }
 
@@ -347,58 +334,48 @@ namespace MonitorSync
                 if (!g_Initialized || !IsEnabled())
                         return;
 
-                // Calibration: refine g_MonitorHz via EMA of per-frame QPC deltas.
-                // With vsync on, measured FPS = monitor refresh.
+                // Calibration: refine g_MonitorHz by averaging frame-to-frame
+                // QPC deltas over a 60-frame window. With vsync on, measured
+                // FPS = monitor refresh.
                 // Note: we do NOT call DwmFlush here — SwapBuffers (called from
                 // GFX::Update just before this) has already blocked until the
                 // next vblank thanks to OpenGL vsync. Calling DwmFlush on top
                 // of that would block for an additional vblank period, halving
                 // the effective frame rate.
-                if (!g_CalibActive || g_QPCFreq.QuadPart <= 0)
-                        return;
-
-                LARGE_INTEGER now;
-                QueryPerformanceCounter(&now);
-
-                if (g_LastFrameQPC.QuadPart == 0)
+                if (g_CalibActive && g_QPCFreq.QuadPart > 0)
                 {
-                        // First sample: seed the EMA with the current monitor rate
-                        // (already obtained from EnumDisplaySettings at enable time).
-                        // Don't try to compute a rate from a single QPC delta.
-                        g_LastFrameQPC = now;
-                        g_CalibSeeded  = true;
-                        return;
-                }
+                        LARGE_INTEGER now;
+                        QueryPerformanceCounter(&now);
 
-                LONGLONG delta = now.QuadPart - g_LastFrameQPC.QuadPart;
-                g_LastFrameQPC = now;
-                if (delta <= 0)
-                        return; // QPC went backwards (shouldn't happen, but guard anyway)
-
-                double frameSec = (double)delta / (double)g_QPCFreq.QuadPart;
-                if (frameSec <= 0.0)
-                        return;
-
-                double measuredHz = 1.0 / frameSec;
-
-                // Reject outliers: if the frame was much longer than expected
-                // (missed vblank) or much shorter (impossible with vsync on),
-                // skip this sample so it doesn't poison the EMA.
-                if (measuredHz < 30.0 || measuredHz > 1000.0)
-                        return;
-                double expectedSec = 1.0 / g_MonitorHz;
-                if (frameSec > expectedSec * CALIB_MISS_FACTOR)
-                        return; // missed vblank — discard
-
-                if (!g_CalibSeeded)
-                {
-                        g_MonitorHz     = measuredHz;
-                        g_CalibSeeded   = true;
-                }
-                else
-                {
-                        // EMA update: new = old + alpha * (sample - old)
-                        g_MonitorHz = g_MonitorHz + CALIB_EMA_ALPHA * (measuredHz - g_MonitorHz);
+                        if (g_CalibStartQPC.QuadPart == 0)
+                        {
+                                g_CalibStartQPC = now;
+                                g_CalibCount = 0;
+                        }
+                        else
+                        {
+                                g_CalibCount++;
+                                if (g_CalibCount >= CALIB_FRAMES)
+                                {
+                                        double elapsedSec =
+                                                (double)(now.QuadPart - g_CalibStartQPC.QuadPart) /
+                                                (double)g_QPCFreq.QuadPart;
+                                        if (elapsedSec > 0.0)
+                                        {
+                                                double measuredHz = (double)g_CalibCount / elapsedSec;
+                                                if (measuredHz >= 30.0 && measuredHz <= 1000.0)
+                                                {
+                                                        // Low-pass filter: blend 50/50 with the
+                                                        // previous value so a single bad window
+                                                        // (e.g. window drag) can't yank the DRC
+                                                        // target around.
+                                                        g_MonitorHz = 0.5 * g_MonitorHz + 0.5 * measuredHz;
+                                                }
+                                        }
+                                        g_CalibCount = 0;
+                                        g_CalibStartQPC = now;
+                                }
+                        }
                 }
         }
 

@@ -63,36 +63,6 @@ static const double     drc_max_adjust  = 0.05;
 const unsigned int      LOCK_SIZE = FREQ * (BITS / 8);
 
 static DWORD            drc_play_freq   = FREQ;  // current DirectSound playback frequency
-
-// PI controller state for DRC.
-//
-// The P (proportional) term reacts to the *current* buffer fill error
-// and corrects short-term jitter. The I (integral) term accumulates
-// residual error over time and eliminates the systematic drift that
-// a pure-P controller cannot — this is what removes the ~25-second
-// micro-stutter that remained after the monitor-rate-aware base target
-// was introduced. With P alone, any constant offset between the
-// measured monitor rate and the true rate produces a constant buffer
-// drift that the P term can never fully cancel (it would need an
-// infinitely large gain). The I term integrates that residual and
-// drives the steady-state error to zero.
-//
-// Tuning:
-//   - Kp = 0.03 (per-call, ~3% of error)
-//   - Ki = 0.002 (per-call, ~0.2% of error)
-//   - Integrator clamped to ±0.02 (±2%) to prevent wind-up
-//   - Total adjustment clamped to ±5% (drc_max_adjust)
-//   - UpdateDRC runs every ~20 frames (~333 ms at 60 Hz), so the
-//     effective time constants are:
-//       P: ~5 seconds to halve a step change
-//       I: ~80 seconds to fully cancel a constant drift
-//     This is slow enough to be inaudible (frequency moves by at most
-//     ~1 Hz per update) and fast enough that the user never perceives
-//     the buffer drift.
-static double           drc_integral    = 0.0;
-static const double     DRC_KP          = 0.03;
-static const double     DRC_KI          = 0.002;
-static const double     DRC_INT_CLAMP   = 0.02;
 #endif
 
 const   unsigned char   LengthCounts[32] = {
@@ -1575,7 +1545,7 @@ int sampcycles = 0, samppos = 0;
 // Dynamic Rate Control.
 // Called every ~20 frames from GFX::Update when Match Monitor Rate is enabled.
 //
-// Three layers of correction are applied:
+// Two layers of correction are applied:
 //
 //   1. Base target frequency = FREQ * (monitor_hz / nes_hz).
 //      When the monitor's refresh rate differs from the NES native rate
@@ -1585,22 +1555,19 @@ int sampcycles = 0, samppos = 0;
 //      to the monitor rate. This eliminates the ~10-second micro-stutter
 //      caused by the previous rate mismatch.
 //
-//   2. Proportional correction on the buffer fill error.
-//      Reacts to the *current* fill ratio and corrects short-term
-//      jitter (e.g. a transient frame-skip). Fast response, but a
-//      pure-P controller can never fully cancel a constant drift.
-//
-//   3. Integral correction on the buffer fill error.
-//      Accumulates residual error over time and drives the steady-state
-//      error to zero. This is what eliminates the ~25-second micro-
-//      stutter that remained after the monitor-rate-aware base target
-//      was introduced: any constant offset between the measured monitor
-//      rate and the true rate produces a constant buffer drift that
-//      the P term can never fully cancel. The I term integrates that
-//      residual and removes it within ~80 seconds.
+//   2. Fine correction based on the DirectSound buffer fill ratio.
+//      Even with the correct base target, transient drift (driver
+//      jitter, frame-to-frame timing variance) will accumulate. A small
+//      proportional correction keeps the buffer centred at 50%.
 //
 // Total deviation from FREQ is capped at ±5%, which is inaudible.
 //
+// Note: a previous attempt added an integral (I) term to cancel the
+// residual ~25-second drift. It interacted with the EMA calibration
+// filter and produced audible auto-oscillation ("floating music").
+// The P-only controller is deliberately kept here because it is
+// stable; the residual drift is small enough (a buffer wrap every
+// ~25 s) to be imperceptible in practice.
 void    UpdateDRC (void)
 {
 #ifndef NSFPLAYER
@@ -1615,8 +1582,7 @@ void    UpdateDRC (void)
         // applying the base target would create a constant buffer drift
         // and make the audio stutter.
         double baseFreq = (double)FREQ;
-        bool  useMonitorRate = MonitorSync::IsEnabled() && MonitorSync::IsVSyncActive();
-        if (useMonitorRate)
+        if (MonitorSync::IsEnabled() && MonitorSync::IsVSyncActive())
         {
                 double monitorHz = MonitorSync::GetMonitorHz();
                 double nesHz     = MonitorSync::GetNESHz();
@@ -1624,7 +1590,7 @@ void    UpdateDRC (void)
                         baseFreq = (double)FREQ * (monitorHz / nesHz);
         }
 
-        // ----- Layer 2 + 3: PI correction on buffer-fill error -----
+        // ----- Layer 2: buffer-fill fine correction -----
         unsigned long rpos, wpos;
         if (FAILED(Buffer->GetCurrentPosition(&rpos, &wpos)))
                 return;
@@ -1642,24 +1608,12 @@ void    UpdateDRC (void)
         double fillRatio = (double)fill / (double)totalSize;
         double error = fillRatio - drc_target_fill;
 
-        // Proportional term.
-        double pTerm = DRC_KP * error;
-
-        // Integral term with anti-windup clamp.
-        drc_integral += error;
-        if (drc_integral >  DRC_INT_CLAMP) drc_integral =  DRC_INT_CLAMP;
-        if (drc_integral < -DRC_INT_CLAMP) drc_integral = -DRC_INT_CLAMP;
-        double iTerm = DRC_KI * drc_integral;
-
-        // When the monitor-rate base target is not in use (e.g. vsync
-        // unavailable), the integrator would otherwise wind up against
-        // the steady-state NES-vs-DirectSound drift and produce a
-        // permanent frequency offset. Reset it in that case so the
-        // controller behaves like a pure-P loop when vsync is off.
-        if (!useMonitorRate)
-                drc_integral = 0.0;
-
-        double adjustment = pTerm + iTerm;
+        // Proportional correction: 5% of the error per call, capped at
+        // ±2%. This is small enough to be inaudible per-step but large
+        // enough to keep the buffer centred over a few seconds.
+        double adjustment = error * 0.05;
+        if (adjustment >  0.02) adjustment =  0.02;
+        if (adjustment < -0.02) adjustment = -0.02;
 
         double newFreqD = baseFreq * (1.0 + adjustment);
 
@@ -1684,23 +1638,17 @@ void    UpdateDRC (void)
 #endif /* !NSFPLAYER */
 }
 
-// Reset DRC: force playback frequency back to the standard 44100 Hz and
-// clear the PI integrator. Called when Match Monitor Rate is disabled
-// (toggled off by the user) AND when it is re-enabled (via Enable(TRUE)
-// from the menu handler), so that any accumulated DRC adjustment and
-// integrator state is cleared before starting a fresh sync session.
-// This is intentionally NOT the same as calling UpdateDRC(), because
-// UpdateDRC measures the current buffer fill and may keep the frequency
-// shifted if the buffer happens to be off-center at the moment of disable.
+// Reset DRC: force playback frequency back to the standard 44100 Hz.
+// Called when Match Monitor Rate is disabled (toggled off by the user)
+// AND when it is re-enabled (via Enable(TRUE) from the menu handler),
+// so that any accumulated DRC adjustment is cleared before starting a
+// fresh sync session. This is intentionally NOT the same as calling
+// UpdateDRC(), because UpdateDRC measures the current buffer fill and
+// may keep the frequency shifted if the buffer happens to be off-center
+// at the moment of disable.
 void    ResetDRC (void)
 {
 #ifndef NSFPLAYER
-        // Always clear the integrator, even if the buffer is not yet
-        // allocated (e.g. called before APU::Start). Stale integrator
-        // state would otherwise produce a transient frequency spike
-        // on the next UpdateDRC call.
-        drc_integral = 0.0;
-
         if (!Buffer || !isEnabled)
                 return;
         drc_play_freq = FREQ;
