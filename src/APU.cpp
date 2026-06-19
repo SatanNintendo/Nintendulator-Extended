@@ -1569,8 +1569,14 @@ void    UpdateDRC (void)
                 return;
 
         // ----- Layer 1: monitor-rate-aware base target -----
+        // Only apply the (monitorHz / nesHz) base target when OpenGL vsync
+        // is actually active. Vsync is what throttles the emulator from
+        // NES rate (60.0988 Hz) down to monitor rate (e.g. 60.000 Hz); if
+        // vsync is not active the emulator still runs at the NES rate, so
+        // applying the base target would create a constant buffer drift
+        // and make the audio stutter.
         double baseFreq = (double)FREQ;
-        if (MonitorSync::IsEnabled())
+        if (MonitorSync::IsEnabled() && MonitorSync::IsVSyncActive())
         {
                 double monitorHz = MonitorSync::GetMonitorHz();
                 double nesHz     = MonitorSync::GetNESHz();

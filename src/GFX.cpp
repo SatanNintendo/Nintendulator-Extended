@@ -587,10 +587,11 @@ void    Start (void)
                 // is already enabled (e.g. loaded from settings at startup or
                 // toggled on before any ROM was loaded), this is the first
                 // moment we can actually load WGL swap control and turn vsync
-                // on. MonitorSync::Enable is a no-op if the flag is already
-                // in the desired state, so calling it here is always safe.
+                // on. ReinitVSync is a no-op if vsync is already active or
+                // MatchMonitorRate is disabled, so calling it here is always
+                // safe.
                 if (MatchMonitorRate)
-                        MonitorSync::Enable(TRUE);
+                        MonitorSync::ReinitVSync();
 
                 if (Fullscreen)
                 {

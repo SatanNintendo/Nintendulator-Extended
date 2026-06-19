@@ -31,52 +31,65 @@
 
 namespace MonitorSync
 {
-	// Called once at program startup with the main window handle.
-	// Loads WGL function pointers and queries the QPC frequency.
-	void	Init (HWND hwnd);
+        // Called once at program startup with the main window handle.
+        // Loads WGL function pointers and queries the QPC frequency.
+        void    Init (HWND hwnd);
 
-	// Toggle Match Monitor Rate on/off.
-	// When enabling: measures monitor Hz, enables OpenGL vsync, resets
-	// pacing state, recomputes the DRC target frequency.
-	// When disabling: resets DRC frequency to standard 44100 Hz.
-	void	Enable (BOOL on);
+        // Toggle Match Monitor Rate on/off.
+        // When enabling: measures monitor Hz, enables OpenGL vsync, resets
+        // pacing state, recomputes the DRC target frequency.
+        // When disabling: resets DRC frequency to standard 44100 Hz.
+        void    Enable (BOOL on);
 
-	// True while Match Monitor Rate is active.
-	bool	IsEnabled ();
+        // Re-attempt vsync initialization. Called by GFX::Start after the
+        // OpenGL context has been created, in case Enable(TRUE) was invoked
+        // earlier when no context existed yet. Safe to call repeatedly.
+        void    ReinitVSync ();
 
-	// Re-measure the monitor refresh rate. Call from WM_DISPLAYCHANGE
-	// (resolution / monitor changed) and from any other place that may
-	// invalidate the cached measurement.
-	void	OnDisplayChange ();
+        // True while Match Monitor Rate is active.
+        bool    IsEnabled ();
 
-	// Called from GFX::DrawScreen after Update() has finished the
-	// SwapBuffers / Blt. Updates the calibration counter used to refine
-	// the monitor-rate measurement, which the next APU::UpdateDRC call
-	// picks up to compute the DRC target frequency.
-	void	OnFrameEnd ();
+        // True if OpenGL vsync was successfully enabled. When false,
+        // SwapBuffers does not block until the next vblank, and the
+        // DRC must NOT apply the (monitorHz / nesHz) base target —
+        // the emulator is still running at the NES rate, not the
+        // monitor rate, so the base target would cause constant
+        // buffer drift and audible stutter.
+        bool    IsVSyncActive ();
 
-	// Called from APU::Run inside the audio-buffer fill wait loop in
-	// place of the old Sleep(1) / waitable-timer hack. Currently uses
-	// Sleep(1) (precise because timeBeginPeriod(1) is active), but kept
-	// as a separate function so future versions can swap in a smarter
-	// wait without touching APU.cpp.
-	void	PaceFrame ();
+        // Re-measure the monitor refresh rate. Call from WM_DISPLAYCHANGE
+        // (resolution / monitor changed) and from any other place that may
+        // invalidate the cached measurement.
+        void    OnDisplayChange ();
 
-	// Reset per-frame timing state. Called when (re)starting emulation
-	// or toggling the feature on so the first frame does not produce a
-	// bogus QPC delta.
-	void	ResetState ();
+        // Called from GFX::DrawScreen after Update() has finished the
+        // SwapBuffers / Blt. Updates the calibration counter used to refine
+        // the monitor-rate measurement, which the next APU::UpdateDRC call
+        // picks up to compute the DRC target frequency.
+        void    OnFrameEnd ();
 
-	// Current measured monitor refresh rate, in Hz.
-	// Always returns a value in [30, 1000]; falls back to 60.0 if no
-	// measurement has been taken yet.
-	double	GetMonitorHz ();
+        // Called from APU::Run inside the audio-buffer fill wait loop in
+        // place of the old Sleep(1) / waitable-timer hack. Currently uses
+        // Sleep(1) (precise because timeBeginPeriod(1) is active), but kept
+        // as a separate function so future versions can swap in a smarter
+        // wait without touching APU.cpp.
+        void    PaceFrame ();
 
-	// Native NES refresh rate for the current region, in Hz.
-	// NTSC = 60.0988, PAL = 50.0069, Dendy = 50.0039.
-	double	GetNESHz ();
+        // Reset per-frame timing state. Called when (re)starting emulation
+        // or toggling the feature on so the first frame does not produce a
+        // bogus QPC delta.
+        void    ResetState ();
 
-	// Tell MonitorSync which NES region is active so GetNESHz returns
-	// the correct value. Called from APU::SetRegion.
-	void	SetNESRegion (int region);
+        // Current measured monitor refresh rate, in Hz.
+        // Always returns a value in [30, 1000]; falls back to 60.0 if no
+        // measurement has been taken yet.
+        double  GetMonitorHz ();
+
+        // Native NES refresh rate for the current region, in Hz.
+        // NTSC = 60.0988, PAL = 50.0069, Dendy = 50.0039.
+        double  GetNESHz ();
+
+        // Tell MonitorSync which NES region is active so GetNESHz returns
+        // the correct value. Called from APU::SetRegion.
+        void    SetNESRegion (int region);
 }

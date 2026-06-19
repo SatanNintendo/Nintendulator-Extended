@@ -30,9 +30,18 @@
 // ------------------------------------------------------------------
 // WGL swap-control extension (present in every Windows OpenGL ICD
 // since at least 2005; still loaded dynamically to be safe).
+//
+// IMPORTANT: WGL extensions are NOT exposed through glGetString(GL_EXTENSIONS)
+// — that returns GL extensions only. We must query WGL extensions via
+// wglGetExtensionsStringARB (WGL_ARB_extensions_string) or the older
+// wglGetExtensionsStringEXT (WGL_EXT_extensions_string), both of which
+// are themselves WGL extension entry points loaded via wglGetProcAddress.
+// If neither is available, we probe wglSwapIntervalEXT directly.
 // ------------------------------------------------------------------
 typedef BOOL (WINAPI *PFN_wglSwapIntervalEXT)(int);
+typedef int  (WINAPI *PFN_wglGetSwapIntervalEXT)(void);
 typedef const char* (WINAPI *PFN_wglGetExtensionsStringARB)(HDC);
+typedef const char* (WINAPI *PFN_wglGetExtensionsStringEXT)(void);
 
 namespace MonitorSync
 {
@@ -48,10 +57,19 @@ namespace MonitorSync
 
         // Function pointers (optional; NULL on systems that lack them).
         static PFN_wglSwapIntervalEXT         pfnWglSwapIntervalEXT         = NULL;
+        static PFN_wglGetSwapIntervalEXT      pfnWglGetSwapIntervalEXT      = NULL;
 
         // Measured / cached values.
         static double         g_MonitorHz      = 60.0;     // last confirmed monitor rate
         static double         g_NESHz          = 60.0988;  // NTSC default; updated by SetNESRegion
+
+        // Did we successfully enable OpenGL vsync?
+        // If false, SwapBuffers will return immediately and we need a
+        // fallback pacing strategy (busy-wait + Sleep(0)) inside PaceFrame
+        // and the DRC must NOT apply the (monitorHz / nesHz) base target
+        // because the emulator is still running at the NES rate, not the
+        // monitor rate.
+        static bool           g_VSyncActive    = false;
 
         // ------------------------------------------------------------------
         // Calibration: refine g_MonitorHz by sampling frame-to-frame QPC
@@ -90,37 +108,79 @@ namespace MonitorSync
 
         // Query the WGL_EXT_swap_control entry points through the active
         // OpenGL context. The caller manages wglMakeCurrent.
+        //
+        // Note: WGL extensions are exposed via wglGetExtensionsStringARB
+        // (WGL_ARB_extensions_string) or wglGetExtensionsStringEXT
+        // (WGL_EXT_extensions_string), NOT via glGetString(GL_EXTENSIONS).
+        // The latter only returns GL-side extensions and will not contain
+        // "WGL_EXT_swap_control" — checking it would always report vsync
+        // as unsupported and silently disable the feature.
         static void LoadWGLSwapControl()
         {
                 if (pfnWglSwapIntervalEXT) return;
                 if (!GFX::hGLDC || !GFX::hGLRC) return;
 
-                PFN_wglGetExtensionsStringARB pfnGetExt =
+                // Try to obtain the WGL extension string. Both entry points are
+                // themselves WGL extensions, but they are universally supported
+                // on Windows OpenGL ICDs from the last 15+ years.
+                PFN_wglGetExtensionsStringARB pfnGetARB =
                         (PFN_wglGetExtensionsStringARB)wglGetProcAddress("wglGetExtensionsStringARB");
+                PFN_wglGetExtensionsStringEXT pfnGetEXT =
+                        (PFN_wglGetExtensionsStringEXT)wglGetProcAddress("wglGetExtensionsStringEXT");
 
                 const char* exts = NULL;
-                if (pfnGetExt)
-                        exts = pfnGetExt(GFX::hGLDC);
+                if (pfnGetARB)
+                        exts = pfnGetARB(GFX::hGLDC);
+                else if (pfnGetEXT)
+                        exts = pfnGetEXT();
+
+                bool hasSwapControl = false;
+                if (exts)
+                {
+                        hasSwapControl = (strstr(exts, "WGL_EXT_swap_control")      != NULL) ||
+                                         (strstr(exts, "WGL_ARB_swap_control")      != NULL) ||
+                                         (strstr(exts, "WGL_EXT_swap_control_tear") != NULL);
+                }
                 else
-                        exts = (const char*)glGetString(GL_EXTENSIONS);
+                {
+                        // No WGL extension string available. Most modern drivers
+                        // still expose wglSwapIntervalEXT, so probe it directly —
+                        // wglGetProcAddress returns NULL if the function is absent.
+                }
 
-                if (!exts) return;
+                if (!hasSwapControl && exts)
+                        return; // extension string is present but lacks swap_control
 
-                bool hasSwapControl = (strstr(exts, "WGL_EXT_swap_control")      != NULL) ||
-                                      (strstr(exts, "WGL_ARB_swap_control")      != NULL) ||
-                                      (strstr(exts, "WGL_EXT_swap_control_tear") != NULL);
-                if (!hasSwapControl) return;
-
+                // Load the entry points. wglGetProcAddress returns NULL when the
+                // function is not supported, so this doubles as a presence check.
                 pfnWglSwapIntervalEXT = (PFN_wglSwapIntervalEXT)wglGetProcAddress("wglSwapIntervalEXT");
+                if (pfnWglSwapIntervalEXT)
+                        pfnWglGetSwapIntervalEXT = (PFN_wglGetSwapIntervalEXT)wglGetProcAddress("wglGetSwapIntervalEXT");
         }
 
-        static void SetOpenGLVSync(int interval)
+        // Returns true if vsync was successfully set to the requested interval.
+        // Caller must have a current OpenGL context on the calling thread; we
+        // do wglMakeCurrent ourselves to be safe but never leave the context
+        // current on this thread (the rendering thread owns it).
+        static bool SetOpenGLVSync(int interval)
         {
                 if (!pfnWglSwapIntervalEXT || !GFX::hGLDC || !GFX::hGLRC)
-                        return;
+                        return false;
                 wglMakeCurrent(GFX::hGLDC, GFX::hGLRC);
-                pfnWglSwapIntervalEXT(interval);
+                BOOL ok = pfnWglSwapIntervalEXT(interval);
+
+                // Best-effort verification: read back the current interval. If the
+                // driver reports something different from what we asked for, vsync
+                // is effectively not active and we should let the caller know so
+                // it can fall back to a different sync strategy.
+                bool verified = (ok != FALSE);
+                if (verified && pfnWglGetSwapIntervalEXT)
+                {
+                        int actual = pfnWglGetSwapIntervalEXT();
+                        verified = (actual == interval);
+                }
                 wglMakeCurrent(NULL, NULL);
+                return verified;
         }
 
         // ------------------------------------------------------------------
@@ -167,8 +227,15 @@ namespace MonitorSync
                 BOOL prev = (BOOL)InterlockedExchange(&g_Enabled, on ? TRUE : FALSE);
                 bool prevBool = (prev != FALSE);
                 bool newBool  = (on != FALSE);
+
+                // Even if the flag did not change, we may need to (re)initialize
+                // vsync — for example, when Enable(TRUE) was called before the
+                // OpenGL context existed (so vsync could not be set), and now
+                // the context is ready. The caller handles this by invoking
+                // ReinitVSync() after GL_Init; we don't do it here to keep the
+                // Enable() path idempotent.
                 if (prevBool == newBool)
-                        return; // no change
+                        return;
 
                 if (newBool)
                 {
@@ -177,13 +244,14 @@ namespace MonitorSync
 
                         // Load WGL swap control (needs an active context) and turn
                         // vsync on so SwapBuffers blocks until the next vblank.
+                        g_VSyncActive = false;
                         if (GFX::hGLDC && GFX::hGLRC)
                         {
                                 wglMakeCurrent(GFX::hGLDC, GFX::hGLRC);
                                 LoadWGLSwapControl();
                                 wglMakeCurrent(NULL, NULL);
+                                g_VSyncActive = SetOpenGLVSync(1);
                         }
-                        SetOpenGLVSync(1);
 
                         ResetState();
                 }
@@ -196,13 +264,38 @@ namespace MonitorSync
                         // We do, however, reset the DRC frequency back to the
                         // standard 44100 Hz so any accumulated adjustment from the
                         // MatchMonitorRate session is cleared.
+                        g_VSyncActive = false;
                         APU::ResetDRC();
+                }
+        }
+
+        // Re-attempt vsync initialization. Called by GFX::Start after the
+        // OpenGL context has been created, in case Enable(TRUE) was invoked
+        // earlier when no context existed yet. Safe to call repeatedly.
+        void ReinitVSync()
+        {
+                if (!g_Initialized || !IsEnabled())
+                        return;
+                if (g_VSyncActive)
+                        return; // already initialised
+
+                if (GFX::hGLDC && GFX::hGLRC)
+                {
+                        wglMakeCurrent(GFX::hGLDC, GFX::hGLRC);
+                        LoadWGLSwapControl();
+                        wglMakeCurrent(NULL, NULL);
+                        g_VSyncActive = SetOpenGLVSync(1);
                 }
         }
 
         bool IsEnabled()
         {
                 return InterlockedExchangeAdd(&g_Enabled, 0) != 0;
+        }
+
+        bool IsVSyncActive()
+        {
+                return g_VSyncActive;
         }
 
         double GetMonitorHz()
@@ -284,19 +377,29 @@ namespace MonitorSync
 
         void PaceFrame()
         {
-                // Called from the audio-buffer fill wait loop. With OpenGL vsync
-                // enabled, the real frame pacing happens inside SwapBuffers
-                // (called from GFX::Update) which blocks until the next monitor
-                // vblank. Here we just need to wait efficiently for DirectSound
-                // to consume the next buffer chunk.
+                // Called from the audio-buffer fill wait loop.
                 //
-                // timeBeginPeriod(1) is already active (set up in WinMain), so
-                // Sleep(1) has ~1ms granularity rather than the default 15.6ms.
-                // This is precise enough for the DirectSound wait (the buffer
-                // chunk takes ~16ms to drain at 44100 Hz / 60 FPS) and does not
-                // burn a CPU core on a busy-wait. The previous 500us waitable-
-                // timer hack was actually LESS accurate because it was a fixed
-                // delay unrelated to the actual vblank position.
-                Sleep(1);
+                // Two scenarios:
+                //
+                // 1. VSync is active (the common case): SwapBuffers inside
+                //    GFX::Update has already blocked until the next monitor
+                //    vblank, throttling the emulator to monitor_hz. Here we
+                //    only need to wait for DirectSound to drain its buffer
+                //    chunk (~16ms at 60 FPS), and Sleep(1) with the 1ms timer
+                //    resolution enabled by WinMain is precise enough without
+                //    burning a CPU core.
+                //
+                // 2. VSync is NOT active (driver lacks WGL_EXT_swap_control,
+                //    or context creation failed, or SetOpenGLVSync returned
+                //    false): SwapBuffers returns immediately and the emulator
+                //    runs at full NES speed. The previous implementation had a
+                //    500us waitable-timer hack here; we replace it with a
+                //    Sleep(0) busy-yield which is at least as good (the timer
+                //    was a fixed delay unrelated to vblank anyway). The
+                //    DirectSound buffer drain itself throttles the loop.
+                if (g_VSyncActive)
+                        Sleep(1);
+                else
+                        Sleep(0);
         }
 }
