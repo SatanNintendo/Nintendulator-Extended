@@ -21,6 +21,7 @@
 # include "GFX.h"
 # include "Lang.h"
 # include "Theme.h"
+# include "MonitorSync.h"
 
 # pragma comment(lib, "dsound.lib")
 # pragma comment(lib, "dxguid.lib")
@@ -61,15 +62,7 @@ static const double     drc_max_adjust  = 0.05;
 #define FRAMEBUF        4
 const unsigned int      LOCK_SIZE = FREQ * (BITS / 8);
 
-static DWORD            drc_play_freq   = FREQ;  // now it's fine
-
-// High-resolution waitable timer for frame throttle (used when MatchMonitorRate is on).
-// CreateWaitableTimerExW with CREATE_WAITABLE_TIMER_HIGH_RESOLUTION is available
-// since Windows 10 1803. We load it dynamically so the binary still runs on Win7/8.
-static HANDLE           hFrameTimer     = NULL;
-typedef HANDLE (WINAPI *PFN_CreateWaitableTimerExW)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
-static PFN_CreateWaitableTimerExW pfnCreateWaitableTimerExW = NULL;
-#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG 0x00000002
+static DWORD            drc_play_freq   = FREQ;  // current DirectSound playback frequency
 #endif
 
 const   unsigned char   LengthCounts[32] = {
@@ -1011,7 +1004,24 @@ void    SetRegion (void)
         if (Enabled)
                 SoundON();
 #endif  /* !NSFPLAYER */
+
+        // Keep MonitorSync aware of the active NES region so its
+        // GetNESHz() returns the correct value for DRC calculations.
+#ifndef NSFPLAYER
+        NotifyMonitorSyncRegion();
+#endif  /* !NSFPLAYER */
 }
+
+// Forward the current NES region to the MonitorSync module.
+// Implemented here (rather than in NES.cpp) so the call site does not
+// have to include MonitorSync.h, and so the dependency on
+// MonitorSync::SetNESRegion stays inside the APU translation unit.
+#ifndef NSFPLAYER
+void    NotifyMonitorSyncRegion (void)
+{
+        MonitorSync::SetNESRegion((int)NES::CurRegion);
+}
+#endif  /* !NSFPLAYER */
 
 void    Init (void)
 {
@@ -1110,35 +1120,12 @@ void    Start (void)
                 return;
         }
         EI.DbgOut(Lang::GetString(LANG_MSG_APU_STARTED));
-
-        // Try to create a high-resolution waitable timer (Win10 1803+).
-        // Used instead of Sleep(1) when Match Monitor Rate is active for more
-        // precise frame throttling. Falls back to Sleep(1) if unavailable.
-        if (!pfnCreateWaitableTimerExW)
-        {
-                HMODULE hKernel = GetModuleHandleW(L"kernel32.dll");
-                if (hKernel)
-                        pfnCreateWaitableTimerExW = (PFN_CreateWaitableTimerExW)
-                                GetProcAddress(hKernel, "CreateWaitableTimerExW");
-        }
-        if (pfnCreateWaitableTimerExW && !hFrameTimer)
-        {
-                hFrameTimer = pfnCreateWaitableTimerExW(
-                        NULL, NULL,
-                        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG,
-                        TIMER_ALL_ACCESS);
-        }
 #endif  /* !NSFPLAYER */
 }
 
 void    Stop (void)
 {
 #ifndef NSFPLAYER
-        if (hFrameTimer)
-        {
-                CloseHandle(hFrameTimer);
-                hFrameTimer = NULL;
-        }
         if (Buffer)
         {
                 SoundOFF();
@@ -1558,14 +1545,22 @@ int sampcycles = 0, samppos = 0;
 // Dynamic Rate Control.
 // Called every ~20 frames from GFX::Update when Match Monitor Rate is enabled.
 //
-// Check how full the DirectSound ring buffer is:
-//   - Buffer too full     → emulator generates sound faster than DirectSound plays
-//   - Buffer too empty    → emulator is slower
-// In both cases, there will eventually be a click and frame disruption.
+// Two layers of correction are applied:
 //
-// Solution: slightly speed up or slow down playback via SetFrequency,
-// keeping the buffer around 50% full. Deviation does not exceed ±5% of 44100 Hz
-// and is completely inaudible.
+//   1. Base target frequency = FREQ * (monitor_hz / nes_hz).
+//      When the monitor's refresh rate differs from the NES native rate
+//      (e.g. 60.000 Hz monitor vs 60.0988 Hz NES), the DirectSound
+//      playback rate has to be shifted by the same ratio so the audio
+//      buffer stays balanced while OpenGL vsync throttles the emulator
+//      to the monitor rate. This eliminates the ~10-second micro-stutter
+//      caused by the previous rate mismatch.
+//
+//   2. Fine correction based on the DirectSound buffer fill ratio.
+//      Even with the correct base target, transient drift (driver
+//      jitter, frame-to-frame timing variance) will accumulate. A small
+//      proportional correction keeps the buffer centred at 50%.
+//
+// Total deviation from FREQ is capped at ±5%, which is inaudible.
 //
 void    UpdateDRC (void)
 {
@@ -1573,48 +1568,55 @@ void    UpdateDRC (void)
         if (!Buffer || !isEnabled)
                 return;
 
-        // Get current buffer positions
+        // ----- Layer 1: monitor-rate-aware base target -----
+        double baseFreq = (double)FREQ;
+        if (MonitorSync::IsEnabled())
+        {
+                double monitorHz = MonitorSync::GetMonitorHz();
+                double nesHz     = MonitorSync::GetNESHz();
+                if (nesHz > 0.0 && monitorHz > 0.0)
+                        baseFreq = (double)FREQ * (monitorHz / nesHz);
+        }
+
+        // ----- Layer 2: buffer-fill fine correction -----
         unsigned long rpos, wpos;
         if (FAILED(Buffer->GetCurrentPosition(&rpos, &wpos)))
                 return;
 
-        // Full ring buffer size in bytes
         DWORD totalSize = LockSize * FRAMEBUF;
         if (totalSize == 0)
                 return;
 
-        // Bytes waiting for playback (accounting for ring wraparound)
         long fill;
         if (wpos >= rpos)
                 fill = (long)(wpos - rpos);
         else
                 fill = (long)(totalSize - rpos + wpos);
 
-        // Fill ratio as fraction 0.0..1.0
         double fillRatio = (double)fill / (double)totalSize;
-
-        // Deviation from 50% target:
-        // positive = buffer too full → speed up playback
-        // negative = buffer too empty → slow down
         double error = fillRatio - drc_target_fill;
 
-        // Smooth correction: coefficient 0.1 means we eliminate 10% of the error
-        // per call. At 10% deviation, frequency changes by 1% of 44100.
-        double adjustment = error * 0.1;
+        // Smaller coefficient than before because the base target already
+        // removes the systematic drift; we only need to correct residual
+        // jitter. 5% of the error per call, capped at ±2%.
+        double adjustment = error * 0.05;
+        if (adjustment >  0.02) adjustment =  0.02;
+        if (adjustment < -0.02) adjustment = -0.02;
 
-        // Limit maximum deviation to ±5%
-        if (adjustment >  drc_max_adjust) adjustment =  drc_max_adjust;
-        if (adjustment < -drc_max_adjust) adjustment = -drc_max_adjust;
+        double newFreqD = baseFreq * (1.0 + adjustment);
 
-        // Calculate new playback frequency
-        DWORD newFreq = (DWORD)((double)FREQ * (1.0 + adjustment) + 0.5);
+        // Hard cap: never let the playback rate deviate from the standard
+        // FREQ by more than the original ±5% window. This protects against
+        // a runaway measurement feeding back into an extreme correction.
+        double lo = (double)FREQ * (1.0 - drc_max_adjust);
+        double hi = (double)FREQ * (1.0 + drc_max_adjust);
+        if (newFreqD < lo) newFreqD = lo;
+        if (newFreqD > hi) newFreqD = hi;
 
-        // Hard limits as a safety measure (±5% of 44100)
-        if (newFreq < 39690) newFreq = 39690;
-        if (newFreq > 46305) newFreq = 46305;
+        DWORD newFreq = (DWORD)(newFreqD + 0.5);
 
-        // Apply only if the change is significant (≥10 Hz)
-        // to avoid unnecessary SetFrequency calls
+        // Apply only if the change is significant (≥10 Hz) to avoid
+        // hammering SetFrequency with no-op calls.
         if (newFreq != drc_play_freq &&
             (newFreq > drc_play_freq + 10 || newFreq + 10 < drc_play_freq))
         {
@@ -1658,18 +1660,17 @@ void    Run (void)
                 {
                         if (!isEnabled)
                                 break;
-                        // When Match Monitor Rate is active and a high-resolution
-                        // waitable timer is available, use it instead of Sleep(1).
-                        // SetWaitableTimer with a relative delay of -500µs (in 100ns units)
-                        // gives ~0.5ms precision vs ~15ms for Sleep(1), which eliminates
-                        // the coarse timing that causes micro-stutters in the video output.
-                        if (GFX::MatchMonitorRate && hFrameTimer)
-                        {
-                                LARGE_INTEGER due;
-                                due.QuadPart = -5000LL; // 500 microseconds in 100ns units
-                                SetWaitableTimer(hFrameTimer, &due, 0, NULL, NULL, FALSE);
-                                WaitForSingleObject(hFrameTimer, 2); // 2ms safety timeout
-                        }
+                        // When Match Monitor Rate is active, delegate the wait to
+                        // MonitorSync::PaceFrame (which uses Sleep(1) with the
+                        // 1ms timer resolution already enabled by WinMain). The
+                        // real frame pacing is handled by OpenGL vsync inside
+                        // GFX::Update's SwapBuffers call, which blocks until the
+                        // next monitor vblank. Otherwise fall back to the same
+                        // Sleep(1) — the difference is only in bookkeeping, but
+                        // keeping the call sites distinct lets us later swap
+                        // PaceFrame for a smarter wait without touching APU.cpp.
+                        if (GFX::MatchMonitorRate)
+                                MonitorSync::PaceFrame();
                         else
                                 Sleep(1);
                         Try(Buffer->GetCurrentPosition(&rpos, &wpos), Lang::GetString(LANG_ERR_APU_BUFFER));

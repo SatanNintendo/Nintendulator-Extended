@@ -35,6 +35,7 @@
 #include "States.h"
 #include "HeaderEdit.h"
 #include "Theme.h"
+#include "MonitorSync.h"
 #include <shlwapi.h>
 
 #pragma comment(lib, "shlwapi.lib")
@@ -176,6 +177,12 @@ int APIENTRY _tWinMain (HINSTANCE hInstance, HINSTANCE hPrevInstance, LPTSTR lpC
         // Perform application initialization:
         if (!InitInstance (hInstance, nCmdShow))
                 return FALSE;
+
+        // Initialize the MonitorSync module now that the main window exists.
+        // It loads DWM/WGL function pointers and queries the current monitor
+        // refresh rate. Does not enable anything yet — that happens only when
+        // the user toggles "Match Monitor Rate" on.
+        MonitorSync::Init(hMainWnd);
 
         hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_NINTENDULATOR));
 
@@ -702,13 +709,9 @@ case ID_PPU_BILINEAR:
     break;
 case ID_PPU_MATCHRATE:
                         GFX::MatchMonitorRate = !GFX::MatchMonitorRate;
-        if (!GFX::MatchMonitorRate)
-        {
-                // On disable - explicitly reset playback frequency to standard 44100 Hz.
-                // UpdateDRC() would just measure current buffer fill and may leave the
-                // frequency shifted; ResetDRC() forces it back to FREQ unconditionally.
-                APU::ResetDRC();
-        }
+        // Hand off to the MonitorSync module: this is where vsync is enabled,
+        // the monitor rate is (re)measured, and DRC state is reset.
+        MonitorSync::Enable(GFX::MatchMonitorRate ? TRUE : FALSE);
         if (GFX::MatchMonitorRate)
                                 CheckMenuItem(hMenu, ID_PPU_MATCHRATE, MF_CHECKED);
         else    CheckMenuItem(hMenu, ID_PPU_MATCHRATE, MF_UNCHECKED);
@@ -920,6 +923,16 @@ case WM_SIZE:
         GFX::GL_Resize(rc.right - rc.left, rc.bottom - rc.top);
 }
 break;
+
+case WM_DISPLAYCHANGE:
+        // The display resolution or refresh rate has changed (user
+        // adjusted settings, plugged in a new monitor, switched monitor
+        // while the emulator was running, etc.). Have MonitorSync
+        // re-measure the refresh rate so DRC keeps tracking the correct
+        // value. This is safe to call from the main thread; it only
+        // updates cached measurements, not the volatile enable flag.
+        MonitorSync::OnDisplayChange();
+        break;
 
 case WM_CLOSE:
                 NES::Stop();

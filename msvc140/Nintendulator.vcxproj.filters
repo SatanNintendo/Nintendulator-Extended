@@ -50,6 +50,9 @@
     <ClCompile Include="..\src\Movie.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\MonitorSync.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\NES.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -146,6 +149,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\src\Movie.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\MonitorSync.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\src\NES.h">

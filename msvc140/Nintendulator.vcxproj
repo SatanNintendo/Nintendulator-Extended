@@ -82,6 +82,7 @@
     <ClCompile Include="..\src\HeaderEdit.cpp" />
     <ClCompile Include="..\src\MapperInterface.cpp" />
     <ClCompile Include="..\src\Movie.cpp" />
+    <ClCompile Include="..\src\MonitorSync.cpp" />
     <ClCompile Include="..\src\NES.cpp" />
     <ClCompile Include="..\src\Nintendulator.cpp" />
     <ClCompile Include="..\src\Lang.cpp" />
@@ -116,6 +117,7 @@
     <ClInclude Include="..\src\HeaderEdit.h" />
     <ClInclude Include="..\src\MapperInterface.h" />
     <ClInclude Include="..\src\Movie.h" />
+    <ClInclude Include="..\src\MonitorSync.h" />
     <ClInclude Include="..\src\NES.h" />
     <ClInclude Include="..\src\Nintendulator.h" />
     <ClInclude Include="..\src\Lang.h" />

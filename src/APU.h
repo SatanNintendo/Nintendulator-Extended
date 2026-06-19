@@ -48,6 +48,15 @@ void    Run             (void);
 void    SetRegion       (void);
 void    UpdateDRC       (void);
 void    ResetDRC        (void);
+
+#ifndef NSFPLAYER
+// Tell the APU that the monitor sync module needs to be informed of the
+// current NES region. Implemented in APU.cpp; declared here so callers
+// can reach it without including MonitorSync.h.
+// NSFPLAYER build does not use MonitorSync, so the function is absent there.
+void    NotifyMonitorSyncRegion (void);
+#endif  /* !NSFPLAYER */
+
 int     MAPINT  IntRead (int, int);
 void    MAPINT  IntWrite (int, int, int);
 } // namespace APU

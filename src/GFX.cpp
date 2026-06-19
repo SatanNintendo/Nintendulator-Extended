@@ -17,6 +17,7 @@
 #include "Lang.h"
 #include "APU.h"
 #include "Theme.h"
+#include "MonitorSync.h"
 
 #if (_MSC_VER < 1400)
 // newer versions of the DirectX SDK helpfully fail to include ddraw.lib
@@ -582,6 +583,15 @@ void    Start (void)
                         return;
                 }
 
+                // OpenGL context has just been created. If Match Monitor Rate
+                // is already enabled (e.g. loaded from settings at startup or
+                // toggled on before any ROM was loaded), this is the first
+                // moment we can actually load WGL swap control and turn vsync
+                // on. MonitorSync::Enable is a no-op if the flag is already
+                // in the desired state, so calling it here is always safe.
+                if (MatchMonitorRate)
+                        MonitorSync::Enable(TRUE);
+
                 if (Fullscreen)
                 {
                         // Save window position before entering fullscreen mode
@@ -1052,6 +1062,13 @@ void    DrawScreen (void)
         {
                 Update();
                 FPSCnt = 0;
+                // When Match Monitor Rate is enabled, Update() (which calls
+                // SwapBuffers) has just blocked until the next monitor vblank
+                // thanks to OpenGL vsync turned on by MonitorSync::Enable.
+                // Use this post-vblank moment to refine the monitor-rate
+                // measurement and apply an extra DwmFlush sync hint.
+                if (MatchMonitorRate)
+                        MonitorSync::OnFrameEnd();
         }
         QueryPerformanceCounter(&TmpClockVal);
         // Guard: on the very first DrawScreen call after ROM load, LastClockVal is 0.
