@@ -1562,12 +1562,6 @@ int sampcycles = 0, samppos = 0;
 //
 // Total deviation from FREQ is capped at ±5%, which is inaudible.
 //
-// Note: a previous attempt added an integral (I) term to cancel the
-// residual ~25-second drift. It interacted with the EMA calibration
-// filter and produced audible auto-oscillation ("floating music").
-// The P-only controller is deliberately kept here because it is
-// stable; the residual drift is small enough (a buffer wrap every
-// ~25 s) to be imperceptible in practice.
 void    UpdateDRC (void)
 {
 #ifndef NSFPLAYER
@@ -1608,9 +1602,9 @@ void    UpdateDRC (void)
         double fillRatio = (double)fill / (double)totalSize;
         double error = fillRatio - drc_target_fill;
 
-        // Proportional correction: 5% of the error per call, capped at
-        // ±2%. This is small enough to be inaudible per-step but large
-        // enough to keep the buffer centred over a few seconds.
+        // Smaller coefficient than before because the base target already
+        // removes the systematic drift; we only need to correct residual
+        // jitter. 5% of the error per call, capped at ±2%.
         double adjustment = error * 0.05;
         if (adjustment >  0.02) adjustment =  0.02;
         if (adjustment < -0.02) adjustment = -0.02;
@@ -1639,13 +1633,12 @@ void    UpdateDRC (void)
 }
 
 // Reset DRC: force playback frequency back to the standard 44100 Hz.
-// Called when Match Monitor Rate is disabled (toggled off by the user)
-// AND when it is re-enabled (via Enable(TRUE) from the menu handler),
-// so that any accumulated DRC adjustment is cleared before starting a
-// fresh sync session. This is intentionally NOT the same as calling
-// UpdateDRC(), because UpdateDRC measures the current buffer fill and
-// may keep the frequency shifted if the buffer happens to be off-center
-// at the moment of disable.
+// Called when Match Monitor Rate is disabled (toggled off by the user),
+// so that any accumulated DRC adjustment is cleared and audio plays at
+// the original sample rate. This is intentionally NOT the same as calling
+// UpdateDRC(), because UpdateDRC measures the current buffer fill and may
+// keep the frequency shifted if the buffer happens to be off-center at
+// the moment of disable.
 void    ResetDRC (void)
 {
 #ifndef NSFPLAYER

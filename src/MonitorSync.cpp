@@ -7,15 +7,10 @@
  *      thread to the monitor's true refresh rate. This is what eliminates
  *      the ~10-second micro-stutter when monitor and NES rates differ.
  *
- *   2. Periodically refine the monitor refresh rate by averaging
- *      frame-to-frame QPC deltas over a 60-frame window. With vsync on,
- *      the measured FPS equals the monitor refresh rate, which we feed
- *      into the DRC target so the audio playback rate tracks
- *      (monitor_hz / nes_hz) * 44100 instead of being pinned to 44100.
- *      Block averaging is used (rather than an EMA) because it produces
- *      a stable, low-jitter value: an EMA with a short time constant
- *      was tried and produced audible auto-oscillation when combined
- *      with the DRC feedback loop.
+ *   2. Continuously measure the actual frame rate via QueryPerformanceCounter
+ *      sampling. With vsync on, the measured FPS equals the monitor refresh
+ *      rate, which we feed into the DRC target so the audio playback rate
+ *      tracks (monitor_hz / nes_hz) * 44100 instead of being pinned to 44100.
  *
  * Every external API is loaded dynamically so the binary still runs on a
  * fresh Windows 7 install without any redistributables. Missing APIs are
@@ -78,18 +73,12 @@ namespace MonitorSync
 
         // ------------------------------------------------------------------
         // Calibration: refine g_MonitorHz by sampling frame-to-frame QPC
-        // deltas over a 60-frame window. With OpenGL vsync on, the measured
-        // FPS equals the monitor refresh rate, so averaging over 60 frames
-        // (~1 second at 60 Hz) gives a stable reading with low jitter.
-        //
-        // Block averaging is preferred over an EMA here because the DRC
-        // feedback loop is sensitive to per-frame Hz jitter: an EMA with
-        // a short time constant tracks the natural QPC quantisation noise
-        // and feeds it into the DRC, which then oscillates the audio
-        // playback rate (audible as "floating music"). Block averaging
-        // produces a single, stable value per second, which the DRC can
-        // track without oscillation.
-        // -----------------------------------------------------------------
+        // deltas. With OpenGL vsync on, the emulator's measured FPS equals
+        // the monitor refresh rate, so averaging over N frames gives us a
+        // very accurate reading. This is more reliable than
+        // DwmGetCompositionTimingInfo's rateRefresh field (which is sometimes
+        // wrong by ~0.1 Hz on certain driver / monitor combinations).
+        // ------------------------------------------------------------------
         static const int      CALIB_FRAMES     = 60;       // sampling window
         static int            g_CalibCount     = 0;
         static LARGE_INTEGER  g_CalibStartQPC  = {0, 0};
@@ -239,20 +228,15 @@ namespace MonitorSync
                 bool prevBool = (prev != FALSE);
                 bool newBool  = (on != FALSE);
 
-                // IMPORTANT: we deliberately do NOT early-return on (prevBool == newBool).
-                // Toggling "Match Monitor Rate" off and back on at runtime (the
-                // "hot toggle" scenario) requires us to re-enable vsync, re-seed
-                // the calibration, and reset the DRC accumulator even though the
-                // *current* call sees the same target state as the last successful
-                // Enable(TRUE). If we skipped that, the second Enable(TRUE) would
-                // leave the emulator in a half-initialised state (vsync may have
-                // been turned off by the OS during the disable phase, the DRC
-                // integrator would retain stale state, etc.) and the user would
-                // see constant stutter until they restarted the ROM.
-                //
-                // The two callers are the menu handler (always toggles) and
-                // GFX::Start after GL_Init (always passes TRUE), so re-running
-                // the full init path on a no-op call is acceptable.
+                // Even if the flag did not change, we may need to (re)initialize
+                // vsync — for example, when Enable(TRUE) was called before the
+                // OpenGL context existed (so vsync could not be set), and now
+                // the context is ready. The caller handles this by invoking
+                // ReinitVSync() after GL_Init; we don't do it here to keep the
+                // Enable() path idempotent.
+                if (prevBool == newBool)
+                        return;
+
                 if (newBool)
                 {
                         // Fresh measurement before we start depending on it.
@@ -269,12 +253,6 @@ namespace MonitorSync
                                 g_VSyncActive = SetOpenGLVSync(1);
                         }
 
-                        // Reset DRC integrator and frequency so the new sync session
-                        // starts from a clean state. Without this, stale integrator
-                        // accumulation from a previous MatchMonitorRate session would
-                        // produce a transient frequency spike and audible glitch.
-                        APU::ResetDRC();
-
                         ResetState();
                 }
                 else
@@ -288,6 +266,25 @@ namespace MonitorSync
                         // MatchMonitorRate session is cleared.
                         g_VSyncActive = false;
                         APU::ResetDRC();
+                }
+        }
+
+        // Re-attempt vsync initialization. Called by GFX::Start after the
+        // OpenGL context has been created, in case Enable(TRUE) was invoked
+        // earlier when no context existed yet. Safe to call repeatedly.
+        void ReinitVSync()
+        {
+                if (!g_Initialized || !IsEnabled())
+                        return;
+                if (g_VSyncActive)
+                        return; // already initialised
+
+                if (GFX::hGLDC && GFX::hGLRC)
+                {
+                        wglMakeCurrent(GFX::hGLDC, GFX::hGLRC);
+                        LoadWGLSwapControl();
+                        wglMakeCurrent(NULL, NULL);
+                        g_VSyncActive = SetOpenGLVSync(1);
                 }
         }
 
@@ -335,8 +332,7 @@ namespace MonitorSync
                         return;
 
                 // Calibration: refine g_MonitorHz by averaging frame-to-frame
-                // QPC deltas over a 60-frame window. With vsync on, measured
-                // FPS = monitor refresh.
+                // QPC deltas. With vsync on, measured FPS = monitor refresh.
                 // Note: we do NOT call DwmFlush here — SwapBuffers (called from
                 // GFX::Update just before this) has already blocked until the
                 // next vblank thanks to OpenGL vsync. Calling DwmFlush on top
@@ -366,7 +362,7 @@ namespace MonitorSync
                                                 if (measuredHz >= 30.0 && measuredHz <= 1000.0)
                                                 {
                                                         // Low-pass filter: blend 50/50 with the
-                                                        // previous value so a single bad window
+                                                        // previous value so a single bad sample
                                                         // (e.g. window drag) can't yank the DRC
                                                         // target around.
                                                         g_MonitorHz = 0.5 * g_MonitorHz + 0.5 * measuredHz;
