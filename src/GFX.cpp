@@ -584,14 +584,15 @@ void    Start (void)
                 }
 
                 // OpenGL context has just been created. If Match Monitor Rate
-                // is already enabled (e.g. loaded from settings at startup or
-                // toggled on before any ROM was loaded), this is the first
-                // moment we can actually load WGL swap control and turn vsync
-                // on. ReinitVSync is a no-op if vsync is already active or
-                // MatchMonitorRate is disabled, so calling it here is always
-                // safe.
+                // is enabled (e.g. loaded from settings at startup or toggled
+                // on before any ROM was loaded), this is the first moment we
+                // can actually load WGL swap control and turn vsync on. We
+                // call Enable(TRUE) unconditionally — since the no-op early
+                // return was removed from Enable(), this always re-runs the
+                // full init path, which is what we want when a fresh GL
+                // context has just been created.
                 if (MatchMonitorRate)
-                        MonitorSync::ReinitVSync();
+                        MonitorSync::Enable(TRUE);
 
                 if (Fullscreen)
                 {

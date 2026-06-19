@@ -8,9 +8,18 @@
  *      the ~10-second micro-stutter when monitor and NES rates differ.
  *
  *   2. Continuously measure the actual frame rate via QueryPerformanceCounter
- *      sampling. With vsync on, the measured FPS equals the monitor refresh
- *      rate, which we feed into the DRC target so the audio playback rate
- *      tracks (monitor_hz / nes_hz) * 44100 instead of being pinned to 44100.
+ *      sampling using an exponential moving average (EMA). With vsync on,
+ *      the measured FPS equals the monitor refresh rate, which we feed
+ *      into the DRC target so the audio playback rate tracks
+ *      (monitor_hz / nes_hz) * 44100 instead of being pinned to 44100.
+ *      The EMA filter (alpha ~1/120) is much smoother than the previous
+ *      block-of-60-frames averaging and reacts faster to real changes
+ *      while still rejecting transient spikes (window drag, etc.).
+ *
+ *   3. Detect missed vblanks: if a frame took longer than 1.5 / monitor_hz
+ *      seconds, the driver skipped a vsync (rare but possible under load).
+ *      Such samples are excluded from the EMA so the calibration doesn't
+ *      drift toward a wrong value.
  *
  * Every external API is loaded dynamically so the binary still runs on a
  * fresh Windows 7 install without any redistributables. Missing APIs are
@@ -72,16 +81,28 @@ namespace MonitorSync
         static bool           g_VSyncActive    = false;
 
         // ------------------------------------------------------------------
-        // Calibration: refine g_MonitorHz by sampling frame-to-frame QPC
-        // deltas. With OpenGL vsync on, the emulator's measured FPS equals
-        // the monitor refresh rate, so averaging over N frames gives us a
-        // very accurate reading. This is more reliable than
-        // DwmGetCompositionTimingInfo's rateRefresh field (which is sometimes
-        // wrong by ~0.1 Hz on certain driver / monitor combinations).
+        // Calibration: refine g_MonitorHz via exponential moving average (EMA)
+        // of per-frame QPC deltas. With OpenGL vsync on, the measured FPS
+        // equals the monitor refresh rate.
+        //
+        // EMA is preferred over block-of-N-frames averaging because:
+        //   - It reacts continuously (no step changes every 60 frames).
+        //   - It weights recent samples more, so a real monitor-rate change
+        //     (e.g. user switched from 60 Hz to 144 Hz) propagates within
+        //     ~2 seconds instead of ~30 seconds.
+        //   - With alpha = 1/60, the effective time constant is ~60 frames
+        //     (~1 second at 60 Hz), which is long enough to reject per-frame
+        //     jitter but short enough to track real changes.
+        //
+        // Missed-vblank detection: if a frame took longer than 1.5 / monitor_hz
+        // seconds, the driver skipped a vsync (rare but possible under load).
+        // Such samples are excluded from the EMA so a transient stall doesn't
+        // pull the calibration toward a wrong value.
         // ------------------------------------------------------------------
-        static const int      CALIB_FRAMES     = 60;       // sampling window
-        static int            g_CalibCount     = 0;
-        static LARGE_INTEGER  g_CalibStartQPC  = {0, 0};
+        static const double   CALIB_EMA_ALPHA  = 1.0 / 60.0;  // ~1 second at 60 Hz
+        static const double   CALIB_MISS_FACTOR= 1.5;          // >1.5/Hz = missed vblank
+        static LARGE_INTEGER  g_LastFrameQPC   = {0, 0};
+        static bool           g_CalibSeeded    = false;        // first valid sample taken?
         static bool           g_CalibActive    = false;
 
         // ------------------------------------------------------------------
@@ -214,9 +235,12 @@ namespace MonitorSync
                 }
 
                 // Restart calibration so the new rate is confirmed via QPC
-                // sampling at the next opportunity.
-                g_CalibCount = 0;
-                g_CalibStartQPC.QuadPart = 0;
+                // sampling at the next opportunity. Clearing g_LastFrameQPC
+                // forces the next OnFrameEnd to re-seed the EMA rather than
+                // computing a delta across the display-change boundary (which
+                // could be a multi-second gap and would produce a garbage rate).
+                g_LastFrameQPC.QuadPart = 0;
+                g_CalibSeeded = false;
                 g_CalibActive = IsEnabled();
         }
 
@@ -228,15 +252,20 @@ namespace MonitorSync
                 bool prevBool = (prev != FALSE);
                 bool newBool  = (on != FALSE);
 
-                // Even if the flag did not change, we may need to (re)initialize
-                // vsync — for example, when Enable(TRUE) was called before the
-                // OpenGL context existed (so vsync could not be set), and now
-                // the context is ready. The caller handles this by invoking
-                // ReinitVSync() after GL_Init; we don't do it here to keep the
-                // Enable() path idempotent.
-                if (prevBool == newBool)
-                        return;
-
+                // IMPORTANT: we deliberately do NOT early-return on (prevBool == newBool).
+                // Toggling "Match Monitor Rate" off and back on at runtime (the
+                // "hot toggle" scenario) requires us to re-enable vsync, re-seed
+                // the calibration, and reset the DRC accumulator even though the
+                // *current* call sees the same target state as the last successful
+                // Enable(TRUE). If we skipped that, the second Enable(TRUE) would
+                // leave the emulator in a half-initialised state (vsync may have
+                // been turned off by the OS during the disable phase, the DRC
+                // integrator would retain stale state, etc.) and the user would
+                // see constant stutter until they restarted the ROM.
+                //
+                // The two callers are the menu handler (always toggles) and
+                // GFX::Start after GL_Init (always passes TRUE), so re-running
+                // the full init path on a no-op call is acceptable.
                 if (newBool)
                 {
                         // Fresh measurement before we start depending on it.
@@ -253,6 +282,12 @@ namespace MonitorSync
                                 g_VSyncActive = SetOpenGLVSync(1);
                         }
 
+                        // Reset DRC integrator and frequency so the new sync session
+                        // starts from a clean state. Without this, stale integrator
+                        // accumulation from a previous MatchMonitorRate session would
+                        // produce a transient frequency spike and audible glitch.
+                        APU::ResetDRC();
+
                         ResetState();
                 }
                 else
@@ -266,25 +301,6 @@ namespace MonitorSync
                         // MatchMonitorRate session is cleared.
                         g_VSyncActive = false;
                         APU::ResetDRC();
-                }
-        }
-
-        // Re-attempt vsync initialization. Called by GFX::Start after the
-        // OpenGL context has been created, in case Enable(TRUE) was invoked
-        // earlier when no context existed yet. Safe to call repeatedly.
-        void ReinitVSync()
-        {
-                if (!g_Initialized || !IsEnabled())
-                        return;
-                if (g_VSyncActive)
-                        return; // already initialised
-
-                if (GFX::hGLDC && GFX::hGLRC)
-                {
-                        wglMakeCurrent(GFX::hGLDC, GFX::hGLRC);
-                        LoadWGLSwapControl();
-                        wglMakeCurrent(NULL, NULL);
-                        g_VSyncActive = SetOpenGLVSync(1);
                 }
         }
 
@@ -321,8 +337,8 @@ namespace MonitorSync
 
         void ResetState()
         {
-                g_CalibCount = 0;
-                g_CalibStartQPC.QuadPart = 0;
+                g_LastFrameQPC.QuadPart = 0;
+                g_CalibSeeded = false;
                 g_CalibActive = true;
         }
 
@@ -331,47 +347,58 @@ namespace MonitorSync
                 if (!g_Initialized || !IsEnabled())
                         return;
 
-                // Calibration: refine g_MonitorHz by averaging frame-to-frame
-                // QPC deltas. With vsync on, measured FPS = monitor refresh.
+                // Calibration: refine g_MonitorHz via EMA of per-frame QPC deltas.
+                // With vsync on, measured FPS = monitor refresh.
                 // Note: we do NOT call DwmFlush here — SwapBuffers (called from
                 // GFX::Update just before this) has already blocked until the
                 // next vblank thanks to OpenGL vsync. Calling DwmFlush on top
                 // of that would block for an additional vblank period, halving
                 // the effective frame rate.
-                if (g_CalibActive && g_QPCFreq.QuadPart > 0)
-                {
-                        LARGE_INTEGER now;
-                        QueryPerformanceCounter(&now);
+                if (!g_CalibActive || g_QPCFreq.QuadPart <= 0)
+                        return;
 
-                        if (g_CalibStartQPC.QuadPart == 0)
-                        {
-                                g_CalibStartQPC = now;
-                                g_CalibCount = 0;
-                        }
-                        else
-                        {
-                                g_CalibCount++;
-                                if (g_CalibCount >= CALIB_FRAMES)
-                                {
-                                        double elapsedSec =
-                                                (double)(now.QuadPart - g_CalibStartQPC.QuadPart) /
-                                                (double)g_QPCFreq.QuadPart;
-                                        if (elapsedSec > 0.0)
-                                        {
-                                                double measuredHz = (double)g_CalibCount / elapsedSec;
-                                                if (measuredHz >= 30.0 && measuredHz <= 1000.0)
-                                                {
-                                                        // Low-pass filter: blend 50/50 with the
-                                                        // previous value so a single bad sample
-                                                        // (e.g. window drag) can't yank the DRC
-                                                        // target around.
-                                                        g_MonitorHz = 0.5 * g_MonitorHz + 0.5 * measuredHz;
-                                                }
-                                        }
-                                        g_CalibCount = 0;
-                                        g_CalibStartQPC = now;
-                                }
-                        }
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+
+                if (g_LastFrameQPC.QuadPart == 0)
+                {
+                        // First sample: seed the EMA with the current monitor rate
+                        // (already obtained from EnumDisplaySettings at enable time).
+                        // Don't try to compute a rate from a single QPC delta.
+                        g_LastFrameQPC = now;
+                        g_CalibSeeded  = true;
+                        return;
+                }
+
+                LONGLONG delta = now.QuadPart - g_LastFrameQPC.QuadPart;
+                g_LastFrameQPC = now;
+                if (delta <= 0)
+                        return; // QPC went backwards (shouldn't happen, but guard anyway)
+
+                double frameSec = (double)delta / (double)g_QPCFreq.QuadPart;
+                if (frameSec <= 0.0)
+                        return;
+
+                double measuredHz = 1.0 / frameSec;
+
+                // Reject outliers: if the frame was much longer than expected
+                // (missed vblank) or much shorter (impossible with vsync on),
+                // skip this sample so it doesn't poison the EMA.
+                if (measuredHz < 30.0 || measuredHz > 1000.0)
+                        return;
+                double expectedSec = 1.0 / g_MonitorHz;
+                if (frameSec > expectedSec * CALIB_MISS_FACTOR)
+                        return; // missed vblank — discard
+
+                if (!g_CalibSeeded)
+                {
+                        g_MonitorHz     = measuredHz;
+                        g_CalibSeeded   = true;
+                }
+                else
+                {
+                        // EMA update: new = old + alpha * (sample - old)
+                        g_MonitorHz = g_MonitorHz + CALIB_EMA_ALPHA * (measuredHz - g_MonitorHz);
                 }
         }
 

@@ -39,12 +39,14 @@ namespace MonitorSync
         // When enabling: measures monitor Hz, enables OpenGL vsync, resets
         // pacing state, recomputes the DRC target frequency.
         // When disabling: resets DRC frequency to standard 44100 Hz.
+        //
+        // Note: Enable(TRUE) is safe to call even when already enabled — it
+        // re-runs the full init path. This is intentional, so that toggling
+        // the feature off and back on at runtime (the "hot toggle" case)
+        // re-establishes vsync and resets the DRC integrator. Without this,
+        // the second Enable(TRUE) would be a no-op and the emulator would
+        // run in a half-initialised state with constant stutter.
         void    Enable (BOOL on);
-
-        // Re-attempt vsync initialization. Called by GFX::Start after the
-        // OpenGL context has been created, in case Enable(TRUE) was invoked
-        // earlier when no context existed yet. Safe to call repeatedly.
-        void    ReinitVSync ();
 
         // True while Match Monitor Rate is active.
         bool    IsEnabled ();
