@@ -16,6 +16,9 @@ extern short    *buffer;
 extern unsigned long    LockSize;
 extern int      buflen;
 extern int      InternalClock;
+// NRS ported settings
+extern bool     NonlinearMixing;            // true = use 2A03 DAC nonlinear formula
+extern bool     BootWithDisabledFrameIRQ;   // true = start with $4017 bit6 set (Famiclone)
 
 #ifdef  NSFPLAYER
 extern  short   sample_pos;

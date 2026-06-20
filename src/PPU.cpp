@@ -29,6 +29,9 @@ unsigned char SprAddr;
 unsigned char Palette[0x20];
 
 unsigned char readLatch;
+unsigned char readLatchDecay;	// NRS: PPU open-bus decay counter (~30 VBL frames)
+bool inReset;			// NRS: PPU ignores $2000/$2001 writes for ~29658 CPU cycles after power-on
+unsigned char UpdateIsRendering;	// NRS: delay IsRendering update by 1 PPU cycle after $2001 write
 
 unsigned char Reg2000, Reg2001, Reg2002;
 
@@ -411,6 +414,9 @@ void	PowerOn()
 	VRAMAddr = IntReg = 0;
 	IntX = 0;
 	readLatch = 0;
+	readLatchDecay = 0;
+	inReset = true;		// PPU ignores $2000/$2001 until ~29658 CPU cycles have elapsed
+	UpdateIsRendering = 0;
 	Reg2002 = 0;
 	buf2007 = 0;
 	HVTog = TRUE;
@@ -556,6 +562,9 @@ void	RunNoSkip (int NumTicks)
 			Reg2002 |= 0x40;	// Trigger sprite 0 hit
 			Spr0Hit = FALSE;
 		}
+		// NRS: delayed IsRendering update from $2001 write
+		if (UpdateIsRendering && !--UpdateIsRendering)
+			IsRendering = (Reg2001 & 0x18) && (SLnum < 240);
 		Clockticks++;
 		if (Clockticks == 256)
 		{
@@ -607,11 +616,21 @@ void	RunNoSkip (int NumTicks)
 					IsRendering = TRUE;
 				// Sprite flags are cleared immediately
 				Reg2002 &= ~0x60;
+				// NRS: lift power-on write inhibit after first full frame
+				if (inReset) inReset = false;
 			}
 		}
 		// VBL flag gets cleared a cycle late
 		else if ((SLnum == -1) && (Clockticks == 1))
+		{
 			Reg2002 &= ~0x80;
+			// Open-bus readLatch decay: clears after ~30 VBL frames (~600ms on real hardware)
+			if (++readLatchDecay >= 30)
+			{
+				readLatchDecay = 0;
+				readLatch = 0;
+			}
+		}
 		if (IsRendering)
 		{
 			ProcessSprites();
@@ -873,6 +892,9 @@ void	RunSkip (int NumTicks)
 			Reg2002 |= 0x40;	// Trigger sprite 0 hit
 			Spr0Hit = FALSE;
 		}
+		// NRS: delayed IsRendering update from $2001 write
+		if (UpdateIsRendering && !--UpdateIsRendering)
+			IsRendering = (Reg2001 & 0x18) && (SLnum < 240);
 		Clockticks++;
 		if (Clockticks == 256)
 		{
@@ -927,11 +949,21 @@ void	RunSkip (int NumTicks)
 					IsRendering = TRUE;
 				// Sprite flags are cleared immediately
 				Reg2002 &= ~0x60;
+				// NRS: lift power-on write inhibit after first full frame
+				if (inReset) inReset = false;
 			}
 		}
 		// VBL flag gets cleared a cycle late
 		else if ((SLnum == -1) && (Clockticks == 1))
+		{
 			Reg2002 &= ~0x80;
+			// Open-bus readLatch decay: clears after ~30 VBL frames (~600ms on real hardware)
+			if (++readLatchDecay >= 30)
+			{
+				readLatchDecay = 0;
+				readLatch = 0;
+			}
+		}
 		if (IsRendering)
 		{
 			ProcessSprites();
@@ -1249,6 +1281,8 @@ int	MAPINT	IntReadVs (int Bank, int Addr)
 
 void	__fastcall	Write0 (int Val)
 {
+	// NRS: $2000 writes are ignored during power-on reset period
+	if (inReset) return;
 	if ((Val & 0x80) && !(Reg2000 & 0x80) && (Reg2002 & 0x80) && (SLnum != -1))
 		CPU::WantNMI = TRUE;
 	// race condition
@@ -1267,10 +1301,11 @@ void	__fastcall	Write0 (int Val)
 
 void	__fastcall	Write1 (int Val)
 {
+	// NRS: $2001 writes are ignored during power-on reset period
+	if (inReset) return;
 	Reg2001 = (unsigned char)Val;
-	if ((Val & 0x18) && (SLnum < 240))
-		IsRendering = TRUE;
-	else	IsRendering = FALSE;
+	// NRS: IsRendering update is delayed by 1 PPU cycle (mid-scanline accuracy)
+	UpdateIsRendering = 1;
 	ColorEmphasis = (Val & 0xE0) << 1;
 	GrayScale = (Val & 0x01) ? 0x30 : 0x3F;
 }
@@ -1289,8 +1324,9 @@ void	__fastcall	Write4 (int Val)
 	if ((SprAddr & 0x03) == 0x02)
 		Val &= 0xE3;
 	// During rendering, writes are discarded and address increments wrong
+	// On real hardware OAMADDR always stays aligned to 4 during rendering
 	if (IsRendering)
-		SprAddr = (SprAddr + 4) & 0xFF;
+		SprAddr = (SprAddr + 4) & 0xFC;
 	else
 	{
 #ifdef	ENABLE_DEBUGGER
@@ -1370,4 +1406,26 @@ void	MAPINT	IntWriteVs (int Bank, int Addr, int Val)
 	readLatch = (unsigned char)Val;
 	funcs[Addr & 7](Val);
 }
+// Called by CPU when a RMW instruction (INC, DEC, ASL, LSR, ROL, ROR) targets $2007.
+// On real hardware, RMW instructions to $2007 cause VRAM address to increment TWICE:
+// once on the dummy read phase, once on the write phase.
+// This fixes Solar Jetman tile rendering glitch.
+void	NotifyRMW (void)
+{
+	if (IsRendering)
+	{
+		// During rendering, increment horizontal position in VRAM address
+		IncrementH();
+	}
+	else
+	{
+		// Outside rendering, apply normal address increment (stride 1 or 32)
+		if (Reg2000 & 0x04)
+			VRAMAddr += 32;
+		else
+			VRAMAddr++;
+		VRAMAddr &= 0x7FFF;
+	}
+}
+
 } // namespace PPU

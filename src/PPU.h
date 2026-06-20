@@ -45,6 +45,7 @@ void	MAPINT	IntWrite (int, int, int);
 void	MAPINT	IntWriteVs (int, int, int);
 void	Run (void);
 void	GetGFXPtr (void);
+void	NotifyRMW (void);	// Called by CPU RMW instructions targeting $2007
 
 int	MAPINT	ReadUnsafe (int, int);
 int	MAPINT	BusRead (int, int);

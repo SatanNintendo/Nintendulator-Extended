@@ -46,6 +46,11 @@ unsigned char RAM[0x800];
 
 BOOL LogBadOps;
 
+// RAM initialization mode: 0 = zero-fill, 1 = random (default), 2 = 0xFF-fill
+// Affects Final Fantasy, Terminator 2, Silva Saga, and others that depend
+// on initial RAM state.  Change via external config if needed.
+int RAMInitialization = 1;
+
 SplitReg rCalcAddr;
 SplitReg rTmpAddr;
 unsigned char BranchOffset;
@@ -311,7 +316,19 @@ void	GetHandlers (void)
 
 void	PowerOn (void)
 {
-	ZeroMemory(RAM, sizeof(RAM));
+	switch (RAMInitialization)
+	{
+	case 0:
+		ZeroMemory(RAM, sizeof(RAM));
+		break;
+	case 2:
+		memset(RAM, 0xFF, sizeof(RAM));
+		break;
+	default: // 1 = random
+		for (int ri = 0; ri < 0x800; ri++)
+			RAM[ri] = (unsigned char)(rand() & 0xFF);
+		break;
+	}
 	A = 0;
 	X = 0;
 	Y = 0;
@@ -707,6 +724,12 @@ __forceinline	void	IN_INC (void)
 	FZ = (TmpData == 0);
 	FN = (TmpData >> 7) & 1;
 	MemSet(CalcAddr, TmpData);
+#ifndef	NSFPLAYER
+	// RMW instructions to $2007 increment VRAM address twice on real hardware
+	// (once on dummy read, once on write).  Fixes Solar Jetman.
+	if (CalcAddr == 0x2007)
+		PPU::NotifyRMW();
+#endif	/* !NSFPLAYER */
 }
 __forceinline	void	IN_INX (void)
 {
@@ -918,6 +941,15 @@ __forceinline	void	IN_TYA (void)
 	FN = (A >> 7) & 1;
 }
 
+__forceinline	void	IV_LAE (void)
+{	// LAS (0xBB) - SP = X = A = Memory & SP
+	if (LogBadOps)
+		EI.DbgOut(_T("Invalid opcode $%02X (LAS) encountered at $%04X"), Opcode, OpAddr);
+	SP = X = A = MemGetData(CalcAddr) & SP;
+	FZ = (A == 0);
+	FN = (A >> 7) & 1;
+}
+
 __forceinline	void	IV_UNK (void)
 {
 	// This isn't affected by the "Log Invalid Ops" toggle
@@ -1105,18 +1137,28 @@ __forceinline	void	IV_AXS (void)
 	X = result & 0xFF;
 	FN = (result >> 7) & 1;
 }
+__forceinline	void	IV_XAA (void)
+{	// XAA (0x8B) - unstable: A = (A | 0xFF) & X & imm
+	if (LogBadOps)
+		EI.DbgOut(_T("Invalid opcode $%02X (XAA) encountered at $%04X"), Opcode, OpAddr);
+	A = (A | 0xFF) & X & MemGetData(CalcAddr);
+	FZ = (A == 0);
+	FN = (A >> 7) & 1;
+}
 __forceinline	void	IV_SYA (void)
 {	// STY abs,X, malfunctions due to internal bus conflicts
 	if (LogBadOps)
 		EI.DbgOut(_T("Invalid opcode $%02X (SHY) encountered at $%04X"), Opcode, OpAddr);
 	CalcAddrL = MemGetCode(PC++);
 	CalcAddrH = MemGetCode(PC++);
+	// DMC DMA corruption: if DMC DMA is active, the AND-value is 0xFF (no masking)
+	int AND = (EnableDMA & DMA_PCM) ? 0xFF : (CalcAddrH + 1) & Y;
 	bool inc = (CalcAddrL + X) >= 0x100;
 	CalcAddrL += X;
 	MemGetData(CalcAddr);
 	if (inc)
-		CalcAddrH &= Y;
-	MemSet(CalcAddr, Y & (CalcAddrH + 1));
+		CalcAddrH = Y & (CalcAddrH + 1); // address high byte corrupted
+	MemSet(CalcAddr, Y & AND);
 }
 __forceinline	void	IV_SXA (void)
 {	// STX abs,Y, malfunctions due to internal bus conflicts
@@ -1124,34 +1166,18 @@ __forceinline	void	IV_SXA (void)
 		EI.DbgOut(_T("Invalid opcode $%02X (SHX) encountered at $%04X"), Opcode, OpAddr);
 	CalcAddrL = MemGetCode(PC++);
 	CalcAddrH = MemGetCode(PC++);
+	// DMC DMA corruption: if DMC DMA is active, the AND-value is 0xFF (no masking)
+	int AND = (EnableDMA & DMA_PCM) ? 0xFF : (CalcAddrH + 1) & X;
 	bool inc = (CalcAddrL + Y) >= 0x100;
 	CalcAddrL += Y;
 	MemGetData(CalcAddr);
 	if (inc)
-		CalcAddrH &= X;
-	MemSet(CalcAddr, X & (CalcAddrH + 1));
+		CalcAddrH = X & (CalcAddrH + 1); // address high byte corrupted
+	MemSet(CalcAddr, X & AND);
 }
 
 void	ExecOp (void)
 {
-#ifndef	NSFPLAYER
-	if (LastNMI)
-	{
-		WantNMI = FALSE;
-		DoNMI();
-		return;
-	}
-	else
-#endif	/* !NSFPLAYER */
-	if (LastIRQ)
-	{
-		DoIRQ();
-		return;
-	}
-#ifdef	ENABLE_DEBUGGER
-	else	GotInterrupt = 0;
-#endif	/* ENABLE_DEBUGGER */
-
 	Opcode = MemGetCode(OpAddr = PC++);
 	switch (Opcode)
 	{
@@ -1188,12 +1214,30 @@ OP(03, INX, IV_SLO) OP(13,INYW, IV_SLO) OP(0B, IMM, IV_AAC) OP(1B,ABYW, IV_SLO) 
 OP(23, INX, IV_RLA) OP(33,INYW, IV_RLA) OP(2B, IMM, IV_AAC) OP(3B,ABYW, IV_RLA) OP(27, ZPG, IV_RLA) OP(37, ZPX, IV_RLA) OP(2F, ABS, IV_RLA) OP(3F,ABXW, IV_RLA)
 OP(43, INX, IV_SRE) OP(53,INYW, IV_SRE) OP(4B, IMM, IV_ASR) OP(5B,ABYW, IV_SRE) OP(47, ZPG, IV_SRE) OP(57, ZPX, IV_SRE) OP(4F, ABS, IV_SRE) OP(5F,ABXW, IV_SRE)
 OP(63, INX, IV_RRA) OP(73,INYW, IV_RRA) OP(6B, IMM, IV_ARR) OP(7B,ABYW, IV_RRA) OP(67, ZPG, IV_RRA) OP(77, ZPX, IV_RRA) OP(6F, ABS, IV_RRA) OP(7F,ABXW, IV_RRA)
-OP(83, INX, IV_SAX) OP(93,INYW, IV_UNK) OP(8B, IMM, IV_UNK) OP(9B,ABYW, IV_UNK) OP(87, ZPG, IV_SAX) OP(97, ZPY, IV_SAX) OP(8F, ABS, IV_SAX) OP(9F,ABYW, IV_UNK)
-OP(A3, INX, IV_LAX) OP(B3, INY, IV_LAX) OP(AB, IMM, IV_ATX) OP(BB, ABY, IV_UNK) OP(A7, ZPG, IV_LAX) OP(B7, ZPY, IV_LAX) OP(AF, ABS, IV_LAX) OP(BF, ABY, IV_LAX)
+OP(83, INX, IV_SAX) OP(93,INYW, IV_UNK) OP(8B, IMM, IV_XAA) OP(9B,ABYW, IV_UNK) OP(87, ZPG, IV_SAX) OP(97, ZPY, IV_SAX) OP(8F, ABS, IV_SAX) OP(9F,ABYW, IV_UNK)
+OP(A3, INX, IV_LAX) OP(B3, INY, IV_LAX) OP(AB, IMM, IV_ATX) OP(BB, ABY, IV_LAE) OP(A7, ZPG, IV_LAX) OP(B7, ZPY, IV_LAX) OP(AF, ABS, IV_LAX) OP(BF, ABY, IV_LAX)
 OP(C3, INX, IV_DCP) OP(D3,INYW, IV_DCP) OP(CB, IMM, IV_AXS) OP(DB,ABYW, IV_DCP) OP(C7, ZPG, IV_DCP) OP(D7, ZPX, IV_DCP) OP(CF, ABS, IV_DCP) OP(DF,ABXW, IV_DCP)
 OP(E3, INX, IV_ISB) OP(F3,INYW, IV_ISB) OP(EB, IMM, IV_SBC) OP(FB,ABYW, IV_ISB) OP(E7, ZPG, IV_ISB) OP(F7, ZPX, IV_ISB) OP(EF, ABS, IV_ISB) OP(FF,ABXW, IV_ISB)
 
 #undef OP
 	}
+
+	// On real 6502, interrupts are polled AFTER the current instruction completes.
+	// This is more accurate than checking at the start of ExecOp.
+#ifndef	NSFPLAYER
+	if (LastNMI)
+	{
+		WantNMI = FALSE;
+		DoNMI();
+	}
+	else
+#endif	/* !NSFPLAYER */
+	if (LastIRQ)
+	{
+		DoIRQ();
+	}
+#ifdef	ENABLE_DEBUGGER
+	else	GotInterrupt = 0;
+#endif	/* ENABLE_DEBUGGER */
 }
 } // namespace CPU

@@ -48,6 +48,7 @@ extern SplitReg rPC;
 extern unsigned char RAM[0x800];
 
 extern BOOL LogBadOps;
+extern int RAMInitialization;	// 0=zero, 1=random (default), 2=0xFF
 
 #define PC rPC.Full
 #define PCL rPC.Segment[0]

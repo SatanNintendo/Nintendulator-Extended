@@ -90,6 +90,19 @@ const   signed char     SquareDuty[4][8] = {
         {-4,-4,-4,-4,+4,+4,+4,+4},
         {+4,+4,+4,+4,+4,+4,-4,-4},
 };
+// Unipolar duty table for NonlinearMixing (0 or 1, multiplied by Vol to get 0-15)
+const   unsigned char   SquareDutyNL[4][8] = {
+        {0,0,0,0,0,0,0,1},
+        {0,0,0,0,0,0,1,1},
+        {0,0,0,0,1,1,1,1},
+        {1,1,1,1,1,1,0,0},
+};
+// NonlinearMixing: emulate real 2A03 DAC transfer function (NesDev formula).
+// false = legacy linear mixing; true = accurate nonlinear mixing.
+bool NonlinearMixing = false;
+// BootWithDisabledFrameIRQ: some Famiclones start with $4017 = 0x40 (IRQ disabled, 4-step mode)
+// Set to true to emulate those clones.
+bool BootWithDisabledFrameIRQ = false;
 const   signed char     TriangleDuty[32] = {
         +7,+6,+5,+4,+3,+2,+1,+0,
         -1,-2,-3,-4,-5,-6,-7,-8,
@@ -148,6 +161,7 @@ namespace Square0
         BOOL EnvClk, SwpClk;
         unsigned long Cycles;   // short
         signed long Pos;
+        unsigned char NL_Pos;   // unipolar position for NonlinearMixing (0-15)
 
 void    PowerOn (void)
 {
@@ -164,6 +178,7 @@ void    Reset (void)
         Enabled = ValidFreq = Active = FALSE;
         EnvClk = SwpClk = FALSE;
         Pos = 0;
+        NL_Pos = 0;
         Cycles = 1;
         EnvCtr = 1;
         BendCtr = 1;
@@ -173,6 +188,7 @@ inline void     CheckActive (void)
         ValidFreq = (freq >= 0x8) && ((swpdir) || !((freq + (freq >> swpstep)) & 0x800));
         Active = LengthCtr && ValidFreq;
         Pos = Active ? (SquareDuty[duty][CurD] * Vol) : 0;
+        NL_Pos = Active ? (SquareDutyNL[duty][CurD] * Vol) : 0;
 }
 inline void     Write (int Reg, unsigned char Val)
 {
@@ -221,7 +237,10 @@ inline void     Run (void)
                 Cycles = freq;
                 CurD = (CurD - 1) & 0x7;
                 if (Active)
+                {
                         Pos = SquareDuty[duty][CurD] * Vol;
+                        NL_Pos = SquareDutyNL[duty][CurD] * Vol;
+                }
         }
 }
 inline void     QuarterFrame (void)
@@ -276,6 +295,7 @@ namespace Square1
         BOOL EnvClk, SwpClk;
         unsigned long Cycles;   // short
         signed long Pos;
+        unsigned char NL_Pos;   // unipolar position for NonlinearMixing (0-15)
 
 void    PowerOn (void)
 {
@@ -292,6 +312,7 @@ void    Reset (void)
         Enabled = ValidFreq = Active = FALSE;
         EnvClk = SwpClk = FALSE;
         Pos = 0;
+        NL_Pos = 0;
         Cycles = 1;
         EnvCtr = 1;
         BendCtr = 1;
@@ -301,6 +322,7 @@ inline void     CheckActive (void)
         ValidFreq = (freq >= 0x8) && ((swpdir) || !((freq + (freq >> swpstep)) & 0x800));
         Active = LengthCtr && ValidFreq;
         Pos = Active ? (SquareDuty[duty][CurD] * Vol) : 0;
+        NL_Pos = Active ? (SquareDutyNL[duty][CurD] * Vol) : 0;
 }
 inline void     Write (int Reg, unsigned char Val)
 {
@@ -348,7 +370,10 @@ inline void     Run (void)
                 Cycles = freq;
                 CurD = (CurD - 1) & 0x7;
                 if (Active)
+                {
                         Pos = SquareDuty[duty][CurD] * Vol;
+                        NL_Pos = SquareDutyNL[duty][CurD] * Vol;
+                }
         }
 }
 inline void     QuarterFrame (void)
@@ -729,18 +754,25 @@ namespace Frame
         unsigned char Bits;
         int Cycles;
         BOOL Quarter, Half, IRQ, Zero;
+        BOOL ClearBit6;     // NRS: delayed frame IRQ clear after $4015 read
 
 const   int     *CycleTable;
 void    PowerOn (void)
 {
         Bits = 0;
         Cycles = 0;
-        Quarter = Half = IRQ = Zero = FALSE;
+        Quarter = Half = IRQ = Zero = ClearBit6 = FALSE;
+        // NRS: some Famiclones boot with frame IRQ already disabled ($4017 = 0x40)
+        if (BootWithDisabledFrameIRQ)
+        {
+                Bits = 0x40;
+                CPU::WantIRQ &= ~IRQ_FRAME;
+        }
 }
 void    Reset (void)
 {
         Cycles = 0;
-        Quarter = Half = IRQ = Zero = FALSE;
+        Quarter = Half = IRQ = Zero = ClearBit6 = FALSE;
 }
 inline void     Write (unsigned char Val)
 {
@@ -778,6 +810,13 @@ inline void     Run (void)
                 if (!Bits)
                         CPU::WantIRQ |= IRQ_FRAME;
                 IRQ = FALSE;
+        }
+
+        // NRS: delayed frame IRQ flag clear (set on $4015 read, applied next APU cycle)
+        if (ClearBit6)
+        {
+                CPU::WantIRQ &= ~IRQ_FRAME;
+                ClearBit6 = FALSE;
         }
 
         if (Zero)
@@ -921,7 +960,8 @@ int     MAPINT  IntRead (int Bank, int Addr)
                         ((         DPCM::LengthCtr) ? 0x10 : 0) |
                         ((CPU::WantIRQ & IRQ_FRAME) ? 0x40 : 0) |
                         ((CPU::WantIRQ &  IRQ_DPCM) ? 0x80 : 0);
-                CPU::WantIRQ &= ~IRQ_FRAME;     // DPCM flag doesn't get reset
+                // NRS: frame IRQ clear is delayed by 1 APU cycle (ClearBit6 mechanism)
+                Frame::ClearBit6 = TRUE;    // DPCM flag doesn't get reset
                 break;
 #ifndef NSFPLAYER
         case 0x016:
@@ -1716,21 +1756,72 @@ void    Run (void)
         DPCM::Run();
 
 #ifdef  SOUND_FILTERING
-        samppos += VolAdjust(Square0::Pos, 1) + VolAdjust(Square1::Pos, 2) + VolAdjust(Triangle::Pos, 3) + VolAdjust(Noise::Pos, 4) + VolAdjust(DPCM::Pos, 5);
+        if (NonlinearMixing)
+        {
+                // NonlinearMixing: accumulate linear sample values for averaging.
+                // We use NL_Pos (0-15) for squares and derive TND values below.
+                // During filtering we accumulate as-is; final NL formula applied at flush.
+                samppos += (long)Square0::NL_Pos + (long)Square1::NL_Pos;
+        }
+        else
+        {
+                samppos += VolAdjust(Square0::Pos, 1) + VolAdjust(Square1::Pos, 2) + VolAdjust(Triangle::Pos, 3) + VolAdjust(Noise::Pos, 4) + VolAdjust(DPCM::Pos, 5);
+        }
 #endif  /* SOUND_FILTERING */
         sampcycles++;
         
         if (NewBufPos != BufPos)
         {
                 BufPos = NewBufPos;
+                if (NonlinearMixing)
+                {
+                        // Apply NesDev nonlinear DAC formula.
+                        // Pulse: 0-30 range (sum of two 0-15 channels).
+                        // TND channels need 0-based values:
+                        //   Triangle 0-15: normalize from TriangleDuty*8 range [-64,+56]
+                        //   Noise 0-15: abs(Noise::Pos) / max_noise_vol (max=30 for Vol=15)
+                        //   DPCM 0-127: pcmdata directly
+                        double s0 = (double)Square0::NL_Pos;
+                        double s1 = (double)Square1::NL_Pos;
 #ifdef  SOUND_FILTERING
-                samppos = (samppos << 6) / sampcycles;
+                        // Use averaged pulse for filtering mode
+                        double pulse_avg = ((double)samppos / sampcycles);
+                        s0 = pulse_avg * 0.5;
+                        s1 = 0.0;
+#endif
+                        double pulse = (s0 + s1 > 0.0) ?
+                                95.88 / ((8128.0 / (s0 + s1)) + 100.0) : 0.0;
+
+                        // Triangle: Pos in [-64,+56], map to 0-15
+                        double tri_v = (Triangle::Pos + 64.0) * (15.0 / 120.0);
+                        if (tri_v < 0.0) tri_v = 0.0;
+                        if (tri_v > 15.0) tri_v = 15.0;
+                        // Noise: |Pos| / 2 gives Vol (0-15)
+                        double nse_v = (double)(Noise::Pos < 0 ? -Noise::Pos : Noise::Pos) / 2.0;
+                        if (nse_v > 15.0) nse_v = 15.0;
+                        // DPCM: pcmdata 0-127
+                        double dmc_v = (double)DPCM::pcmdata;
+                        double tnd_denom = (tri_v > 0.0 || nse_v > 0.0 || dmc_v > 0.0) ?
+                                (tri_v / 8227.0 + nse_v / 12241.0 + dmc_v / 22638.0) : 0.0;
+                        double tnd = (tnd_denom > 0.0) ?
+                                159.79 / (1.0 / tnd_denom + 100.0) : 0.0;
+
+                        samppos = (long)((pulse + tnd) * 32767.0);
+                        if ((MI) && (MI->GenSound))
+                                samppos += VolAdjust(MI->GenSound(sampcycles), 6);
+                        samppos = VolAdjust(samppos, 0);
+                }
+                else
+                {
+#ifdef  SOUND_FILTERING
+                        samppos = (samppos << 6) / sampcycles;
 #else   /* !SOUND_FILTERING */
-                samppos = (VolAdjust(Square0::Pos, 1) + VolAdjust(Square1::Pos, 2) + VolAdjust(Triangle::Pos, 3) + VolAdjust(Noise::Pos, 4) + VolAdjust(DPCM::Pos, 5)) << 6;
+                        samppos = (VolAdjust(Square0::Pos, 1) + VolAdjust(Square1::Pos, 2) + VolAdjust(Triangle::Pos, 3) + VolAdjust(Noise::Pos, 4) + VolAdjust(DPCM::Pos, 5)) << 6;
 #endif  /* SOUND_FILTERING */
-                if ((MI) && (MI->GenSound))
-                        samppos += VolAdjust(MI->GenSound(sampcycles), 6);
-                samppos = VolAdjust(samppos, 0);
+                        if ((MI) && (MI->GenSound))
+                                samppos += VolAdjust(MI->GenSound(sampcycles), 6);
+                        samppos = VolAdjust(samppos, 0);
+                }
                 if (samppos < -0x8000)
                         samppos = -0x8000;
                 if (samppos > 0x7FFF)
