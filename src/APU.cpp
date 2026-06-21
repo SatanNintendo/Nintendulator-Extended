@@ -53,7 +53,14 @@ BYTE                    Regs[0x18];
 unsigned long           MHz;
 #ifndef NSFPLAYER
 // Dynamic Rate Control
-static double           drc_target_fill = 0.5;
+// Dynamic Rate Control state.
+// target_fill = 0.55: keep the write cursor 2.2 slots ahead of the play
+// cursor (instead of exactly 2.0 / 50%). The extra 5% margin means the
+// write position nearly always clears the DirectSound safe-write boundary
+// without waiting, so the pre-check in APU::Run exits via goto and never
+// calls SwitchToThread(). Each 1% of the 4-slot, 66.67ms buffer = 0.67ms
+// of extra latency — the 5% increase adds ~3.3ms, which is inaudible.
+static double           drc_target_fill = 0.55;
 static const double     drc_max_adjust  = 0.05;
 
 // === MOVED HERE ===
@@ -1709,19 +1716,36 @@ void    Run (void)
                 Cycles = NewBufPos = 0;
                 if (AVI::IsActive())
                         AVI::AddAudio();
+
+                // Pre-check: with vsync on, the DS slot we want to write is
+                // almost always already free by the time we arrive here
+                // (~1ms after vblank). Check once before entering the wait-
+                // loop. If the slot is free, skip the loop entirely — zero
+                // SwitchToThread() calls, zero timing jitter added.
+                // If it is still busy (rare scheduler hiccup), fall through.
+                if (isEnabled && Buffer)
+                {
+                        unsigned long pr, pw;
+                        if (SUCCEEDED(Buffer->GetCurrentPosition(&pr, &pw)))
+                        {
+                                unsigned long sr = pr / LockSize;
+                                unsigned long sw = pw / LockSize;
+                                if (sw < sr) sw += FRAMEBUF;
+                                if (!((sr <= next_pos) && (next_pos <= sw)))
+                                        goto write_slot;
+                        }
+                }
+
                 do
                 {
                         if (!isEnabled)
                                 break;
-                        // When Match Monitor Rate is active, delegate the wait to
-                        // MonitorSync::PaceFrame (which uses Sleep(1) with the
-                        // 1ms timer resolution already enabled by WinMain). The
-                        // real frame pacing is handled by OpenGL vsync inside
-                        // GFX::Update's SwapBuffers call, which blocks until the
-                        // next monitor vblank. Otherwise fall back to the same
-                        // Sleep(1) — the difference is only in bookkeeping, but
-                        // keeping the call sites distinct lets us later swap
-                        // PaceFrame for a smarter wait without touching APU.cpp.
+                        // When Match Monitor Rate is active, use SwitchToThread()
+                        // instead of Sleep(1). Sleep(1) can sleep 1-2ms and push
+                        // us past the next vblank; SwitchToThread() yields only
+                        // for the remainder of the current scheduler time-slice
+                        // (typically 0.1-0.5ms) and returns immediately when
+                        // the CPU is free, letting us re-check DS much sooner.
                         if (GFX::MatchMonitorRate)
                                 MonitorSync::PaceFrame();
                         else
@@ -1732,6 +1756,7 @@ void    Run (void)
                         if (wpos < rpos)
                                 wpos += FRAMEBUF;
                 } while ((rpos <= next_pos) && (next_pos <= wpos));
+                write_slot:
                 if (isEnabled)
                 {
                         Try(Buffer->Lock(next_pos * LockSize, LockSize, &bufPtr, &bufBytes, NULL, 0, 0), Lang::GetString(LANG_ERR_APU_BUFFER));

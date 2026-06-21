@@ -1160,6 +1160,15 @@ void    Reset (RESET_TYPE ResetType)
 
 DWORD   WINAPI  Thread (void *param)
 {
+        // Elevate to ABOVE_NORMAL so background tasks (antivirus, browser,
+        // indexer) cannot preempt us during the critical 16ms vblank window.
+        // We still yield to HIGH and REALTIME threads (audio driver, kernel),
+        // so the system remains stable. A 1-2ms preemption right after
+        // SwapBuffers returns causes us to miss the next vblank entirely,
+        // producing the intermittent micro-stutter visible as a 2-frame skip.
+        // Thread exits at NORMAL automatically; no explicit restore needed.
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
 #ifdef  CPU_BENCHMARK
         // Run with cyctest.nes
         int i;

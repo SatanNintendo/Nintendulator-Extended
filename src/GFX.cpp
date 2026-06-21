@@ -253,6 +253,11 @@ static void GL_DrawFrame(void)
 
         wglMakeCurrent(hGLDC, hGLRC);
 
+        // Apply any pending vsync interval change posted by MonitorSync::Enable()
+        // from the UI thread. Must happen here, after wglMakeCurrent and before
+        // any GL draw calls, so the context is current and owned by this thread.
+        MonitorSync::ApplyPendingVSync();
+
         glViewport(0, 0, glWinW, glWinH);
 
         glBindTexture(GL_TEXTURE_2D, glTex);

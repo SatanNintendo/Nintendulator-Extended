@@ -92,4 +92,10 @@ namespace MonitorSync
         // Tell MonitorSync which NES region is active so GetNESHz returns
         // the correct value. Called from APU::SetRegion.
         void    SetNESRegion (int region);
+
+        // Apply a pending wglSwapIntervalEXT change posted by Enable().
+        // Must be called from the NES emulation thread (the OpenGL context
+        // owner), at the start of GL_DrawFrame after wglMakeCurrent.
+        // No-op if no change is pending. Safe to call every frame.
+        void    ApplyPendingVSync ();
 }

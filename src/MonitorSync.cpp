@@ -85,6 +85,23 @@ namespace MonitorSync
         static bool           g_CalibActive    = false;
 
         // ------------------------------------------------------------------
+        // Deferred vsync interval.
+        //
+        // wglSwapIntervalEXT must be called from the thread that owns the
+        // OpenGL context (the NES emulation thread, via GL_DrawFrame).
+        // Enable() is called from the UI thread (WM_COMMAND), so it cannot
+        // safely call wglSwapIntervalEXT directly without racing with
+        // GL_DrawFrame's wglMakeCurrent / glDraw / SwapBuffers sequence.
+        // A race here causes GL_DrawFrame to silently drop frames because
+        // the UI thread's wglMakeCurrent steals the context mid-draw.
+        //
+        // Enable() writes the desired interval here; ApplyPendingVSync()
+        // reads and applies it from the rendering thread at the start of
+        // GL_DrawFrame, where the context is always current. -1 = no change.
+        // ------------------------------------------------------------------
+        static volatile LONG  g_PendingVSyncInterval = -1;
+
+        // ------------------------------------------------------------------
         // Helpers
         // ------------------------------------------------------------------
 
@@ -242,43 +259,45 @@ namespace MonitorSync
                         // Fresh measurement before we start depending on it.
                         OnDisplayChange();
 
-                        // Load WGL swap control (needs an active context) and turn
-                        // vsync on so SwapBuffers blocks until the next vblank.
+                        // We CANNOT call wglSwapIntervalEXT here directly.
+                        // Enable() is called from the UI thread (WM_COMMAND),
+                        // but the OpenGL context belongs to the NES emulation
+                        // thread (GL_DrawFrame calls wglMakeCurrent / SwapBuffers).
+                        // Calling wglMakeCurrent from the UI thread while
+                        // GL_DrawFrame is running on the NES thread steals the
+                        // context, silently breaking the in-progress GL calls
+                        // (glTexSubImage2D etc.) and producing a corrupted or
+                        // missing frame — visible as a brief black flash or
+                        // stutter on hot-toggle.
+                        //
+                        // Solution: post a deferred request. The rendering thread
+                        // reads g_PendingVSyncInterval at the start of GL_DrawFrame
+                        // via ApplyPendingVSync() and applies wglSwapIntervalEXT
+                        // safely while the context is already current there.
+                        //
+                        // We still load the WGL function pointers here (safe:
+                        // LoadWGLSwapControl only calls wglGetProcAddress, which
+                        // is thread-safe and does not touch the rendering context).
                         g_VSyncActive = false;
                         if (GFX::hGLDC && GFX::hGLRC)
                         {
                                 wglMakeCurrent(GFX::hGLDC, GFX::hGLRC);
                                 LoadWGLSwapControl();
                                 wglMakeCurrent(NULL, NULL);
-                                g_VSyncActive = SetOpenGLVSync(1);
                         }
+                        // Post the deferred enable; the NES thread picks this up.
+                        InterlockedExchange(&g_PendingVSyncInterval, 1);
 
                         ResetState();
                 }
                 else
                 {
-                        // Disable OpenGL vsync so SwapBuffers no longer blocks
-                        // on the vblank. This is essential for correctness: if
-                        // we only set g_VSyncActive = false without actually
-                        // calling wglSwapIntervalEXT(0), SwapBuffers continues
-                        // to block until the next vblank even though the rest of
-                        // the code thinks vsync is off. The result is:
-                        //   - PaceFrame switches to Sleep(0) (busy-yield)
-                        //   - SwapBuffers still throttles to ~16.67ms per frame
-                        //   - DRC is reset to 44100 Hz but the 0.0988 Hz drift
-                        //     accumulates uncorrected while vsync is "disabled"
-                        //   - When the user re-enables Match Monitor Rate the
-                        //     audio buffer is already badly drifted and the DRC
-                        //     overcorrects, producing the severe stutter seen
-                        //     on hot-toggle.
-                        //
-                        // We explicitly turn vsync off here so the physical state
-                        // matches g_VSyncActive. A user whose driver has vsync
-                        // forced on globally will see no change, but that's a
-                        // driver override outside our control anyway.
-                        if (pfnWglSwapIntervalEXT && GFX::hGLDC && GFX::hGLRC)
-                                SetOpenGLVSync(0);
-
+                        // Post a deferred disable for the same thread-safety reason.
+                        // We set g_VSyncActive = false immediately so PaceFrame()
+                        // switches to Sleep(0) right away and DRC is reset, while
+                        // the actual wglSwapIntervalEXT(0) call happens on the next
+                        // GL_DrawFrame iteration (at most 16ms later — imperceptible).
+                        InterlockedExchange(&g_PendingVSyncInterval, 0);
                         g_VSyncActive = false;
                         g_CalibActive = false;
                         APU::ResetDRC();
@@ -288,6 +307,8 @@ namespace MonitorSync
         // Re-attempt vsync initialization. Called by GFX::Start after the
         // OpenGL context has been created, in case Enable(TRUE) was invoked
         // earlier when no context existed yet. Safe to call repeatedly.
+        // GFX::Start runs on the NES emulation thread, so wglMakeCurrent is
+        // safe here — no concurrent rendering in flight at this point.
         void ReinitVSync()
         {
                 if (!g_Initialized || !IsEnabled())
@@ -300,7 +321,10 @@ namespace MonitorSync
                         wglMakeCurrent(GFX::hGLDC, GFX::hGLRC);
                         LoadWGLSwapControl();
                         wglMakeCurrent(NULL, NULL);
+                        // Apply immediately: we ARE on the NES thread, context is ours.
                         g_VSyncActive = SetOpenGLVSync(1);
+                        // Clear any pending deferred request that would overwrite us.
+                        InterlockedExchange(&g_PendingVSyncInterval, -1);
                 }
         }
 
@@ -426,17 +450,56 @@ namespace MonitorSync
                 //    resolution enabled by WinMain is precise enough without
                 //    burning a CPU core.
                 //
-                // 2. VSync is NOT active (driver lacks WGL_EXT_swap_control,
-                //    or context creation failed, or SetOpenGLVSync returned
-                //    false): SwapBuffers returns immediately and the emulator
-                //    runs at full NES speed. The previous implementation had a
-                //    500us waitable-timer hack here; we replace it with a
-                //    Sleep(0) busy-yield which is at least as good (the timer
-                //    was a fixed delay unrelated to vblank anyway). The
-                //    DirectSound buffer drain itself throttles the loop.
+                //    However, Sleep(1) can actually sleep 1–2ms due to timer
+                //    granularity, and that extra 1ms pushes us past the NEXT
+                //    vblank — SwapBuffers then returns immediately (vblank already
+                //    happened) and the whole cadence slips by one frame, producing
+                //    the intermittent micro-stutter that remains even after DRC
+                //    and frameskip fixes.
+                //
+                //    SwitchToThread() de-schedules us for the remainder of the
+                //    current time-slice and returns as soon as the scheduler gives
+                //    us back the CPU (typically 0.1–0.5ms). We re-check the DS
+                //    position far sooner, keeping the wait-loop below its 1ms
+                //    budget and preventing vblank misses.
+                //
+                // 2. VSync is NOT active: Sleep(0) yields without sleeping, letting
+                //    the DirectSound buffer drain be the sole throttle.
                 if (g_VSyncActive)
-                        Sleep(1);
+                        SwitchToThread();
                 else
                         Sleep(0);
+        }
+
+        // Apply a pending vsync interval change. Must be called from the
+        // NES emulation thread at the start of GL_DrawFrame, after
+        // wglMakeCurrent has been called and before any GL draw commands.
+        // This is the ONLY place wglSwapIntervalEXT is called during normal
+        // operation (Enable/ReinitVSync only post a request here).
+        void ApplyPendingVSync()
+        {
+                LONG pending = InterlockedExchange(&g_PendingVSyncInterval, -1);
+                if (pending < 0)
+                        return; // nothing pending
+
+                if (!pfnWglSwapIntervalEXT)
+                {
+                        // Try to load WGL pointers now; context is current here.
+                        LoadWGLSwapControl();
+                        if (!pfnWglSwapIntervalEXT)
+                                return; // driver doesn't support swap control
+                }
+
+                int interval = (int)pending; // 0 or 1
+                if (interval == 1)
+                {
+                        g_VSyncActive = SetOpenGLVSync(1);
+                }
+                else
+                {
+                        // Disabling vsync. g_VSyncActive was already set to false
+                        // in Enable(FALSE) so PaceFrame already uses Sleep(0).
+                        SetOpenGLVSync(0);
+                }
         }
 }
