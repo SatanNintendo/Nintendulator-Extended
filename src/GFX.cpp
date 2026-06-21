@@ -256,6 +256,9 @@ static void GL_DrawFrame(void)
         // Apply any pending vsync interval change posted by MonitorSync::Enable()
         // from the UI thread. Must happen here, after wglMakeCurrent and before
         // any GL draw calls, so the context is current and owned by this thread.
+        // ApplyPendingVSync calls pfnWglSwapIntervalEXT directly — it must NOT
+        // call wglMakeCurrent(NULL,NULL) internally, as that would deassociate
+        // the context and turn all subsequent GL calls into silent no-ops.
         MonitorSync::ApplyPendingVSync();
 
         glViewport(0, 0, glWinW, glWinH);

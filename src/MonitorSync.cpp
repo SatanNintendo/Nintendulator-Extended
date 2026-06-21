@@ -275,16 +275,18 @@ namespace MonitorSync
                         // via ApplyPendingVSync() and applies wglSwapIntervalEXT
                         // safely while the context is already current there.
                         //
-                        // We still load the WGL function pointers here (safe:
-                        // LoadWGLSwapControl only calls wglGetProcAddress, which
-                        // is thread-safe and does not touch the rendering context).
+                        // NOTE: we do NOT call wglMakeCurrent here, even though
+                        // LoadWGLSwapControl only calls wglGetProcAddress internally.
+                        // wglMakeCurrent itself is NOT thread-safe per the WGL spec:
+                        // if NES thread is between its own wglMakeCurrent and SwapBuffers
+                        // in GL_DrawFrame, a concurrent wglMakeCurrent from the UI thread
+                        // deassociates the context, causing the in-flight glTexSubImage2D
+                        // and SwapBuffers to silently write to a NULL context.
+                        // wglGetProcAddress on Windows works without a current context
+                        // once any context has been created in the process, so we call
+                        // LoadWGLSwapControl directly without touching the context.
                         g_VSyncActive = false;
-                        if (GFX::hGLDC && GFX::hGLRC)
-                        {
-                                wglMakeCurrent(GFX::hGLDC, GFX::hGLRC);
-                                LoadWGLSwapControl();
-                                wglMakeCurrent(NULL, NULL);
-                        }
+                        LoadWGLSwapControl();
                         // Post the deferred enable; the NES thread picks this up.
                         InterlockedExchange(&g_PendingVSyncInterval, 1);
 
@@ -472,10 +474,17 @@ namespace MonitorSync
         }
 
         // Apply a pending vsync interval change. Must be called from the
-        // NES emulation thread at the start of GL_DrawFrame, after
-        // wglMakeCurrent has been called and before any GL draw commands.
-        // This is the ONLY place wglSwapIntervalEXT is called during normal
-        // operation (Enable/ReinitVSync only post a request here).
+        // NES emulation thread inside GL_DrawFrame, AFTER wglMakeCurrent
+        // and BEFORE any GL draw commands or SwapBuffers.
+        //
+        // CRITICAL: this function calls pfnWglSwapIntervalEXT directly and
+        // must NOT call wglMakeCurrent in any form. GL_DrawFrame has already
+        // made the context current; a second wglMakeCurrent(NULL,NULL) here
+        // would deassociate the context for this thread, making all subsequent
+        // GL calls (glTexSubImage2D, glBegin/End, SwapBuffers) write to a
+        // NULL context — producing a silent black frame or corrupted output.
+        // SetOpenGLVSync() wraps wglSwapIntervalEXT with its own Make/Null
+        // pair and must NOT be used here for exactly this reason.
         void ApplyPendingVSync()
         {
                 LONG pending = InterlockedExchange(&g_PendingVSyncInterval, -1);
@@ -484,22 +493,30 @@ namespace MonitorSync
 
                 if (!pfnWglSwapIntervalEXT)
                 {
-                        // Try to load WGL pointers now; context is current here.
+                        // Try to load WGL pointers now; context is current here
+                        // (we are inside GL_DrawFrame after wglMakeCurrent).
+                        // LoadWGLSwapControl uses wglGetProcAddress only — no
+                        // wglMakeCurrent side effects.
                         LoadWGLSwapControl();
                         if (!pfnWglSwapIntervalEXT)
                                 return; // driver doesn't support swap control
                 }
 
+                // Call the extension directly — no wglMakeCurrent wrapper.
+                // The context is already current on this thread (GL_DrawFrame).
                 int interval = (int)pending; // 0 or 1
+                BOOL ok = pfnWglSwapIntervalEXT(interval);
+
                 if (interval == 1)
                 {
-                        g_VSyncActive = SetOpenGLVSync(1);
+                        // Verify the driver actually honoured the request.
+                        bool verified = (ok != FALSE);
+                        if (verified && pfnWglGetSwapIntervalEXT)
+                                verified = (pfnWglGetSwapIntervalEXT() == 1);
+                        g_VSyncActive = verified;
                 }
-                else
-                {
-                        // Disabling vsync. g_VSyncActive was already set to false
-                        // in Enable(FALSE) so PaceFrame already uses Sleep(0).
-                        SetOpenGLVSync(0);
-                }
+                // For interval == 0: g_VSyncActive was already set false in
+                // Enable(FALSE) so PaceFrame already uses Sleep(0). The
+                // wglSwapIntervalEXT(0) call above is the physical disable.
         }
 }
