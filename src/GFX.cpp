@@ -97,6 +97,15 @@ static GLuint glTex  = 0;
 static int    glWinW = 0;
 static int    glWinH = 0;
 static BOOL   UsingOpenGL = FALSE;
+
+// Deferred GL viewport resize.
+// WM_SIZE arrives on the UI thread; GL_Resize calls wglMakeCurrent which races
+// with GL_DrawFrame on the NES thread. Instead, WM_SIZE calls PostGLResize()
+// which stores the new size atomically. GL_DrawFrame reads and applies it at
+// the start of each frame while the context is safely current on the NES thread.
+// Packed as a single 64-bit value: high 32 = width, low 32 = height.
+// -1 means "no pending resize".
+static __declspec(align(8)) volatile LONGLONG g_PendingResize = -1LL;
 void ApplyGLFilter(void)
 {
         if (!UsingOpenGL || !glTex)
@@ -215,33 +224,73 @@ static void GL_Destroy(void)
         UsingOpenGL = FALSE;
 }
 
+// Called ONLY from the NES emulation thread (via ApplyPendingResize inside
+// GL_DrawFrame), where the GL context is already current. Never call directly
+// from the UI thread — use PostGLResize instead.
+static void GL_ResizeInternal(int w, int h)
+{
+        if (w <= 0) w = 1;
+        if (h <= 0) h = 1;
+
+        glWinW = w;
+        glWinH = h;
+
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(0, w, h, 0, -1, 1);
+
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+}
+
+// Legacy entry point — kept for GFX::Start() which runs on the NES thread
+// before rendering has started (no concurrent GL_DrawFrame in flight).
 void GL_Resize(int w, int h)
 {
         if (!UsingOpenGL || !hGLRC || !hGLDC)
                 return;
 
-        // Guard against zero window size
-        if (w <= 0)
-                w = 1;
+        // If the NES thread is already running (emulation active), defer the
+        // resize so it lands inside GL_DrawFrame where the context is current.
+        // If we are NOT yet running (called from GFX::Start setup), it is safe
+        // to apply directly — there is no concurrent GL_DrawFrame.
+        if (NES::Running)
+        {
+                PostGLResize(w, h);
+                return;
+        }
 
-        if (h <= 0)
-                h = 1;
-
-        glWinW = w;
-        glWinH = h;
+        if (w <= 0) w = 1;
+        if (h <= 0) h = 1;
 
         wglMakeCurrent(hGLDC, hGLRC);
-
-        // Projection
-        glMatrixMode(GL_PROJECTION);
-        glLoadIdentity();
-        glOrtho(0, w, h, 0, -1, 1);
-
-        // ModelView
-        glMatrixMode(GL_MODELVIEW);
-        glLoadIdentity();
-
+        GL_ResizeInternal(w, h);
         wglMakeCurrent(NULL, NULL);
+}
+
+// Post a deferred resize from the UI thread (WM_SIZE). The new dimensions are
+// packed into a single 64-bit atomic so the read in GL_DrawFrame is always
+// consistent — no partial-word tearing between width and height.
+void PostGLResize(int w, int h)
+{
+        if (w <= 0) w = 1;
+        if (h <= 0) h = 1;
+
+        LONGLONG packed = ((LONGLONG)(DWORD)w << 32) | (LONGLONG)(DWORD)h;
+        InterlockedExchange64(&g_PendingResize, packed);
+}
+
+// Read and apply any deferred resize. Called at the start of GL_DrawFrame,
+// after wglMakeCurrent, so the GL context is current on this thread.
+static void ApplyPendingResize()
+{
+        LONGLONG packed = InterlockedExchange64(&g_PendingResize, -1LL);
+        if (packed == -1LL)
+                return;
+
+        int w = (int)(DWORD)(packed >> 32);
+        int h = (int)(DWORD)(packed & 0xFFFFFFFFLL);
+        GL_ResizeInternal(w, h);
 }
 
 static void GL_DrawFrame(void)
@@ -256,10 +305,12 @@ static void GL_DrawFrame(void)
         // Apply any pending vsync interval change posted by MonitorSync::Enable()
         // from the UI thread. Must happen here, after wglMakeCurrent and before
         // any GL draw calls, so the context is current and owned by this thread.
-        // ApplyPendingVSync calls pfnWglSwapIntervalEXT directly — it must NOT
-        // call wglMakeCurrent(NULL,NULL) internally, as that would deassociate
-        // the context and turn all subsequent GL calls into silent no-ops.
         MonitorSync::ApplyPendingVSync();
+
+        // Apply any pending viewport resize posted by WM_SIZE from the UI thread.
+        // GL_Resize cannot be called directly from WM_SIZE while NES is running
+        // because it would call wglMakeCurrent and race with this draw sequence.
+        ApplyPendingResize();
 
         glViewport(0, 0, glWinW, glWinH);
 

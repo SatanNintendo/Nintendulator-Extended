@@ -58,6 +58,7 @@ void    DrawIntegerScale (void);
 void    Update (void);
 void    Repaint (void);
 void    GL_Resize (int, int);
+void    PostGLResize (int, int);   // thread-safe deferred resize (posts to NES thread)
 void    ApplyGLFilter (void);
 BOOL    UseOpenGL (void);
 void    SyncMenuChecks (void);

@@ -920,7 +920,25 @@ case WM_SIZE:
 {
         RECT rc;
         GetClientRect(hWnd, &rc);
-        GFX::GL_Resize(rc.right - rc.left, rc.bottom - rc.top);
+        // GL_Resize calls wglMakeCurrent from the UI thread. If the NES thread
+        // is currently inside GL_DrawFrame (between its own wglMakeCurrent and
+        // SwapBuffers), this races and can corrupt the in-flight GL state.
+        // Post a deferred resize request that GL_DrawFrame picks up safely at
+        // the start of the next frame, the same way vsync changes are deferred.
+        GFX::PostGLResize(rc.right - rc.left, rc.bottom - rc.top);
+}
+break;
+
+case WM_APP_SETTITLE:
+{
+        // Async title-bar update posted by UpdateTitlebar() when called from
+        // the NES emulation thread. lParam owns the heap string; free it here.
+        TCHAR *title = reinterpret_cast<TCHAR*>(lParam);
+        if (title)
+        {
+                SetWindowText(hWnd, title);
+                delete[] title;
+        }
 }
 break;
 
@@ -1062,7 +1080,40 @@ void UpdateTitlebar (void)
                 _tcscat(titlebar, _T(" - "));
                 _tcscat(titlebar, TitlebarBuffer);
         }
-        SetWindowText(hMainWnd, titlebar);
+
+        // CRITICAL: never call SetWindowText from the NES emulation thread.
+        // SetWindowText on a window owned by another thread is implemented as
+        // SendMessage(WM_SETTEXT), which BLOCKS the caller until the UI thread's
+        // message pump processes the message. If the UI thread is busy (DWM
+        // composition cycle, window manager repaint, antivirus hook) this stall
+        // can be 5-15ms — easily long enough to miss the next vblank and produce
+        // the ~30-second periodic glitch where both video and audio drop out
+        // simultaneously (audio drops because the NES thread also drives the APU
+        // write loop, so any stall here starves the DirectSound buffer too).
+        //
+        // PostMessage(WM_SETTEXT) is fully asynchronous: the NES thread posts
+        // the string and returns immediately. The UI thread applies it whenever
+        // it next processes messages — at most one frame later, imperceptible.
+        // We copy the string to a heap buffer because the stack allocation here
+        // will be gone by the time the UI thread runs; the UI thread frees it
+        // via a custom WM_APP_SETTITLE handler in WndProc.
+        //
+        // When NOT running (called from UI thread directly), use SetWindowText
+        // as before — no cross-thread issue in that case.
+        if (NES::Running && GetCurrentThreadId() != GetWindowThreadProcessId(hMainWnd, NULL))
+        {
+                // Allocate a persistent copy for the async message.
+                TCHAR *asyncTitle = new TCHAR[256];
+                _tcscpy(asyncTitle, titlebar);
+                // WM_APP_SETTITLE = WM_APP+1. Defined in Nintendulator.h.
+                // WndProc handles it: SetWindowText((TCHAR*)lParam); delete[] (TCHAR*)lParam;
+                if (!PostMessage(hMainWnd, WM_APP_SETTITLE, 0, (LPARAM)asyncTitle))
+                        delete[] asyncTitle; // PostMessage failed (queue full) — just drop it
+        }
+        else
+        {
+                SetWindowText(hMainWnd, titlebar);
+        }
 }
 void __cdecl PrintTitlebar (const TCHAR *Text, ...)
 {

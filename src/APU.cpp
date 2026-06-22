@@ -69,7 +69,28 @@ static const double     drc_max_adjust  = 0.05;
 #define FRAMEBUF        4
 const unsigned int      LOCK_SIZE = FREQ * (BITS / 8);
 
+static double           drc_target_fill = 0.55;
+static const double     drc_max_adjust  = 0.05;
+
+// === MOVED HERE ===
+#define FREQ            44100
+#define BITS            16
+#define FRAMEBUF        4
+const unsigned int      LOCK_SIZE = FREQ * (BITS / 8);
+
 static DWORD            drc_play_freq   = FREQ;  // current DirectSound playback frequency
+
+// Deferred DirectSound SetFrequency.
+// IDirectSoundBuffer::SetFrequency is an IPC call into audiodg.exe (the Windows
+// Audio Engine). The Audio Engine runs its own 10ms service cycle; if SetFrequency
+// arrives at the start of that cycle the call blocks for up to ~10ms. When this
+// stall happens inside UpdateDRC (called every frame from the NES thread), both
+// video and audio glitch simultaneously because the NES thread drives both.
+//
+// Solution: UpdateDRC writes the new frequency here via InterlockedExchange.
+// APU::Run reads it once per audio slot write — outside the vblank-critical
+// window, so a brief IPC stall there costs nothing visible. -1 = no pending change.
+static volatile LONG    g_PendingFreq   = -1L;
 #endif
 
 const   unsigned char   LengthCounts[32] = {
@@ -1671,17 +1692,20 @@ void    UpdateDRC (void)
 
         DWORD newFreq = (DWORD)(newFreqD + 0.5);
 
-        // Apply only if the change is significant (≥2 Hz) to avoid
-        // hammering SetFrequency with no-op calls. The old threshold was
-        // 10 Hz, which was appropriate when UpdateDRC ran every 20 frames;
-        // with per-frame calls the incremental steps are much smaller and
-        // 2 Hz is enough hysteresis to avoid redundant driver calls while
-        // still tracking the buffer fill smoothly.
+        // Post the new frequency for deferred application in APU::Run.
+        // We do NOT call Buffer->SetFrequency here directly. SetFrequency is an
+        // IPC call into audiodg.exe; the Audio Engine runs a 10ms service cycle
+        // and SetFrequency can block for the remainder of that cycle (~0-10ms)
+        // if it arrives at the wrong moment. This stall is in the NES thread,
+        // which also drives the GL_DrawFrame / SwapBuffers path — so both video
+        // AND audio glitch simultaneously, which is exactly the ~30-second
+        // periodic symptom. APU::Run applies g_PendingFreq after the DS slot
+        // write, safely outside the vblank-critical window.
         if (newFreq != drc_play_freq &&
             (newFreq > drc_play_freq + 2 || newFreq + 2 < drc_play_freq))
         {
                 drc_play_freq = newFreq;
-                Buffer->SetFrequency(newFreq);
+                InterlockedExchange(&g_PendingFreq, (LONG)newFreq);
         }
 #endif /* !NSFPLAYER */
 }
@@ -1699,7 +1723,11 @@ void    ResetDRC (void)
         if (!Buffer || !isEnabled)
                 return;
         drc_play_freq = FREQ;
-        Buffer->SetFrequency(FREQ);
+        // Post the reset frequency for deferred application, same as UpdateDRC.
+        // ResetDRC is called from MonitorSync::Enable(FALSE) on the UI thread;
+        // calling SetFrequency directly from the UI thread would be an IPC call
+        // into audiodg.exe from a thread that has no business stalling there.
+        InterlockedExchange(&g_PendingFreq, (LONG)FREQ);
 #endif /* !NSFPLAYER */
 }
 
@@ -1763,6 +1791,16 @@ void    Run (void)
                         memcpy(bufPtr, buffer, bufBytes);
                         Try(Buffer->Unlock(bufPtr, bufBytes, NULL, 0), Lang::GetString(LANG_ERR_APU_BUFFER));
                         next_pos = (next_pos + 1) % FRAMEBUF;
+
+                        // Apply any deferred SetFrequency posted by UpdateDRC.
+                        // We do this AFTER the slot write, not during UpdateDRC,
+                        // to keep the IPC call to audiodg.exe outside the vblank-
+                        // critical window. A 0-10ms stall here costs nothing visible;
+                        // the same stall inside UpdateDRC (which runs in GL_DrawFrame's
+                        // frame) would produce a missed vblank + audio dropout.
+                        LONG pendingFreq = InterlockedExchange(&g_PendingFreq, -1L);
+                        if (pendingFreq > 0 && Buffer)
+                                Buffer->SetFrequency((DWORD)pendingFreq);
                 }
         }
 #define VolAdjust(pos, vol) ((volumes[vol] > 0) ? (((pos) * volumes[vol]) / 100) : 0)

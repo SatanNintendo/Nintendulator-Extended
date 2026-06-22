@@ -37,6 +37,13 @@ extern  void            BrowseFolder (const TCHAR *dir);
 
 extern  BOOL            ProcessMessages (void);
 
+// Custom window message: asynchronous title-bar update.
+// Posted (never sent) by UpdateTitlebar() when called from the NES emulation
+// thread, so the NES thread never blocks waiting for the UI thread to process
+// WM_SETTEXT. lParam is a heap-allocated TCHAR[256] string; WndProc calls
+// SetWindowText and then delete[] on it.
+#define WM_APP_SETTITLE  (WM_APP + 1)
+
 extern  TCHAR           TitlebarBuffer[256];
 extern  int             TitlebarDelay;
 extern  void            UpdateTitlebar (void);
