@@ -881,7 +881,7 @@ case ID_SOUND_ENABLED:
 case WM_KEYDOWN:
         if (wParam == VK_F11)
         {
-                BOOL running = NES::Running;
+                BOOL wasRunning = NES::Running;
 
                 NES::Stop();
                 GFX::Stop();
@@ -890,7 +890,7 @@ case WM_KEYDOWN:
 
                 GFX::Start();
 
-                if (running)
+                if (wasRunning)
                         NES::Start(FALSE);
 
                 return 0;
@@ -900,7 +900,7 @@ case WM_KEYDOWN:
 case WM_SYSKEYDOWN:
         if (wParam == VK_RETURN && (lParam & (1 << 29)))
         {
-                BOOL running = NES::Running;
+                BOOL wasRunning = NES::Running;
 
                 NES::Stop();
                 GFX::Stop();
@@ -909,7 +909,7 @@ case WM_SYSKEYDOWN:
 
                 GFX::Start();
 
-                if (running)
+                if (wasRunning)
                         NES::Start(FALSE);
 
                 return 0;

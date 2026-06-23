@@ -1277,8 +1277,9 @@ void    DrawIntegerScale (void)
                 int srcY = (y - ISBorderY) / ISMult;
 
                 // Left black border
-                unsigned short *dst;
-                        *dst++ = 0x000000;
+                unsigned short *dstS = (unsigned short *)dst;
+                for (x = 0; x < ISBorderX; x++)
+                        *dstS++ = 0x0000;
 
                 // NES pixels - each repeated ISMult times
                 unsigned short *src = PPU::DrawArray + srcY * 256;
@@ -1286,12 +1287,12 @@ void    DrawIntegerScale (void)
                 {
                         unsigned long color = Palette32[*src++];
                         for (int px = 0; px < ISMult; px++)
-                                *dst++ = color;
+                                *dstS++ = (unsigned short)color;
                 }
 
                 // Right black border
                 for (x = ISBorderX + 256 * ISMult; x < scrW; x++)
-                        *dst++ = 0x000000;
+                        *dstS++ = 0x0000;
         }
 }
 

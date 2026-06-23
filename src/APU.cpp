@@ -52,7 +52,6 @@ BYTE                    Regs[0x18];
 
 unsigned long           MHz;
 #ifndef NSFPLAYER
-// Dynamic Rate Control
 // Dynamic Rate Control state.
 // target_fill = 0.55: keep the write cursor 2.2 slots ahead of the play
 // cursor (instead of exactly 2.0 / 50%). The extra 5% margin means the
@@ -63,16 +62,6 @@ unsigned long           MHz;
 static double           drc_target_fill = 0.55;
 static const double     drc_max_adjust  = 0.05;
 
-// === MOVED HERE ===
-#define FREQ            44100
-#define BITS            16
-#define FRAMEBUF        4
-const unsigned int      LOCK_SIZE = FREQ * (BITS / 8);
-
-static double           drc_target_fill = 0.55;
-static const double     drc_max_adjust  = 0.05;
-
-// === MOVED HERE ===
 #define FREQ            44100
 #define BITS            16
 #define FRAMEBUF        4
