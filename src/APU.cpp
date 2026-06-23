@@ -1166,7 +1166,13 @@ void    Start (void)
                 return;
         }
 
-        DSBD.dwFlags = DSBCAPS_GLOBALFOCUS | DSBCAPS_LOCSOFTWARE | DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_CTRLFREQUENCY;
+        // DSBCAPS_LOCSOFTWARE deliberately omitted: on Windows Vista and later,
+        // DirectSound always routes through WASAPI shared mode regardless of
+        // this flag (hardware mixing was removed). Specifying LOCSOFTWARE forces
+        // the legacy software mixer code path which adds latency and slightly
+        // increases the probability of IPC stalls when audiodg.exe is busy.
+        // Omitting it lets the driver choose the optimal path.
+        DSBD.dwFlags = DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_CTRLFREQUENCY;
         DSBD.dwBufferBytes = LockSize * FRAMEBUF;
         DSBD.lpwfxFormat = &WFX;
 
