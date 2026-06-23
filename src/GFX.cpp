@@ -106,19 +106,24 @@ static BOOL   UsingOpenGL = FALSE;
 // Packed as a single 64-bit value: high 32 = width, low 32 = height.
 // -1 means "no pending resize".
 static __declspec(align(8)) volatile LONGLONG g_PendingResize = -1LL;
+
+// Deferred bilinear filter toggle.
+// ApplyGLFilter() used to call wglMakeCurrent from the UI thread (WM_COMMAND →
+// ID_PPU_BILINEAR), which races with GL_DrawFrame exactly like the old Enable()
+// and WM_SIZE bugs. Fix: UI thread posts g_PendingBilinear; GL_DrawFrame applies
+// it at the start of the frame while the context is already current.
+// 0 = nearest (off), 1 = linear (on), -1 = no pending change.
+static volatile LONG g_PendingBilinear = -1L;
+
 void ApplyGLFilter(void)
 {
+        // Post the change for deferred application in GL_DrawFrame.
+        // Never call wglMakeCurrent from the UI thread while the NES thread
+        // may be inside GL_DrawFrame — it steals the context and produces
+        // a black frame or corrupted output.
         if (!UsingOpenGL || !glTex)
                 return;
-
-        wglMakeCurrent(hGLDC, hGLRC);
-
-        glBindTexture(GL_TEXTURE_2D, glTex);
-
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, Bilinear ? GL_LINEAR : GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, Bilinear ? GL_LINEAR : GL_NEAREST);
-
-        wglMakeCurrent(NULL, NULL);
+        InterlockedExchange(&g_PendingBilinear, Bilinear ? 1L : 0L);
 }
 
 #if (_MSC_VER >= 1400)
@@ -312,19 +317,17 @@ static void GL_DrawFrame(void)
         // because it would call wglMakeCurrent and race with this draw sequence.
         ApplyPendingResize();
 
+        // Apply any pending bilinear filter change posted by ApplyGLFilter()
+        // from the UI thread. Must be here (context current, before draw calls).
+        {
+                LONG pendingBilinear = InterlockedExchange(&g_PendingBilinear, -1L);
+                if (pendingBilinear >= 0)
+                        Bilinear = (pendingBilinear != 0) ? TRUE : FALSE;
+        }
+
         glViewport(0, 0, glWinW, glWinH);
 
         glBindTexture(GL_TEXTURE_2D, glTex);
-        if (Bilinear)
-        {
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        }
-        else
-        {
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        }
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 240, GL_BGRA_EXT, GL_UNSIGNED_BYTE, frameBuf);
 
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -374,10 +377,22 @@ static void GL_DrawFrame(void)
         glEnable(GL_TEXTURE_2D);
         glBindTexture(GL_TEXTURE_2D, glTex);
 
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                Bilinear ? GL_LINEAR : GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
-                Bilinear ? GL_LINEAR : GL_NEAREST);
+        // Only call glTexParameteri when the filter setting actually changes.
+        // These calls flush state to the driver even when the value is identical,
+        // adding unnecessary overhead on every frame. The filter rarely changes
+        // (only when the user toggles Bilinear in the menu), so caching the
+        // last-applied value eliminates the per-frame driver round-trip.
+        {
+                static BOOL s_lastBilinear = -1;
+                if (Bilinear != s_lastBilinear)
+                {
+                        s_lastBilinear = Bilinear;
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                                Bilinear ? GL_LINEAR : GL_NEAREST);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                                Bilinear ? GL_LINEAR : GL_NEAREST);
+                }
+        }
 
         glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
 
@@ -1128,7 +1143,17 @@ void    DrawScreen (void)
                 // Use this post-vblank moment to refine the monitor-rate
                 // measurement and apply an extra DwmFlush sync hint.
                 if (MatchMonitorRate)
+                {
                         MonitorSync::OnFrameEnd();
+                        // Dynamic Rate Control: call UpdateDRC AFTER SwapBuffers,
+                        // not before. UpdateDRC calls IDirectSoundBuffer::GetCurrentPosition,
+                        // which is an IPC call into audiodg.exe. When this was placed
+                        // before Update()/SwapBuffers, the 0-5ms IPC stall consumed part
+                        // of the inter-vblank budget, occasionally causing us to miss
+                        // the next vblank. Post-vblank is the safest moment: we have
+                        // a full ~16ms window and the same stall costs nothing visible.
+                        APU::UpdateDRC();
+                }
         }
         QueryPerformanceCounter(&TmpClockVal);
         // Guard: on the very first DrawScreen call after ROM load, LastClockVal is 0.
@@ -1137,16 +1162,6 @@ void    DrawScreen (void)
         if (LastClockVal.QuadPart != 0)
                 aFPSnum += TmpClockVal.QuadPart - LastClockVal.QuadPart;
         LastClockVal = TmpClockVal;
-
-        // Dynamic Rate Control: when Match Monitor Rate is active, call UpdateDRC
-        // every single frame. Previously it was called once per 20-frame window,
-        // introducing up to ~330ms of correction lag. The DirectSound buffer
-        // (FRAMEBUF = 4 slots * ~16.67ms = ~67ms) can drift noticeably within that
-        // window, and a tardy correction then overshoots, producing the periodic
-        // stutter. Calling UpdateDRC every frame keeps the feedback loop tight
-        // and the per-call overhead is negligible (one GetCurrentPosition query).
-        if (MatchMonitorRate)
-                APU::UpdateDRC();
 
         if (++aFPScnt >= 20)
         {

@@ -102,6 +102,31 @@ namespace MonitorSync
         static volatile LONG  g_PendingVSyncInterval = -1;
 
         // ------------------------------------------------------------------
+        // Waitable timer for PaceFrame.
+        //
+        // SwitchToThread() gives up the current time-slice but the scheduler
+        // is free to not reschedule us for up to ~15ms on a loaded system
+        // (same order of magnitude as Sleep(1)). This causes the wait-loop in
+        // APU::Run to occasionally stall past the next vblank.
+        //
+        // A waitable timer with a sub-millisecond period is more reliable:
+        // it programs the hardware timer interrupt to fire at the right time,
+        // independent of scheduler state. We aim for ~LockSize/FREQ*1000 - 0.5ms
+        // (one audio slot duration minus 0.5ms headroom), so we wake up just
+        // before the DS slot becomes free. The pre-check in APU::Run then
+        // immediately finds the slot free and skips the loop.
+        //
+        // CreateWaitableTimerExW with CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+        // is loaded dynamically (Win 10 1803+); older systems fall back to
+        // a standard waitable timer which still beats SwitchToThread() under
+        // load. NULL = not yet initialized, INVALID_HANDLE_VALUE = unavailable.
+        // ------------------------------------------------------------------
+        static HANDLE g_PaceTimer = NULL;
+        typedef HANDLE (WINAPI *PFN_CreateWaitableTimerExW)(
+                LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
+        static const DWORD CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG = 0x00000002;
+
+        // ------------------------------------------------------------------
         // Helpers
         // ------------------------------------------------------------------
 
@@ -440,37 +465,87 @@ namespace MonitorSync
 
         void PaceFrame()
         {
-                // Called from the audio-buffer fill wait loop.
+                // Called from the audio-buffer fill wait loop in APU::Run.
                 //
                 // Two scenarios:
                 //
                 // 1. VSync is active (the common case): SwapBuffers inside
                 //    GFX::Update has already blocked until the next monitor
-                //    vblank, throttling the emulator to monitor_hz. Here we
-                //    only need to wait for DirectSound to drain its buffer
-                //    chunk (~16ms at 60 FPS), and Sleep(1) with the 1ms timer
-                //    resolution enabled by WinMain is precise enough without
-                //    burning a CPU core.
+                //    vblank, throttling the emulator to monitor_hz. We only need
+                //    to wait for the DirectSound slot to drain (~16ms at 60 FPS).
                 //
-                //    However, Sleep(1) can actually sleep 1–2ms due to timer
-                //    granularity, and that extra 1ms pushes us past the NEXT
-                //    vblank — SwapBuffers then returns immediately (vblank already
-                //    happened) and the whole cadence slips by one frame, producing
-                //    the intermittent micro-stutter that remains even after DRC
-                //    and frameskip fixes.
+                //    We use a waitable timer instead of SwitchToThread():
+                //    SwitchToThread() hands control to another runnable thread
+                //    but the scheduler may not reschedule us for up to ~15ms on
+                //    a loaded system (antivirus, browser, etc.) — same problem as
+                //    Sleep(1). A waitable timer programs the hardware interrupt
+                //    at the precise deadline regardless of scheduler state.
                 //
-                //    SwitchToThread() de-schedules us for the remainder of the
-                //    current time-slice and returns as soon as the scheduler gives
-                //    us back the CPU (typically 0.1–0.5ms). We re-check the DS
-                //    position far sooner, keeping the wait-loop below its 1ms
-                //    budget and preventing vblank misses.
+                //    Period: one audio slot (~16.67ms at 60fps) minus 0.5ms
+                //    headroom. We fire just before the slot becomes free; the
+                //    pre-check in APU::Run immediately confirms it and skips
+                //    the loop entirely without a second wait.
                 //
-                // 2. VSync is NOT active: Sleep(0) yields without sleeping, letting
-                //    the DirectSound buffer drain be the sole throttle.
-                if (g_VSyncActive)
-                        SwitchToThread();
-                else
+                //    We try CreateWaitableTimerExW with HIGH_RESOLUTION first
+                //    (Win 10 1803+, ~0.5ms accuracy), fall back to standard
+                //    waitable timer (~1ms accuracy, still better than STT under
+                //    load), and ultimately SwitchToThread as last resort.
+                //
+                // 2. VSync NOT active: Sleep(0) yields without sleeping.
+                if (!g_VSyncActive)
+                {
                         Sleep(0);
+                        return;
+                }
+
+                // Lazy-initialize the pace timer once.
+                if (g_PaceTimer == NULL)
+                {
+                        // Try high-resolution waitable timer (Win10 1803+).
+                        PFN_CreateWaitableTimerExW pfnEx =
+                                (PFN_CreateWaitableTimerExW)GetProcAddress(
+                                        GetModuleHandleW(L"kernel32.dll"),
+                                        "CreateWaitableTimerExW");
+                        HANDLE ht = NULL;
+                        if (pfnEx)
+                        {
+                                ht = pfnEx(NULL, NULL,
+                                        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG,
+                                        TIMER_ALL_ACCESS);
+                        }
+                        if (!ht)
+                        {
+                                // Standard waitable timer (all Win32 versions).
+                                ht = CreateWaitableTimer(NULL, FALSE, NULL);
+                        }
+                        // Store result; INVALID_HANDLE_VALUE means all attempts failed.
+                        g_PaceTimer = ht ? ht : INVALID_HANDLE_VALUE;
+                }
+
+                if (g_PaceTimer != INVALID_HANDLE_VALUE)
+                {
+                        // Set a one-shot relative timer.
+                        // LARGE_INTEGER in 100-ns units, negative = relative.
+                        // Target: (LockSize/FREQ * 1000 - 0.5) ms
+                        // At 44100 Hz, 16-bit mono: LockSize = 44100*2/60 = 1470 bytes
+                        //   = 735 samples = 735/44100 s = ~16.667 ms
+                        // Minus 0.5ms headroom = 16.167 ms = 161670 * 100ns units.
+                        // We compute it from g_NESHz to be region-aware.
+                        double slotMs = (g_NESHz > 0.0)
+                                ? (1000.0 / g_NESHz) - 0.5
+                                : 16.167;
+                        if (slotMs < 1.0) slotMs = 1.0;
+                        LONGLONG period100ns = -(LONGLONG)(slotMs * 10000.0);
+                        LARGE_INTEGER due;
+                        due.QuadPart = period100ns;
+                        SetWaitableTimer(g_PaceTimer, &due, 0, NULL, NULL, FALSE);
+                        WaitForSingleObject(g_PaceTimer, 20); // 20ms safety timeout
+                }
+                else
+                {
+                        // Final fallback.
+                        SwitchToThread();
+                }
         }
 
         // Apply a pending vsync interval change. Must be called from the
