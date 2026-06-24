@@ -53,18 +53,26 @@ BYTE                    Regs[0x18];
 unsigned long           MHz;
 #ifndef NSFPLAYER
 // Dynamic Rate Control state.
-// target_fill = 0.55: keep the write cursor 2.2 slots ahead of the play
-// cursor (instead of exactly 2.0 / 50%). The extra 5% margin means the
-// write position nearly always clears the DirectSound safe-write boundary
-// without waiting, so the pre-check in APU::Run exits via goto and never
-// calls SwitchToThread(). Each 1% of the 4-slot, 66.67ms buffer = 0.67ms
-// of extra latency — the 5% increase adds ~3.3ms, which is inaudible.
-static double           drc_target_fill = 0.55;
+// With FRAMEBUF=6 (100ms total buffer), we target the write cursor at
+// ~2.5 slots ahead of the play cursor = 2.5/6 = 0.417, rounded to 0.42.
+// Previously 0.55 with FRAMEBUF=4 (2.2/4 slots ahead). Keeping the same
+// 5% margin above the midpoint means we stay near the centre of the ring
+// buffer and have equal headroom in both directions before starving or
+// overflowing. The extra buffer capacity absorbs longer scheduler hiccups
+// (up to ~50ms) without the wait-loop ever being entered.
+static double           drc_target_fill = 0.42;
 static const double     drc_max_adjust  = 0.05;
 
 #define FREQ            44100
 #define BITS            16
-#define FRAMEBUF        4
+// FRAMEBUF: number of DirectSound slots in the ring buffer.
+// 4 slots = 66.67ms total buffer (4 x 16.67ms at 60 Hz NTSC).
+// Raised to 6 slots = 100ms. This gives UpdateDRC and the pre-check
+// more room to absorb DWM scheduling hiccups without the buffer running
+// dry. The extra latency (~33ms) is below perception threshold for
+// retro gaming and is the difference between a slot being free on the
+// very first pre-check vs. entering the wait-loop on a loaded system.
+#define FRAMEBUF        6
 const unsigned int      LOCK_SIZE = FREQ * (BITS / 8);
 
 static DWORD            drc_play_freq   = FREQ;  // current DirectSound playback frequency

@@ -84,6 +84,13 @@ namespace MonitorSync
         static LARGE_INTEGER  g_CalibStartQPC  = {0, 0};
         static bool           g_CalibActive    = false;
 
+        // QPC timestamp of the most recent OnFrameEnd() call.
+        // Updated every frame (unlike g_CalibStartQPC which resets every 60).
+        // Used by PaceFrame() for per-frame drift correction: subtract elapsed
+        // time since this stamp from the nominal wait period so the total
+        // inter-slot duration stays constant regardless of DWM/driver jitter.
+        static LARGE_INTEGER  g_LastFrameEndQPC = {0, 0};
+
         // ------------------------------------------------------------------
         // Deferred vsync interval.
         //
@@ -398,7 +405,11 @@ namespace MonitorSync
                 if (!g_Initialized || !IsEnabled())
                         return;
 
-                // Calibration: refine g_MonitorHz by averaging frame-to-frame
+                // Record the time immediately after SwapBuffers unblocked.
+                // PaceFrame() uses this to subtract already-elapsed time from
+                // its wait period, compensating for DWM/driver wake-up jitter.
+                if (g_QPCFreq.QuadPart > 0)
+                        QueryPerformanceCounter(&g_LastFrameEndQPC);
                 // QPC deltas. With vsync on, measured FPS = monitor refresh.
                 // Note: we do NOT call DwmFlush here — SwapBuffers (called from
                 // GFX::Update just before this) has already blocked until the
@@ -477,14 +488,19 @@ namespace MonitorSync
                 //    We use a waitable timer instead of SwitchToThread():
                 //    SwitchToThread() hands control to another runnable thread
                 //    but the scheduler may not reschedule us for up to ~15ms on
-                //    a loaded system (antivirus, browser, etc.) — same problem as
+                //    a loaded system (antivirus, browser, etc.) -- same problem as
                 //    Sleep(1). A waitable timer programs the hardware interrupt
                 //    at the precise deadline regardless of scheduler state.
                 //
-                //    Period: one audio slot (~16.67ms at 60fps) minus 0.5ms
-                //    headroom. We fire just before the slot becomes free; the
-                //    pre-check in APU::Run immediately confirms it and skips
-                //    the loop entirely without a second wait.
+                //    QPC drift correction: SwapBuffers is supposed to return
+                //    right at vblank, but may be delayed by the driver or DWM.
+                //    If we naively wait the full slot period every time, these
+                //    delays accumulate and occasionally push us past the next
+                //    vblank boundary. Instead, we measure actual elapsed time
+                //    since the last OnFrameEnd tick (which runs immediately
+                //    after SwapBuffers returns) and subtract it from the nominal
+                //    wait period. This keeps total inter-slot time constant
+                //    regardless of when exactly SwapBuffers woke us up.
                 //
                 //    We try CreateWaitableTimerExW with HIGH_RESOLUTION first
                 //    (Win 10 1803+, ~0.5ms accuracy), fall back to standard
@@ -524,17 +540,32 @@ namespace MonitorSync
 
                 if (g_PaceTimer != INVALID_HANDLE_VALUE)
                 {
-                        // Set a one-shot relative timer.
-                        // LARGE_INTEGER in 100-ns units, negative = relative.
-                        // Target: (LockSize/FREQ * 1000 - 0.5) ms
-                        // At 44100 Hz, 16-bit mono: LockSize = 44100*2/60 = 1470 bytes
-                        //   = 735 samples = 735/44100 s = ~16.667 ms
-                        // Minus 0.5ms headroom = 16.167 ms = 161670 * 100ns units.
-                        // We compute it from g_NESHz to be region-aware.
+                        // Nominal slot duration minus 0.5ms headroom.
+                        // Computed from g_NESHz to be region-aware.
                         double slotMs = (g_NESHz > 0.0)
                                 ? (1000.0 / g_NESHz) - 0.5
                                 : 16.167;
                         if (slotMs < 1.0) slotMs = 1.0;
+
+                        // QPC drift correction: subtract time already elapsed
+                        // since the last OnFrameEnd (= since SwapBuffers returned).
+                        // g_LastFrameEndQPC holds the QPC timestamp recorded at the
+                        // very start of OnFrameEnd(), immediately after SwapBuffers
+                        // unblocks. Subtracting elapsed time gives the remaining
+                        // budget for this slot. Cap to [1ms, slotMs] to avoid
+                        // negative or degenerate zero-wait busy-poll scenarios.
+                        if (g_QPCFreq.QuadPart > 0 && g_LastFrameEndQPC.QuadPart != 0)
+                        {
+                                LARGE_INTEGER now;
+                                QueryPerformanceCounter(&now);
+                                double elapsedMs = (double)(now.QuadPart - g_LastFrameEndQPC.QuadPart)
+                                        * 1000.0 / (double)g_QPCFreq.QuadPart;
+                                slotMs -= elapsedMs;
+                                if (slotMs < 1.0) slotMs = 1.0;
+                        }
+
+                        // Set a one-shot relative timer.
+                        // LARGE_INTEGER in 100-ns units, negative = relative.
                         LONGLONG period100ns = -(LONGLONG)(slotMs * 10000.0);
                         LARGE_INTEGER due;
                         due.QuadPart = period100ns;

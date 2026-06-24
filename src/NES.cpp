@@ -1160,14 +1160,28 @@ void    Reset (RESET_TYPE ResetType)
 
 DWORD   WINAPI  Thread (void *param)
 {
-        // Elevate to ABOVE_NORMAL so background tasks (antivirus, browser,
-        // indexer) cannot preempt us during the critical 16ms vblank window.
-        // We still yield to HIGH and REALTIME threads (audio driver, kernel),
-        // so the system remains stable. A 1-2ms preemption right after
-        // SwapBuffers returns causes us to miss the next vblank entirely,
-        // producing the intermittent micro-stutter visible as a 2-frame skip.
-        // Thread exits at NORMAL automatically; no explicit restore needed.
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        // Elevate thread priority to reduce preemption during the 16ms vblank
+        // window. When Match Monitor Rate is active we rely on SwapBuffers
+        // blocking at vblank for frame pacing — any preemption after SwapBuffers
+        // returns and before we start the next frame causes us to miss the next
+        // vblank, producing a 2-frame skip (visible stutter).
+        //
+        // With MMR OFF:  ABOVE_NORMAL — beats antivirus/browser/indexer but
+        //   yields to audio driver and kernel. Safe on all machines.
+        //
+        // With MMR ON:   TIME_CRITICAL — sits above DWM, the audio renderer,
+        //   and most system threads. The window between vblank and the next
+        //   GL call is typically <1ms; TIME_CRITICAL ensures no other user-mode
+        //   thread can steal that slice. Risk is low: we spend nearly all our
+        //   time blocked in SwapBuffers (vblank wait) or DS slot wait, so we
+        //   don't actually consume much CPU at this priority. We revert to
+        //   ABOVE_NORMAL when MMR is disabled (checked every 60 frames below).
+        {
+                int prio = GFX::MatchMonitorRate
+                        ? THREAD_PRIORITY_TIME_CRITICAL
+                        : THREAD_PRIORITY_ABOVE_NORMAL;
+                SetThreadPriority(GetCurrentThread(), prio);
+        }
 
 #ifdef  CPU_BENCHMARK
         // Run with cyctest.nes
