@@ -1197,8 +1197,23 @@ void    DrawScreen (void)
                 aFPScnt = 0;
                 aFPSnum = 0;
         }
-        if (!TitleDelay--)\n        {\n                UpdateTitlebar();\n                TitleDelay = 10;\n\n                // Recheck thread priority every ~10 frames (piggybacked on\n                // the title-bar update). This ensures that toggling Match\n                // Monitor Rate on/off at runtime is reflected promptly in the\n                // NES thread's priority without needing a stop/restart cycle.\n                // TIME_CRITICAL is used when MMR is on (minimises preemption\n                // in the vblank window), ABOVE_NORMAL otherwise.\n                SetThreadPriority(GetCurrentThread(),\n                        MatchMonitorRate\n                                ? THREAD_PRIORITY_TIME_CRITICAL\n                                : THREAD_PRIORITY_ABOVE_NORMAL);\n        }\n}
+        if (!TitleDelay--)
+        {
+                UpdateTitlebar();
+                TitleDelay = 10;
 
+                // Recheck thread priority every ~10 frames (piggybacked on
+                // the title-bar update). This ensures that toggling Match
+                // Monitor Rate on/off at runtime is reflected promptly in the
+                // NES thread's priority without needing a stop/restart cycle.
+                // TIME_CRITICAL is used when MMR is on (minimises preemption
+                // in the vblank window), ABOVE_NORMAL otherwise.
+                SetThreadPriority(GetCurrentThread(),
+                        MatchMonitorRate
+                                ? THREAD_PRIORITY_TIME_CRITICAL
+                                : THREAD_PRIORITY_ABOVE_NORMAL);
+        }
+}
 void    SetFrameskip (int skip)
 {
         if (skip >= 0)
