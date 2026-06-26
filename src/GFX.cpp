@@ -1017,6 +1017,17 @@ void    Stop (void)
                         ChangeDisplaySettingsEx(NULL, NULL, NULL, 0, NULL);
                         HasSavedDisplayMode = FALSE;
                 }
+                // Reset MonitorSync QPC baseline before destroying the GL context.
+                // Without this, PaceFrame() computes elapsed time from the old
+                // fullscreen baseline (seconds old) on the first windowed frame,
+                // clamps slotMs to 1ms, and causes 2-3 seconds of audio stutter /
+                // apparent slowdown after returning to windowed mode.
+                MonitorSync::ResetState();
+                // Reset the DwmFlush sentinel so it re-evaluates on the first
+                // windowed frame.  The pointer itself remains valid (dwmapi.dll
+                // stays loaded), but re-checking guards against edge cases where
+                // the DWM state changed during the fullscreen session.
+                s_pfnDwmFlush = reinterpret_cast<PFN_DwmFlush>(1);
                 GL_Destroy();
                 SetWindowLongPtr(hMainWnd, GWL_STYLE, WS_OVERLAPPEDWINDOW);
                 SetMenu(hMainWnd, hMenu);

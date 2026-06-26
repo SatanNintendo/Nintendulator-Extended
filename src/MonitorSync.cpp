@@ -398,6 +398,13 @@ namespace MonitorSync
                 g_CalibCount = 0;
                 g_CalibStartQPC.QuadPart = 0;
                 g_CalibActive = true;
+                // Clear the QPC drift-correction baseline.  If this is not reset
+                // on a fullscreen toggle (GL context destroy + recreate), PaceFrame
+                // will compute an enormous elapsed time (seconds) on the first frame
+                // after the toggle, clamp slotMs to 1 ms, and hammer the audio
+                // thread — causing 2-3 seconds of apparent slowdown until normal
+                // OnFrameEnd ticks restore a sane baseline.
+                g_LastFrameEndQPC.QuadPart = 0;
         }
 
         void OnFrameEnd()
