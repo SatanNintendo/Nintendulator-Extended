@@ -50,6 +50,16 @@
 typedef HRESULT (WINAPI *PFN_DwmFlush)(void);
 static PFN_DwmFlush s_pfnDwmFlush = reinterpret_cast<PFN_DwmFlush>(1); // 1 = not yet loaded
 
+// After a fullscreen<->windowed transition, DWM restarts its composition
+// pipeline. The first several DwmFlush() calls during this warm-up period
+// can block for more than one vblank (DWM is re-syncing its internal state),
+// causing apparent slowdown (~24fps for 2-3 seconds). We skip DwmFlush for
+// DWM_WARMUP_FRAMES frames after each mode switch, falling back to plain
+// GL-vsync (interval=1) during that window, then switch to DwmFlush+interval=0.
+#define DWM_WARMUP_FRAMES 12
+static int  s_DwmWarmupFrames = 0;
+static bool s_DwmModeArmed    = false; // true once SetDwmSyncMode(true) has been called
+
 namespace GFX
 {
 unsigned char RawPalette[8][64][3];
@@ -440,52 +450,51 @@ static void GL_DrawFrame(void)
                 glColor4f(1, 1, 1, 1);
         }
 
-        // Synchronise with DWM before presenting.
+        // Synchronise with DWM before presenting (windowed + MMR only).
         //
-        // In windowed mode on Vista+ the Desktop Window Manager composites all
-        // windows and flips to the monitor on its own schedule.  OpenGL vsync
-        // (wglSwapIntervalEXT(1)) makes SwapBuffers block until the *driver's*
-        // vblank interrupt fires — but that does not guarantee the frame lands
-        // in the current DWM composition tick.  DWM may display the previous
-        // frame again and show ours one tick later, which manifests as judder.
+        // DwmFlush() + SwapBuffers(interval=0) is the correct pattern:
+        //   DwmFlush blocks until DWM finishes its composition pass, then
+        //   SwapBuffers(0) presents immediately into the next cycle.
+        // Using SwapBuffers(interval=1) on top of DwmFlush would add a second
+        // vblank wait (~33ms total at 60Hz) and halve the frame rate to 30fps.
         //
-        // The correct fix is DwmFlush() + SwapBuffers(interval=0):
-        //   - DwmFlush() blocks until DWM finishes its current composition pass,
-        //     placing us at the very start of a new DWM cycle.
-        //   - SwapBuffers with interval=0 presents immediately into that cycle.
-        //
-        // CRITICAL: Do NOT use DwmFlush() + SwapBuffers(interval=1) together.
-        // That stacks two vblank waits per frame (~33ms at 60Hz) and cuts the
-        // effective frame rate to 30fps — visible as sustained slow-motion.
-        //
-        // MonitorSync::SetDwmSyncMode(true) posts SwapInterval(0) to the driver
-        // while keeping g_VSyncActive=true so PaceFrame() keeps its high-res
-        // waitable-timer path.  SetDwmSyncMode(false) restores SwapInterval(1).
-        //
-        // Conditions for DWM-sync mode:
-        //   1. MMR active (we control frame pacing).
-        //   2. Windowed only — fullscreen bypasses DWM, no DwmFlush needed.
-        //   3. dwmapi.dll present (not available on XP/2003).
-        //
-        // s_pfnDwmFlush starts at sentinel (PFN_DwmFlush)1 = "not yet loaded".
-        // The first windowed frame loads dwmapi.dll and calls SetDwmSyncMode.
+        // Warm-up guard: after a fullscreen<->windowed transition, DWM restarts
+        // its composition pipeline. DwmFlush() during this warm-up can block for
+        // 2+ vblanks, causing ~24fps for the first 2-3 seconds. We skip DwmFlush
+        // for DWM_WARMUP_FRAMES frames (GL-vsync only), then enable DWM-sync mode.
         if (MatchMonitorRate && !Fullscreen)
         {
+                // Lazy-load dwmapi.dll once.
                 if (s_pfnDwmFlush == reinterpret_cast<PFN_DwmFlush>(1))
                 {
-                        // First windowed frame: load dwmapi.dll and arm DWM-sync mode.
                         HMODULE hDwm = LoadLibrary(_T("dwmapi.dll"));
                         s_pfnDwmFlush = hDwm
                                 ? (PFN_DwmFlush)GetProcAddress(hDwm, "DwmFlush")
                                 : NULL;
-                        // Switch the GL swap interval to 0 so DwmFlush is the sole
-                        // vblank gate.  If DwmFlush is unavailable (XP/2003), fall
-                        // back to the standard GL-vsync path (interval stays 1).
-                        if (s_pfnDwmFlush)
-                                MonitorSync::SetDwmSyncMode(true);
+                        // DWM unavailable (XP/2003) — stay on GL-vsync forever.
                 }
+
                 if (s_pfnDwmFlush)
-                        s_pfnDwmFlush();
+                {
+                        if (s_DwmWarmupFrames > 0)
+                        {
+                                // Warm-up: DWM pipeline not yet stable after mode switch.
+                                // Use GL-vsync (interval=1) — SetDwmSyncMode(false) in
+                                // Stop() already set this. Count down the warmup window.
+                                --s_DwmWarmupFrames;
+                        }
+                        else
+                        {
+                                // Warm-up complete. Switch to DwmFlush+interval=0 once,
+                                // then call DwmFlush every frame.
+                                if (!s_DwmModeArmed)
+                                {
+                                        MonitorSync::SetDwmSyncMode(true);
+                                        s_DwmModeArmed = true;
+                                }
+                                s_pfnDwmFlush();
+                        }
+                }
         }
 
         SwapBuffers(hGLDC);
@@ -1048,6 +1057,11 @@ void    Stop (void)
                 // When entering fullscreen SetDwmSyncMode(false) is called below
                 // to restore interval=1 for the direct-flip path.
                 s_pfnDwmFlush = reinterpret_cast<PFN_DwmFlush>(1);
+                // Arm the DWM warm-up counter so the first DWM_WARMUP_FRAMES
+                // windowed frames use plain GL-vsync while DWM restarts its
+                // composition pipeline after the fullscreen session.
+                s_DwmWarmupFrames = DWM_WARMUP_FRAMES;
+                s_DwmModeArmed    = false;
                 // Restore GL vsync (interval=1) for the windowed context that
                 // GFX::Start() is about to create.  Without this the interval
                 // stays 0 from the previous DWM-sync session and SwapBuffers
