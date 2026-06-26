@@ -108,6 +108,11 @@ namespace MonitorSync
         // ------------------------------------------------------------------
         static volatile LONG  g_PendingVSyncInterval = -1;
 
+        // When true, DwmFlush() is handling synchronisation in GL_DrawFrame,
+        // so the GL swap interval is kept at 0.  g_VSyncActive remains true
+        // so PaceFrame() still uses the waitable-timer path.
+        static volatile LONG  g_DwmSyncMode = 0;
+
         // ------------------------------------------------------------------
         // Waitable timer for PaceFrame.
         //
@@ -407,6 +412,22 @@ namespace MonitorSync
                 g_LastFrameEndQPC.QuadPart = 0;
         }
 
+        void SetDwmSyncMode(bool useDwm)
+        {
+                // In DWM-sync mode GFX.cpp calls DwmFlush() before SwapBuffers.
+                // DwmFlush already blocks until the DWM composition tick, so the
+                // GL swap interval must be 0.  Leaving it at 1 causes SwapBuffers
+                // to wait for a SECOND vblank after DwmFlush's first one, doubling
+                // frame time to ~33ms (30fps).
+                //
+                // g_VSyncActive is kept TRUE in both modes so PaceFrame() continues
+                // using its high-resolution waitable-timer path instead of Sleep(0).
+                // The only difference is the swap interval posted to the GL driver.
+                InterlockedExchange(&g_DwmSyncMode, useDwm ? 1 : 0);
+                if (g_VSyncActive || IsEnabled())
+                        InterlockedExchange(&g_PendingVSyncInterval, useDwm ? 0 : 1);
+        }
+
         void OnFrameEnd()
         {
                 if (!g_Initialized || !IsEnabled())
@@ -627,6 +648,19 @@ namespace MonitorSync
                                 verified = (pfnWglGetSwapIntervalEXT() == 1);
                         g_VSyncActive = verified;
                 }
-                // interval == 0: g_VSyncActive already false from Enable(FALSE).
+                else // interval == 0
+                {
+                        // Normal disable (Enable(FALSE)): g_VSyncActive is already
+                        // false (set in Enable before posting interval=0).
+                        //
+                        // DWM-sync mode (SetDwmSyncMode(true)): interval is 0 so the
+                        // GL driver does not add a second vblank wait, but we keep
+                        // g_VSyncActive=true so PaceFrame() continues using the
+                        // high-resolution waitable-timer path.  DwmFlush() in
+                        // GL_DrawFrame provides the actual monitor synchronisation.
+                        if (InterlockedExchangeAdd(&g_DwmSyncMode, 0) != 0)
+                                g_VSyncActive = true;
+                        // else: already false from Enable(FALSE), leave it.
+                }
         }
 }

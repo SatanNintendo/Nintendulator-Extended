@@ -80,6 +80,16 @@ namespace MonitorSync
         // bogus QPC delta.
         void    ResetState ();
 
+        // Switch between DWM-sync mode (windowed) and GL-vsync mode (fullscreen).
+        // In DWM-sync mode the GL swap interval is set to 0 (no driver vsync)
+        // because DwmFlush() in GL_DrawFrame already synchronises the present
+        // with the monitor composition tick.  Stacking driver vsync on top of
+        // DwmFlush blocks for TWO vblank periods per frame (~33ms at 60Hz),
+        // halving the effective frame rate to 30fps.
+        // useDwm=TRUE  -> post SwapInterval(0), keep g_VSyncActive=true for PaceFrame
+        // useDwm=FALSE -> post SwapInterval(1), normal GL-vsync path
+        void    SetDwmSyncMode (bool useDwm);
+
         // Current measured monitor refresh rate, in Hz.
         // Always returns a value in [30, 1000]; falls back to 60.0 if no
         // measurement has been taken yet.

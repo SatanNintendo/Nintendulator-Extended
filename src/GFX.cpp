@@ -447,35 +447,42 @@ static void GL_DrawFrame(void)
         // (wglSwapIntervalEXT(1)) makes SwapBuffers block until the *driver's*
         // vblank interrupt fires — but that does not guarantee the frame lands
         // in the current DWM composition tick.  DWM may display the previous
-        // frame again and show ours one tick later (or vice-versa), which
-        // manifests as the periodic judder seen in windowed mode even when
-        // fullscreen scrolling is perfectly smooth.
+        // frame again and show ours one tick later, which manifests as judder.
         //
-        // DwmFlush() blocks until DWM has finished its most recent composition
-        // pass, placing us right at the start of a new DWM cycle.  The
-        // subsequent SwapBuffers then lands cleanly in that cycle.
+        // The correct fix is DwmFlush() + SwapBuffers(interval=0):
+        //   - DwmFlush() blocks until DWM finishes its current composition pass,
+        //     placing us at the very start of a new DWM cycle.
+        //   - SwapBuffers with interval=0 presents immediately into that cycle.
         //
-        // Conditions for calling DwmFlush():
-        //   1. MMR must be active (vsync is on; without vsync DwmFlush wastes time).
-        //   2. Windowed mode only — fullscreen bypasses DWM entirely, so the call
-        //      would add latency without benefit.
-        //   3. dwmapi.dll must be present (not available on XP/2003).
+        // CRITICAL: Do NOT use DwmFlush() + SwapBuffers(interval=1) together.
+        // That stacks two vblank waits per frame (~33ms at 60Hz) and cuts the
+        // effective frame rate to 30fps — visible as sustained slow-motion.
         //
-        // We load DwmFlush lazily: s_pfnDwmFlush starts at (PFN_DwmFlush)1
-        // (sentinel "not yet loaded") so the first frame triggers the load.
-        // After the load it is either a valid pointer or NULL (unavailable).
+        // MonitorSync::SetDwmSyncMode(true) posts SwapInterval(0) to the driver
+        // while keeping g_VSyncActive=true so PaceFrame() keeps its high-res
+        // waitable-timer path.  SetDwmSyncMode(false) restores SwapInterval(1).
+        //
+        // Conditions for DWM-sync mode:
+        //   1. MMR active (we control frame pacing).
+        //   2. Windowed only — fullscreen bypasses DWM, no DwmFlush needed.
+        //   3. dwmapi.dll present (not available on XP/2003).
+        //
+        // s_pfnDwmFlush starts at sentinel (PFN_DwmFlush)1 = "not yet loaded".
+        // The first windowed frame loads dwmapi.dll and calls SetDwmSyncMode.
         if (MatchMonitorRate && !Fullscreen)
         {
                 if (s_pfnDwmFlush == reinterpret_cast<PFN_DwmFlush>(1))
                 {
-                        // First call: try to load dwmapi.dll.
+                        // First windowed frame: load dwmapi.dll and arm DWM-sync mode.
                         HMODULE hDwm = LoadLibrary(_T("dwmapi.dll"));
                         s_pfnDwmFlush = hDwm
                                 ? (PFN_DwmFlush)GetProcAddress(hDwm, "DwmFlush")
                                 : NULL;
-                        // We intentionally do NOT FreeLibrary: keeping the handle
-                        // avoids repeated LoadLibrary overhead on every frame and
-                        // is harmless since the process lifetime matches the session.
+                        // Switch the GL swap interval to 0 so DwmFlush is the sole
+                        // vblank gate.  If DwmFlush is unavailable (XP/2003), fall
+                        // back to the standard GL-vsync path (interval stays 1).
+                        if (s_pfnDwmFlush)
+                                MonitorSync::SetDwmSyncMode(true);
                 }
                 if (s_pfnDwmFlush)
                         s_pfnDwmFlush();
@@ -717,7 +724,18 @@ void    Start (void)
                 // MatchMonitorRate is disabled, so calling it here is always
                 // safe.
                 if (MatchMonitorRate)
+                {
                         MonitorSync::ReinitVSync();
+                        // In fullscreen mode DWM is bypassed entirely; the GL driver
+                        // flips directly to the display.  Use GL-vsync (interval=1).
+                        // In windowed mode DwmFlush() in GL_DrawFrame handles sync;
+                        // the swap interval will be switched to 0 by SetDwmSyncMode
+                        // on the first rendered frame (lazy, after DwmFlush loads).
+                        if (Fullscreen)
+                                MonitorSync::SetDwmSyncMode(false);
+                        // Windowed case: sentinel reset in Stop() ensures
+                        // SetDwmSyncMode(true) fires on the first DwmFlush call.
+                }
 
                 if (Fullscreen)
                 {
@@ -1025,9 +1043,19 @@ void    Stop (void)
                 MonitorSync::ResetState();
                 // Reset the DwmFlush sentinel so it re-evaluates on the first
                 // windowed frame.  The pointer itself remains valid (dwmapi.dll
-                // stays loaded), but re-checking guards against edge cases where
-                // the DWM state changed during the fullscreen session.
+                // stays loaded), but re-checking ensures SetDwmSyncMode is called
+                // to switch the GL swap interval back to 0 (DWM-sync mode).
+                // When entering fullscreen SetDwmSyncMode(false) is called below
+                // to restore interval=1 for the direct-flip path.
                 s_pfnDwmFlush = reinterpret_cast<PFN_DwmFlush>(1);
+                // Restore GL vsync (interval=1) for the windowed context that
+                // GFX::Start() is about to create.  Without this the interval
+                // stays 0 from the previous DWM-sync session and SwapBuffers
+                // returns immediately — DwmFlush alone is not enough to pace
+                // the emulator before SetDwmSyncMode fires on the first frame.
+                // SetDwmSyncMode(true) on the first windowed frame will then
+                // switch it back to 0 as needed.
+                MonitorSync::SetDwmSyncMode(false);
                 GL_Destroy();
                 SetWindowLongPtr(hMainWnd, GWL_STYLE, WS_OVERLAPPEDWINDOW);
                 SetMenu(hMainWnd, hMenu);
