@@ -39,6 +39,17 @@
 #define GL_CLAMP_TO_EDGE 0x812F
 #endif
 
+// DwmFlush is loaded dynamically so the binary stays compatible with
+// Windows XP/2003 where dwmapi.dll does not exist. On Vista+ in windowed
+// mode we call DwmFlush() just before SwapBuffers to synchronise our GL
+// present with the DWM composition tick.  Without this, DWM may display
+// the same GL frame twice (or skip one) even when OpenGL vsync is on,
+// because the driver's vblank interrupt and DWM's composition cycle are
+// not phase-locked.  In fullscreen/exclusive mode DWM is bypassed, so the
+// call is skipped entirely to avoid adding latency.
+typedef HRESULT (WINAPI *PFN_DwmFlush)(void);
+static PFN_DwmFlush s_pfnDwmFlush = reinterpret_cast<PFN_DwmFlush>(1); // 1 = not yet loaded
+
 namespace GFX
 {
 unsigned char RawPalette[8][64][3];
@@ -427,6 +438,47 @@ static void GL_DrawFrame(void)
                 glEnable(GL_TEXTURE_2D);
 
                 glColor4f(1, 1, 1, 1);
+        }
+
+        // Synchronise with DWM before presenting.
+        //
+        // In windowed mode on Vista+ the Desktop Window Manager composites all
+        // windows and flips to the monitor on its own schedule.  OpenGL vsync
+        // (wglSwapIntervalEXT(1)) makes SwapBuffers block until the *driver's*
+        // vblank interrupt fires — but that does not guarantee the frame lands
+        // in the current DWM composition tick.  DWM may display the previous
+        // frame again and show ours one tick later (or vice-versa), which
+        // manifests as the periodic judder seen in windowed mode even when
+        // fullscreen scrolling is perfectly smooth.
+        //
+        // DwmFlush() blocks until DWM has finished its most recent composition
+        // pass, placing us right at the start of a new DWM cycle.  The
+        // subsequent SwapBuffers then lands cleanly in that cycle.
+        //
+        // Conditions for calling DwmFlush():
+        //   1. MMR must be active (vsync is on; without vsync DwmFlush wastes time).
+        //   2. Windowed mode only — fullscreen bypasses DWM entirely, so the call
+        //      would add latency without benefit.
+        //   3. dwmapi.dll must be present (not available on XP/2003).
+        //
+        // We load DwmFlush lazily: s_pfnDwmFlush starts at (PFN_DwmFlush)1
+        // (sentinel "not yet loaded") so the first frame triggers the load.
+        // After the load it is either a valid pointer or NULL (unavailable).
+        if (MatchMonitorRate && !Fullscreen)
+        {
+                if (s_pfnDwmFlush == reinterpret_cast<PFN_DwmFlush>(1))
+                {
+                        // First call: try to load dwmapi.dll.
+                        HMODULE hDwm = LoadLibrary(_T("dwmapi.dll"));
+                        s_pfnDwmFlush = hDwm
+                                ? (PFN_DwmFlush)GetProcAddress(hDwm, "DwmFlush")
+                                : NULL;
+                        // We intentionally do NOT FreeLibrary: keeping the handle
+                        // avoids repeated LoadLibrary overhead on every frame and
+                        // is harmless since the process lifetime matches the session.
+                }
+                if (s_pfnDwmFlush)
+                        s_pfnDwmFlush();
         }
 
         SwapBuffers(hGLDC);
