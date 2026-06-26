@@ -51,12 +51,19 @@ typedef HRESULT (WINAPI *PFN_DwmFlush)(void);
 static PFN_DwmFlush s_pfnDwmFlush = reinterpret_cast<PFN_DwmFlush>(1); // 1 = not yet loaded
 
 // After a fullscreen<->windowed transition, DWM restarts its composition
-// pipeline. The first several DwmFlush() calls during this warm-up period
-// can block for more than one vblank (DWM is re-syncing its internal state),
-// causing apparent slowdown (~24fps for 2-3 seconds). We skip DwmFlush for
-// DWM_WARMUP_FRAMES frames after each mode switch, falling back to plain
-// GL-vsync (interval=1) during that window, then switch to DwmFlush+interval=0.
-#define DWM_WARMUP_FRAMES 12
+// pipeline. The first DwmFlush() calls during this warm-up period can block
+// for more than one vblank (DWM is re-syncing its internal state), causing
+// apparent slowdown (~30fps for 2-3 seconds). The previous value of 12
+// frames (200ms) was far too short — DWM actually stabilises over ~3 seconds
+// (~180 frames at 60fps). Switching to DwmFlush+interval=0 at frame 13 while
+// DWM was still re-syncing caused exactly the "3-second slowdown after
+// exiting fullscreen" symptom reported by users: each DwmFlush blocked for
+// ~33ms (two vblanks), halving the effective frame rate.
+// 180 frames = 3 seconds at 60fps, which gives DWM enough time to fully
+// stabilise before we hand pacing over to DwmFlush. The cost is ~1 vblank
+// of additional latency during the first 3 seconds after a mode switch,
+// which is imperceptible for retro gaming.
+#define DWM_WARMUP_FRAMES 180
 static int  s_DwmWarmupFrames = 0;
 static bool s_DwmModeArmed    = false; // true once SetDwmSyncMode(true) has been called
 
