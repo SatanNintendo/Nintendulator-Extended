@@ -88,6 +88,14 @@ namespace MonitorSync
         // halving the effective frame rate to 30fps.
         // useDwm=TRUE  -> post SwapInterval(0), keep g_VSyncActive=true for PaceFrame
         // useDwm=FALSE -> post SwapInterval(1), normal GL-vsync path
+        //
+        // NOTE: As of Session 8, DwmFlush is DISABLED by default in GL_DrawFrame
+        // (see USE_DWMFLUSH define in GFX.cpp). SetDwmSyncMode(true) is never
+        // called when DwmFlush is disabled, so the GL swap interval stays at 1
+        // in both windowed and fullscreen modes. SetDwmSyncMode(false) is still
+        // called from GFX::Start and GFX::Stop to ensure interval=1. The
+        // useDwm=TRUE path is retained only for the case where a user re-enables
+        // DwmFlush via USE_DWMFLUSH=1.
         void    SetDwmSyncMode (bool useDwm);
 
         // Current measured monitor refresh rate, in Hz.

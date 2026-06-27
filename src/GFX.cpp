@@ -459,16 +459,67 @@ static void GL_DrawFrame(void)
 
         // Synchronise with DWM before presenting (windowed + MMR only).
         //
-        // DwmFlush() + SwapBuffers(interval=0) is the correct pattern:
-        //   DwmFlush blocks until DWM finishes its composition pass, then
-        //   SwapBuffers(0) presents immediately into the next cycle.
-        // Using SwapBuffers(interval=1) on top of DwmFlush would add a second
-        // vblank wait (~33ms total at 60Hz) and halve the frame rate to 30fps.
+        // *** DWMFLUSH DISABLED BY DEFAULT — see USE_DWMFLUSH below ***
         //
-        // Warm-up guard: after a fullscreen<->windowed transition, DWM restarts
-        // its composition pipeline. DwmFlush() during this warm-up can block for
-        // 2+ vblanks, causing ~24fps for the first 2-3 seconds. We skip DwmFlush
-        // for DWM_WARMUP_FRAMES frames (GL-vsync only), then enable DWM-sync mode.
+        // HISTORY:
+        // Previous versions called DwmFlush() just before SwapBuffers in
+        // windowed mode (with GL swap interval=0) to synchronise the GL
+        // present with the DWM composition tick. The pattern was:
+        //   DwmFlush()  — blocks until DWM finishes its composition pass
+        //   SwapBuffers(interval=0) — presents immediately into next cycle
+        //
+        // This worked MOST of the time, but DwmFlush can occasionally block
+        // for 2+ vblank periods (~33 ms at 60 Hz) when DWM performs internal
+        // maintenance:
+        //   - periodic composition re-sync
+        //   - DWM state refresh cycles (roughly every 20-60 seconds
+        //     depending on Windows version and GPU driver)
+        //   - GPU driver periodic events that DWM waits on
+        //
+        // Each such stall produces a 2-frame stutter on the NES thread,
+        // which also drives audio (APU::Run is called from CPU::ExecOp).
+        // The result is the EXACT reported symptom:
+        //   - periodic (~30 sec) simultaneous video+audio dropout
+        //   - "everything is perfectly smooth in between"
+        //   - resistant to all fixes that targeted SetFrequency / DRC /
+        //     thread priority / waitable timers, because the stall is
+        //     in DwmFlush itself, not in any of those subsystems.
+        //
+        // This also explains the "3-second slowdown after exiting
+        // fullscreen" problem: after exiting fullscreen, the warmup
+        // counter (DWM_WARMUP_FRAMES) keeps DwmFlush off for a while,
+        // but once warmup ends, SetDwmSyncMode(true) fires → interval=0
+        // → DwmFlush+SwapBuffers(0) takes over. If DWM has not fully
+        // stabilised yet (it can take 5-10 seconds on some systems),
+        // every DwmFlush blocks for ~33 ms → effective 30 fps for
+        // several seconds. Increasing DWM_WARMUP_FRAMES only shifts
+        // the slowdown later; it does not eliminate it.
+        //
+        // FIX:
+        // On Windows 10/11 with modern GPU drivers, DWM composition is
+        // phase-locked to the monitor vblank, and OpenGL vsync
+        // (SwapBuffers with interval=1) is also synced to the same
+        // vblank. GL-vsync alone is therefore sufficient for smooth
+        // windowed presentation. DwmFlush is redundant and only adds
+        // stall risk.
+        //
+        // The GL swap interval stays at 1 (set by ReinitVSync or
+        // SetDwmSyncMode(false)). SetDwmSyncMode(true) is never called,
+        // so SwapBuffers blocks at vblank — exactly the same behaviour
+        // as fullscreen mode. No DWM warmup is needed because there is
+        // no transition to interval=0.
+        //
+        // TRADE-OFF:
+        // On older drivers (Windows 7/8 with legacy GPU drivers), DWM
+        // composition and GL vblank may not be perfectly phase-locked.
+        // Without DwmFlush, this can occasionally cause a frame to be
+        // displayed one composition cycle late (1-frame latency, NOT
+        // doubling/skipping). This is less perceptible than the dropout
+        // symptom it fixes. If frame doubling/skipping is observed on
+        // a specific system, set USE_DWMFLUSH=1 to re-enable the old
+        // DwmFlush path (with its warmup logic).
+#define USE_DWMFLUSH 0
+#if USE_DWMFLUSH
         if (MatchMonitorRate && !Fullscreen)
         {
                 // Lazy-load dwmapi.dll once.
@@ -503,6 +554,7 @@ static void GL_DrawFrame(void)
                         }
                 }
         }
+#endif // USE_DWMFLUSH
 
         SwapBuffers(hGLDC);
         wglMakeCurrent(NULL, NULL);
@@ -742,15 +794,18 @@ void    Start (void)
                 if (MatchMonitorRate)
                 {
                         MonitorSync::ReinitVSync();
-                        // In fullscreen mode DWM is bypassed entirely; the GL driver
-                        // flips directly to the display.  Use GL-vsync (interval=1).
-                        // In windowed mode DwmFlush() in GL_DrawFrame handles sync;
-                        // the swap interval will be switched to 0 by SetDwmSyncMode
-                        // on the first rendered frame (lazy, after DwmFlush loads).
-                        if (Fullscreen)
-                                MonitorSync::SetDwmSyncMode(false);
-                        // Windowed case: sentinel reset in Stop() ensures
-                        // SetDwmSyncMode(true) fires on the first DwmFlush call.
+                        // Both fullscreen and windowed modes now use GL-vsync
+                        // (interval=1) as the sole sync mechanism. DwmFlush is
+                        // disabled by default (see USE_DWMFLUSH in GL_DrawFrame)
+                        // because it was the primary cause of the periodic
+                        // ~30-second video+audio dropouts: DwmFlush occasionally
+                        // blocks for 2 vblanks during DWM internal maintenance.
+                        // SetDwmSyncMode(false) is called unconditionally below
+                        // to ensure the GL swap interval is 1 in both modes;
+                        // SetDwmSyncMode(true) is never called when DwmFlush is
+                        // disabled, so the interval stays at 1 and SwapBuffers
+                        // blocks at vblank exactly as it does in fullscreen mode.
+                        MonitorSync::SetDwmSyncMode(false);
                 }
 
                 if (Fullscreen)
@@ -1057,25 +1112,18 @@ void    Stop (void)
                 // clamps slotMs to 1ms, and causes 2-3 seconds of audio stutter /
                 // apparent slowdown after returning to windowed mode.
                 MonitorSync::ResetState();
-                // Reset the DwmFlush sentinel so it re-evaluates on the first
-                // windowed frame.  The pointer itself remains valid (dwmapi.dll
-                // stays loaded), but re-checking ensures SetDwmSyncMode is called
-                // to switch the GL swap interval back to 0 (DWM-sync mode).
-                // When entering fullscreen SetDwmSyncMode(false) is called below
-                // to restore interval=1 for the direct-flip path.
+                // The DwmFlush sentinel / warmup / DwmModeArmed variables below
+                // are only used when USE_DWMFLUSH=1 (see GL_DrawFrame). With the
+                // default USE_DWMFLUSH=0 they are dead code, but we reset them
+                // anyway for safety in case DwmFlush is re-enabled later.
                 s_pfnDwmFlush = reinterpret_cast<PFN_DwmFlush>(1);
-                // Arm the DWM warm-up counter so the first DWM_WARMUP_FRAMES
-                // windowed frames use plain GL-vsync while DWM restarts its
-                // composition pipeline after the fullscreen session.
                 s_DwmWarmupFrames = DWM_WARMUP_FRAMES;
                 s_DwmModeArmed    = false;
                 // Restore GL vsync (interval=1) for the windowed context that
-                // GFX::Start() is about to create.  Without this the interval
-                // stays 0 from the previous DWM-sync session and SwapBuffers
-                // returns immediately — DwmFlush alone is not enough to pace
-                // the emulator before SetDwmSyncMode fires on the first frame.
-                // SetDwmSyncMode(true) on the first windowed frame will then
-                // switch it back to 0 as needed.
+                // GFX::Start() is about to create. With DwmFlush disabled, this
+                // interval is the sole pacing mechanism in both windowed and
+                // fullscreen modes — SwapBuffers blocks at vblank, throttling
+                // the emulator to the monitor refresh rate.
                 MonitorSync::SetDwmSyncMode(false);
                 GL_Destroy();
                 SetWindowLongPtr(hMainWnd, GWL_STYLE, WS_OVERLAPPEDWINDOW);
