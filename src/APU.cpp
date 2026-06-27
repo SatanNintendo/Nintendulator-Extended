@@ -98,6 +98,39 @@ static DWORD            drc_play_freq   = FREQ;  // current DirectSound playback
 // vblank. See UpdateDRC() for the full rationale.
 // -1 = no pending reset.
 static volatile LONG    g_PendingFreq   = -1L;
+
+// Cached DirectSound buffer position for pre-check in APU::Run.
+//
+// PROBLEM (P27): APU::Run is called ~735 times per frame, interleaved with
+// CPU::ExecOp. Each time NewBufPos >= buflen (roughly once per frame), the
+// pre-check calls Buffer->GetCurrentPosition — an IPC call into audiodg.exe.
+// If this IPC hits the bad phase of audiodg's 10ms service cycle, it blocks
+// for 0-10ms inside the CPU::ExecOp loop. This shifts the remaining PPU
+// emulation, pushes DrawScreen/SwapBuffers later, and causes a missed vblank
+// — exactly the periodic ~30s video+audio dropout symptom.
+//
+// FIX: UpdateDRC (called post-vblank, after SwapBuffers) already calls
+// GetCurrentPosition once. We cache that result here so APU::Run's pre-check
+// can use the cached value instead of issuing a new IPC call. The cached
+// position is at most ~16ms stale when APU::Run reads it (~1 kHz call rate),
+// which is sufficient for a pre-check heuristic: if the cache says the slot
+// is free, we try to write (the Lock call will confirm); if the slot turned
+// out busy in the ~16ms since the cache was taken, the wait-loop issues its
+// own real GetCurrentPosition and recovers in one iteration.
+//
+// The cache is written once per frame (in UpdateDRC, post-vblank) and read
+// once per frame (in APU::Run pre-check, mid-frame). No lock needed: a torn
+// read of a DWORD on x86 is atomic, and the worst case is a stale pre-check
+// that falls through to the wait-loop — exactly the pre-cache behavior.
+//
+// g_DSPosFrameAge tracks how many frames have elapsed since the cache was
+// updated. If UpdateDRC hasn't run yet (first frame, or MMR just enabled),
+// the age will be >0 and APU::Run will fall back to a real GetCurrentPosition
+// for that iteration, just as before.
+static volatile LONG    g_DSCacheRpos   = -1L;  // cached play cursor / LockSize
+static volatile LONG    g_DSCacheWpos   = -1L;  // cached write cursor / LockSize
+static volatile LONG    g_DSCacheAge    = 99L;  // frames since last UpdateDRC update
+                                                 // 99 = "invalid, use real IPC"
 #endif
 
 const   unsigned char   LengthCounts[32] = {
@@ -1290,6 +1323,13 @@ void    SoundON (void)
         next_pos = 0;
         // Reset DRC to standard frequency on every sound start
         drc_play_freq = FREQ;
+        // Invalidate the DS position cache so the first APU::Run pre-check
+        // after start uses a live GetCurrentPosition call rather than stale
+        // data from a previous session. UpdateDRC will populate the cache
+        // on the first post-vblank tick.
+        InterlockedExchange(&g_DSCacheRpos, -1L);
+        InterlockedExchange(&g_DSCacheWpos, -1L);
+        InterlockedExchange(&g_DSCacheAge,  99L);
         if (Buffer)
                 Buffer->SetFrequency(FREQ);
 }
@@ -1683,6 +1723,18 @@ void    UpdateDRC (void)
         if (FAILED(Buffer->GetCurrentPosition(&rpos, &wpos)))
                 return;
 
+        // Update the DS position cache that APU::Run pre-check uses.
+        // This is the ONLY GetCurrentPosition call we keep on the critical
+        // path; APU::Run will use these cached slot indices instead of
+        // issuing its own IPC call from inside the CPU::ExecOp loop.
+        // LockSize is non-zero here (checked in Init before Buffer is created).
+        if (LockSize > 0)
+        {
+                InterlockedExchange(&g_DSCacheRpos, (LONG)(rpos / LockSize));
+                InterlockedExchange(&g_DSCacheWpos, (LONG)(wpos / LockSize));
+                InterlockedExchange(&g_DSCacheAge,  0L);
+        }
+
         DWORD totalSize = LockSize * FRAMEBUF;
         if (totalSize == 0)
                 return;
@@ -1802,16 +1854,48 @@ void    Run (void)
                 // loop. If the slot is free, skip the loop entirely — zero
                 // SwitchToThread() calls, zero timing jitter added.
                 // If it is still busy (rare scheduler hiccup), fall through.
+                //
+                // P27 FIX: use the cached DS position instead of a live
+                // GetCurrentPosition IPC call. The cache is written by
+                // UpdateDRC() post-vblank (at most ~16ms ago), which is
+                // fresh enough for a pre-check heuristic. A stale pre-check
+                // that wrongly indicates "free" will be caught by Lock() or
+                // the wait-loop's own GetCurrentPosition. A stale pre-check
+                // that wrongly indicates "busy" causes one extra wait-loop
+                // iteration — the same cost as the pre-cache behavior.
+                // Either way, we eliminate an IPC call from inside the
+                // CPU::ExecOp loop, which was the source of the 0-10ms stall
+                // that could push SwapBuffers past the next vblank.
                 if (isEnabled && Buffer)
                 {
-                        unsigned long pr, pw;
-                        if (SUCCEEDED(Buffer->GetCurrentPosition(&pr, &pw)))
+                        LONG cacheAge = InterlockedExchangeAdd(&g_DSCacheAge, 1L);
+                        // Use cache only when it's fresh (age == 0 before increment
+                        // means it was just written by UpdateDRC this frame).
+                        // On subsequent APU::Run calls in the same frame, cacheAge
+                        // will be 1, 2, ... — still safe to use; position only moves
+                        // forward. After 2 frames without UpdateDRC (shouldn't happen
+                        // normally), we fall back to live IPC (see below).
+                        if (cacheAge <= 2)
                         {
-                                unsigned long sr = pr / LockSize;
-                                unsigned long sw = pw / LockSize;
+                                unsigned long sr = (unsigned long)InterlockedExchangeAdd(&g_DSCacheRpos, 0L);
+                                unsigned long sw = (unsigned long)InterlockedExchangeAdd(&g_DSCacheWpos, 0L);
                                 if (sw < sr) sw += FRAMEBUF;
                                 if (!((sr <= next_pos) && (next_pos <= sw)))
                                         goto write_slot;
+                        }
+                        else
+                        {
+                                // Cache is stale (UpdateDRC hasn't run yet).
+                                // Fall back to live IPC — same as pre-P27 behavior.
+                                unsigned long pr, pw;
+                                if (SUCCEEDED(Buffer->GetCurrentPosition(&pr, &pw)))
+                                {
+                                        unsigned long sr = pr / LockSize;
+                                        unsigned long sw = pw / LockSize;
+                                        if (sw < sr) sw += FRAMEBUF;
+                                        if (!((sr <= next_pos) && (next_pos <= sw)))
+                                                goto write_slot;
+                                }
                         }
                 }
 
