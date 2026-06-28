@@ -181,7 +181,7 @@ static BOOL   UsingOpenGL = FALSE;
 typedef void   (WINAPI *PFN_glGenBuffers)   (GLsizei, GLuint*);
 typedef void   (WINAPI *PFN_glDeleteBuffers)(GLsizei, const GLuint*);
 typedef void   (WINAPI *PFN_glBindBuffer)   (GLenum, GLuint);
-typedef void   (WINAPI *PFN_glBufferData)   (GLenum, GLsizeiptr, const void*, GLenum);
+typedef void   (WINAPI *PFN_glBufferData)   (GLenum, ptrdiff_t, const void*, GLenum);
 typedef void*  (WINAPI *PFN_glMapBuffer)    (GLenum, GLenum);
 typedef GLboolean (WINAPI *PFN_glUnmapBuffer)(GLenum);
 
