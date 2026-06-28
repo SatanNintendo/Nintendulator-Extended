@@ -562,7 +562,7 @@ static void GL_DrawFrame(void)
         static uint32_t frameBuf[256 * 240];
 
         // Diagnostic: record frame entry time.
-        LONGLONG diagT0 = 0, diagT1 = 0, diagT2 = 0;
+        LONGLONG diagT0 = 0, diagT1 = 0;
         if (MatchMonitorRate)
         {
                 LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc); diagT0 = qpc.QuadPart;

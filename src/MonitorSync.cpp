@@ -579,6 +579,13 @@ void ApplyPendingVSync()
 // ------------------------------------------------------------------
 
 // ==================================================================
+// } // namespace MonitorSync -- temporarily closed so the vblank
+// thread helpers are at file scope (matching the forward declarations
+// at the top of the file and the 'static' storage class specifier).
+// ==================================================================
+} // namespace MonitorSync
+
+// ==================================================================
 // Vblank thread + event (P28 revised).
 //
 // PROBLEM WITH NAIVE WaitForVBlank() on the NES thread:
@@ -659,6 +666,12 @@ static void StopVBlankThread()
     InterlockedExchange(&g_VBlankReady, 0L);
 }
 
+// ==================================================================
+// Re-open namespace MonitorSync for the public API functions.
+// ==================================================================
+namespace MonitorSync
+{
+
 bool HasDXGIVBlank()
 {
     return g_DXGIAvailable && (g_VBlankThread != NULL);
@@ -678,6 +691,4 @@ void WaitForDXGIVBlank()
     WaitForSingleObject(g_VBlankEvent, deadlineMs);
 }
 
-// ==================================================================
 } // namespace MonitorSync
-// ==================================================================
