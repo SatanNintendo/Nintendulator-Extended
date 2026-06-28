@@ -130,6 +130,10 @@ static void* g_pDXGIOutput   = NULL;
 // Written once by InitDXGI(); read every frame from GL_DrawFrame.
 static volatile LONG g_DXGISwapInterval = 1;
 
+// Forward declarations -- defined after namespace MonitorSync ends.
+static void StartVBlankThread();
+static void StopVBlankThread();
+
 static void DXGI_Release(void* p)
 {
     if (!p) return;
@@ -338,25 +342,22 @@ void Enable(BOOL on)
         g_VSyncActive = false;
         LoadWGLSwapControl();
 
-        // Determine which swap interval to request.
-        // If DXGI is available (or will be on first use) we use interval=0
-        // and provide our own WaitForVBlank timing; otherwise use interval=1
-        // and let the driver handle it (the DWM-dependent path).
-        // InitDXGI() is safe to call from the UI thread -- it only does
-        // LoadLibrary + COM vtable calls, no GL context operations.
         InitDXGI();
         LONG desiredInterval = InterlockedExchangeAdd(&g_DXGISwapInterval, 0L);
         InterlockedExchange(&g_PendingVSyncInterval, desiredInterval);
+
+        // Start the vblank poller thread now that DXGI is initialised.
+        // HasDXGIVBlank() returns true only after this succeeds.
+        StartVBlankThread();
 
         ResetState();
     }
     else
     {
-        // Post disable: restore interval=1 (driver-managed, lowest overhead
-        // when MMR is off -- we don't need precise timing then).
         InterlockedExchange(&g_PendingVSyncInterval, 1L);
         g_VSyncActive = false;
         g_CalibActive = false;
+        StopVBlankThread();
         APU::ResetDRC();
     }
 }
@@ -577,24 +578,104 @@ void ApplyPendingVSync()
 // P28: DXGI vblank bypass public API
 // ------------------------------------------------------------------
 
-bool HasDXGIVBlank()
+// ==================================================================
+// Vblank thread + event (P28 revised).
+//
+// PROBLEM WITH NAIVE WaitForVBlank() on the NES thread:
+//   IDXGIOutput::WaitForVBlank() has no timeout parameter.
+//   Confirmed by timing log: swap=166ms (10 vblanks) on frame 3,
+//   swap=20ms on frame 6. The naive call occasionally blocks for
+//   multiple vblank periods during GPU power state transitions or
+//   driver-internal events, making stalls worse than before.
+//
+// SOLUTION: dedicated vblank poller thread.
+//   A HIGH-priority background thread calls WaitForVBlank() in a loop
+//   and SetEvent() after each return. The NES thread waits on that
+//   event with WaitForSingleObject(deadline = 1.5 * frame_period).
+//
+//   If WaitForVBlank blocks for 166ms, the NES thread times out at
+//   ~25ms and presents immediately -- bounded stall, not 10 frames.
+//   If everything is fine, the event fires at ~16.7ms and we present
+//   at exactly the right vblank with zero DWM involvement.
+// ==================================================================
+
+static HANDLE         g_VBlankEvent  = NULL; // auto-reset; fired by vblank thread
+static HANDLE         g_VBlankThread = NULL; // the poller thread handle
+static volatile LONG  g_VBlankStop   = 0L;   // 1 = ask thread to exit
+static volatile LONG  g_VBlankReady  = 0L;   // 1 once thread loop has started
+
+static DWORD WINAPI VBlankThreadProc(void*)
 {
-    // InitDXGI() is idempotent and cheap after the first call.
-    return g_DXGIAvailable;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    InterlockedExchange(&g_VBlankReady, 1L);
+
+    while (!InterlockedExchangeAdd(&g_VBlankStop, 0L))
+    {
+        if (g_pDXGIOutput)
+        {
+            void** vtbl = *(void***)g_pDXGIOutput;
+            ((PFN_WaitForVBlank)vtbl[10])(g_pDXGIOutput);
+            if (g_VBlankEvent)
+                SetEvent(g_VBlankEvent);
+        }
+        else
+        {
+            Sleep(1);
+        }
+    }
+    return 0;
 }
 
-// Wait for the next hardware vblank via IDXGIOutput::WaitForVBlank().
-// Must be called from GL_DrawFrame (NES thread) just before SwapBuffers.
-// The paired SwapBuffers call must use interval=0 (set by Enable() via
-// g_DXGISwapInterval) so the driver does not add a second DWM-based wait.
-//
-// If DXGI is unavailable this is a no-op; the caller's SwapBuffers
-// (interval=1) handles timing via the DWM path as before.
+static void StartVBlankThread()
+{
+    if (g_VBlankThread || !g_DXGIAvailable) return;
+
+    g_VBlankEvent = CreateEvent(NULL, FALSE, FALSE, NULL); // auto-reset
+    if (!g_VBlankEvent) return;
+
+    InterlockedExchange(&g_VBlankStop,  0L);
+    InterlockedExchange(&g_VBlankReady, 0L);
+
+    g_VBlankThread = CreateThread(NULL, 0, VBlankThreadProc, NULL, 0, NULL);
+    if (!g_VBlankThread)
+    {
+        CloseHandle(g_VBlankEvent);
+        g_VBlankEvent = NULL;
+        return;
+    }
+    // Wait until thread loop starts before first frame.
+    for (int i = 0; i < 100 && !InterlockedExchangeAdd(&g_VBlankReady, 0L); i++)
+        Sleep(1);
+}
+
+static void StopVBlankThread()
+{
+    if (!g_VBlankThread) return;
+    InterlockedExchange(&g_VBlankStop, 1L);
+    // WaitForVBlank can't be cancelled; wait up to 100ms for thread to return.
+    WaitForSingleObject(g_VBlankThread, 100);
+    CloseHandle(g_VBlankThread); g_VBlankThread = NULL;
+    if (g_VBlankEvent) { CloseHandle(g_VBlankEvent); g_VBlankEvent = NULL; }
+    InterlockedExchange(&g_VBlankReady, 0L);
+}
+
+bool HasDXGIVBlank()
+{
+    return g_DXGIAvailable && (g_VBlankThread != NULL);
+}
+
+// Called from GL_DrawFrame (NES thread) just before SwapBuffers(interval=0).
+// Waits for the next vblank signal with a hard deadline so a stuck driver
+// WaitForVBlank() on the background thread never stalls the NES thread
+// beyond 1.5 * frame_period (~25ms at 60Hz).
 void WaitForDXGIVBlank()
 {
-    if (!g_DXGIAvailable || !g_pDXGIOutput) return;
-    void** vtbl = *(void***)g_pDXGIOutput;
-    ((PFN_WaitForVBlank)vtbl[10])(g_pDXGIOutput);
+    if (!g_VBlankEvent || !g_VBlankThread) return;
+    double frameMs    = (g_NESHz > 0.0) ? 1000.0 / g_NESHz : 16.7;
+    DWORD  deadlineMs = (DWORD)(frameMs * 1.5);
+    if (deadlineMs < 20) deadlineMs = 20;
+    if (deadlineMs > 50) deadlineMs = 50;
+    WaitForSingleObject(g_VBlankEvent, deadlineMs);
 }
 
 // ==================================================================
