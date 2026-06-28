@@ -116,4 +116,18 @@ namespace MonitorSync
         // owner), at the start of GL_DrawFrame after wglMakeCurrent.
         // No-op if no change is pending. Safe to call every frame.
         void    ApplyPendingVSync ();
+
+        // P28: DXGI vblank bypass for windowed mode.
+        //
+        // HasDXGIVBlank() returns true if IDXGIOutput::WaitForVBlank is
+        // available on this system (Windows 7+, any dGPU or iGPU with
+        // DXGI 1.0 support -- which is essentially every machine since 2009).
+        // Call once after Init(); result is cached; never blocks.
+        //
+        // WaitForDXGIVBlank() blocks until the next hardware vblank interrupt,
+        // bypassing DWM's composition scheduler entirely.  Call this in
+        // GL_DrawFrame BEFORE SwapBuffers(interval=0).  If DXGI is unavailable
+        // this is a no-op and SwapBuffers(interval=1) handles timing as before.
+        bool    HasDXGIVBlank ();
+        void    WaitForDXGIVBlank ();
 }

@@ -326,9 +326,135 @@ static void ApplyPendingResize()
         GL_ResizeInternal(w, h);
 }
 
+// ============================================================
+// Per-frame timing diagnostics (active when MatchMonitorRate is on).
+//
+// Each frame we record QPC timestamps at 5 checkpoints:
+//   t0 = entry to GL_DrawFrame (after palette conversion)
+//   t1 = after glTexSubImage2D
+//   t2 = after SwapBuffers (= vblank wakeup)
+//   t3 = after MonitorSync::OnFrameEnd
+//   t4 = after APU::UpdateDRC
+//
+// The buffer holds the last DIAG_FRAMES frames (~5 seconds at 60fps).
+// When any inter-checkpoint delta exceeds DIAG_STALL_MS milliseconds,
+// the buffer is flushed to %TEMP%\nintendulator_timing.log so you can
+// inspect which call caused the stall.
+//
+// Overhead: ~3 QPC reads (150ns total) per frame — negligible.
+// ============================================================
+#define DIAG_FRAMES    360          // 6 seconds of history at 60fps
+#define DIAG_STALL_MS  20.0        // stall threshold: 20ms (>1 vblank)
+
+struct FrameTimingEntry {
+        LONGLONG t0;        // entry to GL_DrawFrame
+        LONGLONG t1;        // after glTexSubImage2D
+        LONGLONG t2;        // after SwapBuffers
+        LONGLONG t3;        // after OnFrameEnd (filled in DrawScreen)
+        LONGLONG t4;        // after UpdateDRC  (filled in DrawScreen)
+        DWORD    frameNum;
+};
+static FrameTimingEntry s_diagBuf[DIAG_FRAMES];
+static int  s_diagHead      = 0;
+static DWORD s_diagFrameNum = 0;
+
+// Returns the QPC frequency (cached).
+static double DiagQPCFreq()
+{
+        static double freq = 0.0;
+        if (freq == 0.0)
+        {
+                LARGE_INTEGER f;
+                QueryPerformanceFrequency(&f);
+                freq = (double)f.QuadPart;
+        }
+        return freq;
+}
+
+static void DiagDumpLog()
+{
+        TCHAR tmpPath[MAX_PATH];
+        GetTempPath(MAX_PATH, tmpPath);
+        TCHAR logPath[MAX_PATH];
+        _stprintf_s(logPath, MAX_PATH, _T("%snintendulator_timing.log"), tmpPath);
+        FILE *f = _tfopen(logPath, _T("w"));
+        if (!f) return;
+
+        double freq = DiagQPCFreq();
+        _ftprintf(f, _T("Nintendulator frame timing log\n"));
+        _ftprintf(f, _T("Stall threshold: %.1f ms\n"), DIAG_STALL_MS);
+        _ftprintf(f, _T("Columns: frame | t0->t1(texUpload) | t1->t2(SwapBuf) | t2->t3(OnFrameEnd) | t3->t4(UpdateDRC) | total(t0->t4)\n\n"));
+
+        // Walk the circular buffer from oldest to newest
+        for (int i = 0; i < DIAG_FRAMES; i++)
+        {
+                int idx = (s_diagHead + i) % DIAG_FRAMES;
+                FrameTimingEntry &e = s_diagBuf[idx];
+                if (e.frameNum == 0 || e.t4 == 0) continue;
+
+                double d01 = (e.t1 - e.t0) * 1000.0 / freq;  // texUpload ms
+                double d12 = (e.t2 - e.t1) * 1000.0 / freq;  // SwapBuffers ms
+                double d23 = (e.t3 - e.t2) * 1000.0 / freq;  // OnFrameEnd ms
+                double d34 = (e.t4 - e.t3) * 1000.0 / freq;  // UpdateDRC ms
+                double dtot= (e.t4 - e.t0) * 1000.0 / freq;  // total ms
+
+                // Mark stalled stages with '*'
+                _ftprintf(f,
+                        _T("F%06u  tex=%6.2f%s  swap=%7.2f%s  ofe=%6.2f%s  drc=%6.2f%s  tot=%7.2f%s\n"),
+                        e.frameNum,
+                        d01, (d01 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                        d12, (d12 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                        d23, (d23 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                        d34, (d34 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                        dtot,(dtot > DIAG_STALL_MS * 1.5 ? _T("*") : _T(" "))
+                );
+        }
+        fclose(f);
+}
+
+// Called from DrawScreen to complete the timing entry for this frame.
+// t3 and t4 are filled here (after SwapBuffers returns) and a stall check
+// is performed.
+static void DiagCompleteFrame(LONGLONG t3, LONGLONG t4)
+{
+        if (!MatchMonitorRate) return;
+
+        // Find the entry we opened in GL_DrawFrame for this frame number.
+        // It's always at (s_diagHead - 1 + DIAG_FRAMES) % DIAG_FRAMES.
+        int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+        s_diagBuf[idx].t3 = t3;
+        s_diagBuf[idx].t4 = t4;
+
+        // Stall check: SwapBuffers duration > DIAG_STALL_MS
+        double freq = DiagQPCFreq();
+        double swapMs = (s_diagBuf[idx].t2 - s_diagBuf[idx].t1) * 1000.0 / freq;
+        double texMs  = (s_diagBuf[idx].t1 - s_diagBuf[idx].t0) * 1000.0 / freq;
+        double drcMs  = (s_diagBuf[idx].t4 - s_diagBuf[idx].t3) * 1000.0 / freq;
+
+        if (swapMs > DIAG_STALL_MS || texMs > DIAG_STALL_MS || drcMs > DIAG_STALL_MS)
+                DiagDumpLog();
+}
+
 static void GL_DrawFrame(void)
 {
         static uint32_t frameBuf[256 * 240];
+
+        // Diagnostic: record frame entry time.
+        LONGLONG diagT0 = 0, diagT1 = 0, diagT2 = 0;
+        if (MatchMonitorRate)
+        {
+                LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc); diagT0 = qpc.QuadPart;
+                s_diagFrameNum++;
+                int idx = s_diagHead;
+                s_diagBuf[idx].t0       = diagT0;
+                s_diagBuf[idx].t1       = 0;
+                s_diagBuf[idx].t2       = 0;
+                s_diagBuf[idx].t3       = 0;
+                s_diagBuf[idx].t4       = 0;
+                s_diagBuf[idx].frameNum = s_diagFrameNum;
+                s_diagHead = (s_diagHead + 1) % DIAG_FRAMES;
+        }
+
         unsigned short *src = PPU::DrawArray;
         for (int i = 0; i < 256 * 240; i++)
                 frameBuf[i] = Palette32[src[i]];
@@ -357,6 +483,14 @@ static void GL_DrawFrame(void)
 
         glBindTexture(GL_TEXTURE_2D, glTex);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 240, GL_BGRA_EXT, GL_UNSIGNED_BYTE, frameBuf);
+
+        // Diagnostic: record time after texture upload.
+        if (MatchMonitorRate)
+        {
+                LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc); diagT1 = qpc.QuadPart;
+                int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+                s_diagBuf[idx].t1 = diagT1;
+        }
 
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
@@ -556,7 +690,35 @@ static void GL_DrawFrame(void)
         }
 #endif // USE_DWMFLUSH
 
+        // P28: DXGI vblank bypass for windowed mode.
+        //
+        // When WaitForDXGIVBlank() is available and MMR is active in windowed
+        // mode, we wait for the raw GPU vblank interrupt here (bypassing DWM),
+        // then call SwapBuffers with interval=0 so the frame is submitted into
+        // that vblank slot without going through DWM's composition timing path.
+        //
+        // Without this, SwapBuffers(interval=1) routes through DWM's
+        // "composition ready" signal which is subject to DWM's periodic
+        // maintenance stalls (~20-60s), producing the exact symptom: a
+        // simultaneous video + audio dropout roughly every 20-30 seconds.
+        //
+        // If DXGI is unavailable (shouldn't happen on Win7+ but possible
+        // with very old/broken GPU drivers), WaitForDXGIVBlank() is a no-op
+        // and we fall through to SwapBuffers which uses interval=1 (set
+        // during Enable() by the non-DXGI path) -- identical to pre-P28.
+        if (MatchMonitorRate && !Fullscreen)
+                MonitorSync::WaitForDXGIVBlank();
+
         SwapBuffers(hGLDC);
+
+        // Diagnostic: record time after SwapBuffers (= vblank wakeup).
+        if (MatchMonitorRate)
+        {
+                LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
+                int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+                s_diagBuf[idx].t2 = qpc.QuadPart;
+        }
+
         wglMakeCurrent(NULL, NULL);
 }
 
@@ -728,6 +890,11 @@ void    Start (void)
         aFPSnum = 0;
         FPSCnt  = 0;
         FSkip   = 0;
+
+        // Reset diagnostic timing buffer on every session start.
+        s_diagHead      = 0;
+        s_diagFrameNum  = 0;
+        ZeroMemory(s_diagBuf, sizeof(s_diagBuf));
 
         if (UseOpenGL())
         {
@@ -1305,6 +1472,15 @@ void    DrawScreen (void)
                 if (MatchMonitorRate)
                 {
                         MonitorSync::OnFrameEnd();
+
+                        // Diagnostic t3: after OnFrameEnd.
+                        LONGLONG diagT3 = 0, diagT4 = 0;
+                        if (MatchMonitorRate)
+                        {
+                                LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
+                                diagT3 = qpc.QuadPart;
+                        }
+
                         // Dynamic Rate Control: call UpdateDRC AFTER SwapBuffers,
                         // not before. UpdateDRC calls IDirectSoundBuffer::GetCurrentPosition,
                         // which is an IPC call into audiodg.exe. When this was placed
@@ -1313,6 +1489,14 @@ void    DrawScreen (void)
                         // the next vblank. Post-vblank is the safest moment: we have
                         // a full ~16ms window and the same stall costs nothing visible.
                         APU::UpdateDRC();
+
+                        // Diagnostic t4: after UpdateDRC. Complete the entry and check.
+                        if (MatchMonitorRate)
+                        {
+                                LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
+                                diagT4 = qpc.QuadPart;
+                                DiagCompleteFrame(diagT3, diagT4);
+                        }
                 }
         }
         QueryPerformanceCounter(&TmpClockVal);
