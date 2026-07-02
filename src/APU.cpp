@@ -79,23 +79,19 @@ static DWORD            drc_play_freq   = FREQ;  // current DirectSound playback
 
 // Deferred DirectSound SetFrequency reset, used by ResetDRC().
 // IDirectSoundBuffer::SetFrequency is an IPC call into audiodg.exe (the
-// Windows Audio Engine). The Audio Engine runs its own 10ms service cycle;
-// if SetFrequency arrives at the start of that cycle the call blocks for
-// up to ~10ms. Calling SetFrequency directly from ResetDRC would be unsafe
-// because ResetDRC can be invoked from the UI thread (via
+// Windows Audio Engine). The Audio Engine runs its own periodic service
+// cycle; if SetFrequency arrives at the wrong moment in that cycle the
+// call can block. Calling SetFrequency directly from ResetDRC would be
+// unsafe because ResetDRC can be invoked from the UI thread (via
 // MonitorSync::Enable(FALSE) on MMR toggle-off). Instead, ResetDRC posts
-// the reset frequency here; the next UpdateDRC() call (running on the NES
-// thread, post-vblank — safe to stall) consumes it via InterlockedExchange
-// and applies Buffer->SetFrequency directly.
+// the reset frequency here.
 //
-// UpdateDRC's own per-frame frequency adjustments (Layer 1 + Layer 2) are
-// applied DIRECTLY via Buffer->SetFrequency from inside UpdateDRC — they
-// are NOT routed through g_PendingFreq. That path was the source of the
-// ~30s periodic video+audio dropout: APU::Run used to consume g_PendingFreq
-// right after the DS slot write, but APU::Run is interleaved with
-// CPU::ExecOp across the entire frame, so the 0-10ms audiodg stall there
-// could shift the remaining CPU/PPU emulation enough to miss the next
-// vblank. See UpdateDRC() for the full rationale.
+// P30: this is now consumed by the dedicated audio-control background
+// thread (AudioCtrlTick), not by UpdateDRC. UpdateDRC's own per-frame
+// frequency adjustments (Layer 1 + Layer 2) are posted through the
+// separate g_DRCApplyFreq atomic, also consumed by that same thread.
+// Neither call ever touches the NES thread anymore -- see the P30 block
+// comment near g_DSCacheRposBytes for the full history and rationale.
 // -1 = no pending reset.
 static volatile LONG    g_PendingFreq   = -1L;
 
@@ -109,28 +105,191 @@ static volatile LONG    g_PendingFreq   = -1L;
 // emulation, pushes DrawScreen/SwapBuffers later, and causes a missed vblank
 // — exactly the periodic ~30s video+audio dropout symptom.
 //
-// FIX: UpdateDRC (called post-vblank, after SwapBuffers) already calls
-// GetCurrentPosition once. We cache that result here so APU::Run's pre-check
-// can use the cached value instead of issuing a new IPC call. The cached
-// position is at most ~16ms stale when APU::Run reads it (~1 kHz call rate),
-// which is sufficient for a pre-check heuristic: if the cache says the slot
-// is free, we try to write (the Lock call will confirm); if the slot turned
-// out busy in the ~16ms since the cache was taken, the wait-loop issues its
-// own real GetCurrentPosition and recovers in one iteration.
+// FIX: cache the DS position here so APU::Run's pre-check can use the
+// cached value instead of issuing a new IPC call. Originally (P27) this
+// cache was populated once per frame by UpdateDRC itself; as of P30 it is
+// populated by a dedicated background thread roughly every 8ms (see the
+// P30 block comment a few lines down), so it is if anything fresher than
+// before, and UpdateDRC no longer performs the IPC call at all. Either
+// way, the cached position is at most a few ms stale when APU::Run reads
+// it, sufficient for a pre-check heuristic: if the cache says the slot is
+// free, we try to write (the Lock call will confirm); if the slot turned
+// out busy since the cache was taken, the wait-loop issues its own real
+// GetCurrentPosition and recovers in one iteration.
 //
-// The cache is written once per frame (in UpdateDRC, post-vblank) and read
-// once per frame (in APU::Run pre-check, mid-frame). No lock needed: a torn
-// read of a DWORD on x86 is atomic, and the worst case is a stale pre-check
-// that falls through to the wait-loop — exactly the pre-cache behavior.
+// No lock needed for THIS pair of variables specifically: a torn read of
+// a 32-bit value on x86/x64 is atomic, and the worst case is a stale
+// pre-check that falls through to the wait-loop -- exactly the pre-cache
+// behavior. (The Buffer pointer itself, which the background thread also
+// touches, is a different story and IS protected -- see g_BufferCS.)
 //
-// g_DSPosFrameAge tracks how many frames have elapsed since the cache was
-// updated. If UpdateDRC hasn't run yet (first frame, or MMR just enabled),
-// the age will be >0 and APU::Run will fall back to a real GetCurrentPosition
-// for that iteration, just as before.
+// g_DSCacheAge tracks how many ticks have elapsed since the cache was
+// updated. If the worker thread hasn't run yet (first frame, or MMR just
+// enabled), the age will be high and APU::Run/UpdateDRC fall back to
+// treating the cache as not-yet-valid, just as before.
 static volatile LONG    g_DSCacheRpos   = -1L;  // cached play cursor / LockSize
 static volatile LONG    g_DSCacheWpos   = -1L;  // cached write cursor / LockSize
-static volatile LONG    g_DSCacheAge    = 99L;  // frames since last UpdateDRC update
+static volatile LONG    g_DSCacheAge    = 99L;  // frames since last cache update
                                                  // 99 = "invalid, use real IPC"
+
+// ------------------------------------------------------------------
+// P30 — Audio control background thread.
+//
+// ROOT CAUSE (found in session 9 review, after P26-P29 already shipped):
+//
+//   UpdateDRC() still called Buffer->GetCurrentPosition() directly, once
+//   EVERY frame, unconditionally, from the NES thread -- the only
+//   remaining unconditional per-frame IPC call into audiodg.exe left in
+//   the whole pipeline. Every other stall source found so far (DwmFlush,
+//   wglMakeCurrent races, SetWindowText, glTexSubImage2D) was either
+//   removed or made asynchronous/bounded (P26, P28, P29). This one was
+//   not: it runs post-vblank "because that's safe", but that reasoning
+//   only holds if the IPC call itself is fast. It is not guaranteed to
+//   be: IDirectSoundBuffer::GetCurrentPosition/SetFrequency are calls
+//   into audiodg.exe, the same class of cross-process call that DwmFlush
+//   (a call into dwm.exe) was shown to occasionally block on for 20-40ms
+//   during that process's own periodic housekeeping (P26). audiodg.exe
+//   has an analogous periodic service cycle. A single unlucky frame in
+//   that cycle stalls the NES thread post-vblank, which delays the
+//   START of the next frame's CPU/PPU loop -- pushing the FOLLOWING
+//   SwapBuffers past ITS vblank deadline and starving the DirectSound
+//   buffer at the same time. That is exactly the reported symptom: a
+//   simultaneous video micro-stutter + audio click, roughly periodic,
+//   surviving every fix that did not touch this specific call.
+//
+// FIX:
+//   Move GetCurrentPosition and SetFrequency off the NES thread
+//   entirely, onto a dedicated low-priority worker. The worker:
+//     - Wakes roughly every 8ms (finer-grained than the old once-per-
+//       frame refresh, so the caches used by UpdateDRC/APU::Run are, if
+//       anything, fresher than before).
+//     - Calls GetCurrentPosition and republishes both the slot-index
+//       cache (g_DSCacheRpos/Wpos, used by APU::Run's pre-check, P27)
+//       and a byte-precision cache (g_DSCacheRposBytes/WposBytes, used
+//       by UpdateDRC's fill-ratio math, which needs sub-slot resolution
+//       to compute a smooth +/-0.5%/frame correction).
+//     - Applies any pending SetFrequency request: either a full reset
+//       (g_PendingFreq, posted by ResetDRC) or a DRC-computed target
+//       (g_DRCApplyFreq, posted by UpdateDRC).
+//   UpdateDRC() becomes pure CPU-bound math: it reads the caches, computes
+//   the Layer 1 + Layer 2 target, and posts the result -- it never calls
+//   into audiodg.exe itself, so a stall on the worker thread has zero
+//   effect on frame pacing.
+//
+// THREAD SAFETY:
+//   The worker touches the COM `Buffer` pointer, which the NES thread
+//   can set to NULL and Release() at any time (APU::Stop(), region
+//   switches, ROM close). g_BufferCS + an AddRef-while-locked pattern
+//   (see AudioCtrlTick) makes this safe: the worker either observes a
+//   live, ref-counted Buffer for the duration of its call, or observes
+//   NULL and skips the tick. APU::Stop() only nulls the pointer and
+//   calls Release() outside the critical section, so a slow worker call
+//   cannot be starved by holding the lock, and Stop() cannot free the
+//   object while the worker is using it. This lock is only ever
+//   contended around Stop()/region-switch (rare, not part of the
+//   steady 60fps path), never during normal gameplay.
+// ------------------------------------------------------------------
+static volatile LONG    g_DSCacheRposBytes = -1L; // byte-precision play cursor
+static volatile LONG    g_DSCacheWposBytes = -1L; // byte-precision write cursor
+static volatile LONG    g_DRCApplyFreq     = -1L; // DRC-computed target freq, -1 = none pending
+
+static CRITICAL_SECTION g_BufferCS;
+static bool              g_BufferCSInit    = false;
+
+static HANDLE            g_AudioCtrlThread = NULL;
+static volatile LONG     g_AudioCtrlStop   = 0L;
+static volatile LONG     g_AudioCtrlReady  = 0L;
+
+// Runs on the worker thread. Grabs a ref-counted snapshot of Buffer under
+// g_BufferCS so it can never race with APU::Stop()'s Release(). See the
+// P30 header comment above for the full thread-safety argument.
+static void AudioCtrlTick()
+{
+        EnterCriticalSection(&g_BufferCS);
+        LPDIRECTSOUNDBUFFER localBuf = Buffer;
+        if (localBuf)
+                localBuf->AddRef();
+        unsigned long localLockSize = LockSize;
+        LeaveCriticalSection(&g_BufferCS);
+
+        if (!localBuf || !isEnabled || localLockSize == 0)
+        {
+                if (localBuf) localBuf->Release();
+                return;
+        }
+
+        // Apply a pending full-frequency reset first (matches the original
+        // ordering in UpdateDRC: reset takes priority over a stale in-flight
+        // DRC target computed against the pre-reset frequency).
+        LONG pendingReset = InterlockedExchange(&g_PendingFreq, -1L);
+        if (pendingReset > 0)
+                localBuf->SetFrequency((DWORD)pendingReset);
+
+        // Apply the most recent DRC-computed target, if any.
+        LONG pendingDRC = InterlockedExchange(&g_DRCApplyFreq, -1L);
+        if (pendingDRC > 0)
+                localBuf->SetFrequency((DWORD)pendingDRC);
+
+        // Refresh the position caches. This is the one GetCurrentPosition
+        // call in the whole pipeline now -- entirely off the NES thread.
+        unsigned long rpos, wpos;
+        if (SUCCEEDED(localBuf->GetCurrentPosition(&rpos, &wpos)))
+        {
+                InterlockedExchange(&g_DSCacheRposBytes, (LONG)rpos);
+                InterlockedExchange(&g_DSCacheWposBytes, (LONG)wpos);
+                InterlockedExchange(&g_DSCacheRpos, (LONG)(rpos / localLockSize));
+                InterlockedExchange(&g_DSCacheWpos, (LONG)(wpos / localLockSize));
+                InterlockedExchange(&g_DSCacheAge,  0L);
+        }
+
+        localBuf->Release();
+}
+
+static DWORD WINAPI AudioCtrlThreadProc(void*)
+{
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        InterlockedExchange(&g_AudioCtrlReady, 1L);
+
+        while (!InterlockedExchangeAdd(&g_AudioCtrlStop, 0L))
+        {
+                AudioCtrlTick();
+                // ~8ms cadence: finer than the old once-per-frame (16.7ms)
+                // refresh, and this thread is not on any vblank-critical
+                // path, so plain Sleep() granularity is fine here -- no
+                // need for the high-resolution waitable timer used by
+                // MonitorSync::PaceFrame.
+                Sleep(8);
+        }
+        return 0;
+}
+
+void StartAudioCtrlThread()
+{
+        if (g_AudioCtrlThread) return;
+
+        InterlockedExchange(&g_AudioCtrlStop,  0L);
+        InterlockedExchange(&g_AudioCtrlReady, 0L);
+
+        g_AudioCtrlThread = CreateThread(NULL, 0, AudioCtrlThreadProc, NULL, 0, NULL);
+        if (!g_AudioCtrlThread) return;
+
+        for (int i = 0; i < 100 && !InterlockedExchangeAdd(&g_AudioCtrlReady, 0L); i++)
+                Sleep(1);
+}
+
+void StopAudioCtrlThread()
+{
+        if (!g_AudioCtrlThread) return;
+        InterlockedExchange(&g_AudioCtrlStop, 1L);
+        // GetCurrentPosition/SetFrequency have no cancellation; bound the
+        // wait the same way P28's StopVBlankThread does, and move on --
+        // the thread will exit on its own once its current IPC call
+        // returns, it just won't be joined here.
+        WaitForSingleObject(g_AudioCtrlThread, 200);
+        CloseHandle(g_AudioCtrlThread);
+        g_AudioCtrlThread = NULL;
+        InterlockedExchange(&g_AudioCtrlReady, 0L);
+}
 #endif
 
 const   unsigned char   LengthCounts[32] = {
@@ -1139,6 +1298,16 @@ void    Init (void)
         Buffer          = NULL;
         buffer          = nullptr;
         isEnabled       = FALSE;
+
+        // P30: critical section guarding the Buffer pointer against the
+        // audio-control worker thread. Initialised once here; deleted in
+        // Destroy(). See the P30 block comment above g_DSCacheRposBytes
+        // for the full thread-safety rationale.
+        if (!g_BufferCSInit)
+        {
+                InitializeCriticalSection(&g_BufferCS);
+                g_BufferCSInit = true;
+        }
 #endif  /* !NSFPLAYER */
         MHz             = 1;
 #ifndef NSFPLAYER
@@ -1169,6 +1338,15 @@ void    Destroy (void)
 {
         Stop();
 #ifndef NSFPLAYER
+        // Defensive: normally already stopped via MonitorSync::Enable(FALSE),
+        // but make sure the worker is never left running past the point
+        // where g_BufferCS is torn down.
+        StopAudioCtrlThread();
+        if (g_BufferCSInit)
+        {
+                DeleteCriticalSection(&g_BufferCS);
+                g_BufferCSInit = false;
+        }
         if (DirectSound)
         {
                 DirectSound->Release();
@@ -1243,8 +1421,28 @@ void    Stop (void)
         if (Buffer)
         {
                 SoundOFF();
-                Buffer->Release();
-                Buffer = NULL;
+                // P30: null the pointer under g_BufferCS, then Release()
+                // outside the lock. The audio-control worker AddRefs Buffer
+                // while holding the same lock before using it (AudioCtrlTick),
+                // so it either sees the live pointer here (and its AddRef
+                // keeps the object alive until it Release()s its own
+                // reference) or sees NULL and skips the tick -- never a
+                // dangling pointer. Releasing outside the lock keeps this
+                // call from blocking on a slow in-flight worker IPC call.
+                LPDIRECTSOUNDBUFFER tmpBuffer = NULL;
+                if (g_BufferCSInit)
+                {
+                        EnterCriticalSection(&g_BufferCS);
+                        tmpBuffer = Buffer;
+                        Buffer = NULL;
+                        LeaveCriticalSection(&g_BufferCS);
+                }
+                else
+                {
+                        tmpBuffer = Buffer;
+                        Buffer = NULL;
+                }
+                tmpBuffer->Release();
         }
         if (PrimaryBuffer)
         {
@@ -1329,6 +1527,8 @@ void    SoundON (void)
         // on the first post-vblank tick.
         InterlockedExchange(&g_DSCacheRpos, -1L);
         InterlockedExchange(&g_DSCacheWpos, -1L);
+        InterlockedExchange(&g_DSCacheRposBytes, -1L);
+        InterlockedExchange(&g_DSCacheWposBytes, -1L);
         InterlockedExchange(&g_DSCacheAge,  99L);
         if (Buffer)
                 Buffer->SetFrequency(FREQ);
@@ -1689,18 +1889,36 @@ void    UpdateDRC (void)
         if (!Buffer || !isEnabled)
                 return;
 
-        // If ResetDRC posted a pending frequency reset (e.g. when Match
-        // Monitor Rate was just toggled off from the UI thread), apply it
-        // now. UpdateDRC runs on the NES thread from GFX::DrawScreen AFTER
-        // SwapBuffers has returned (post-vblank ~16ms window), so a 0-10ms
-        // audiodg IPC stall here does not shift the next vblank deadline —
-        // the CPU/PPU emulation for this frame is already complete.
-        LONG pendingReset = InterlockedExchange(&g_PendingFreq, -1L);
-        if (pendingReset > 0)
-        {
-                Buffer->SetFrequency((DWORD)pendingReset);
-                drc_play_freq = (DWORD)pendingReset;
-        }
+        // P30: UpdateDRC no longer touches audiodg.exe at all. It used to
+        // call GetCurrentPosition() and, most frames, SetFrequency() —
+        // both IPC calls — directly from here, on the NES thread, every
+        // single frame. That was the last unconditional per-frame IPC
+        // call left on the frame-critical path (see the P30 block comment
+        // near g_DSCacheRposBytes for the full analysis). Both calls are
+        // now owned by a dedicated background thread (AudioCtrlThreadProc);
+        // this function only reads the caches it publishes and, if a new
+        // target frequency is needed, posts it to g_DRCApplyFreq for that
+        // thread to apply. UpdateDRC is therefore pure CPU-bound math with
+        // no possibility of stalling the NES thread.
+        //
+        // Note the frequency-reset path (ResetDRC -> g_PendingFreq) is
+        // ALSO now applied by the background thread, not here -- see
+        // AudioCtrlTick. drc_play_freq itself is still only ever written
+        // from the NES thread (ResetDRC/UpdateDRC/SoundON), preserving the
+        // original single-writer invariant.
+
+        // Cache freshness gate. g_DSCacheAge is incremented on every
+        // APU::Run pre-check (P27) and reset to 0 each time the worker
+        // thread refreshes the cache (~every 8ms). A value this stale
+        // only happens for the first frame or two after MMR is enabled,
+        // before the worker thread has had a chance to run once — skip
+        // this frame's correction rather than compute against garbage.
+        LONG cacheAge = InterlockedExchangeAdd(&g_DSCacheAge, 0L);
+        if (cacheAge > 8)
+                return;
+
+        unsigned long rpos = (unsigned long)(LONG)InterlockedExchangeAdd(&g_DSCacheRposBytes, 0L);
+        unsigned long wpos = (unsigned long)(LONG)InterlockedExchangeAdd(&g_DSCacheWposBytes, 0L);
 
         // ----- Layer 1: monitor-rate-aware base target -----
         // Only apply the (monitorHz / nesHz) base target when OpenGL vsync
@@ -1719,22 +1937,6 @@ void    UpdateDRC (void)
         }
 
         // ----- Layer 2: buffer-fill fine correction -----
-        unsigned long rpos, wpos;
-        if (FAILED(Buffer->GetCurrentPosition(&rpos, &wpos)))
-                return;
-
-        // Update the DS position cache that APU::Run pre-check uses.
-        // This is the ONLY GetCurrentPosition call we keep on the critical
-        // path; APU::Run will use these cached slot indices instead of
-        // issuing its own IPC call from inside the CPU::ExecOp loop.
-        // LockSize is non-zero here (checked in Init before Buffer is created).
-        if (LockSize > 0)
-        {
-                InterlockedExchange(&g_DSCacheRpos, (LONG)(rpos / LockSize));
-                InterlockedExchange(&g_DSCacheWpos, (LONG)(wpos / LockSize));
-                InterlockedExchange(&g_DSCacheAge,  0L);
-        }
-
         DWORD totalSize = LockSize * FRAMEBUF;
         if (totalSize == 0)
                 return;
@@ -1748,12 +1950,12 @@ void    UpdateDRC (void)
         double fillRatio = (double)fill / (double)totalSize;
         double error = fillRatio - drc_target_fill;
 
-        // UpdateDRC is now called every frame (previously once per 20 frames).
-        // The correction coefficient is scaled down accordingly: 0.05/20 = 0.0025
-        // per-frame gives the same convergence speed as the old 0.05/20-frame
-        // scheme, but without the 330ms lag that allowed the buffer to drift
-        // far before the correction kicked in. The per-frame ±0.5% cap prevents
-        // any single bad fill reading from making an audible step change.
+        // UpdateDRC is called every frame. The correction coefficient
+        // (0.0025/frame) gives the same convergence speed as the original
+        // 0.05/20-frame scheme, but without the 330ms lag that allowed the
+        // buffer to drift far before the correction kicked in. The
+        // per-frame ±0.5% cap prevents any single bad fill reading from
+        // making an audible step change.
         double adjustment = error * 0.0025;
         if (adjustment >  0.005) adjustment =  0.005;
         if (adjustment < -0.005) adjustment = -0.005;
@@ -1770,42 +1972,21 @@ void    UpdateDRC (void)
 
         DWORD newFreq = (DWORD)(newFreqD + 0.5);
 
-        // Apply SetFrequency DIRECTLY here, not deferred to APU::Run.
+        // Post the target for the background thread to apply, instead of
+        // calling Buffer->SetFrequency() here. drc_play_freq is updated
+        // immediately (it's just an int, not an IPC call) so the dead-zone
+        // comparison below stays correct frame to frame even though the
+        // actual hardware call may lag by up to one worker tick (~8ms).
         //
-        // HISTORY / WHY THIS CHANGED:
-        // Previously (P11 fix) SetFrequency was deferred via g_PendingFreq
-        // and applied inside APU::Run, right after the DirectSound slot
-        // write. The reasoning was that APU::Run is "outside the vblank-
-        // critical window". This was true ONLY in the narrow sense that
-        // it does not run between two SwapBuffers — but APU::Run still
-        // runs on the NES thread, interleaved with CPU::ExecOp throughout
-        // the entire frame (~29800 calls per frame at NTSC). A 0-10ms
-        // audiodg IPC stall fired from inside APU::Run at the wrong moment
-        // shifts the remaining CPU/PPU emulation, which in turn pushes
-        // the next SwapBuffers past the next vblank deadline. The result
-        // is exactly the reported symptom: a periodic (≈30s) simultaneous
-        // video+audio dropout, because the NES thread drives BOTH paths.
-        //
-        // UpdateDRC is called from GFX::DrawScreen AFTER SwapBuffers has
-        // unblocked (see GFX.cpp:1260). At this point the CPU/PPU work
-        // for the current frame is COMPLETE — nothing else needs to run
-        // before the next frame's CPU loop begins. A 0-10ms stall here
-        // eats into the ~16.7ms inter-frame budget but does NOT shift
-        // the next vblank deadline, because the only thing scheduled
-        // before the next vblank is the next frame's CPU loop, which has
-        // ~16ms of headroom.
-        //
-        // The threshold for actually issuing SetFrequency is raised from
-        // ±2 Hz to ±5 Hz. ±5 Hz around 44100 Hz is ±0.011% — completely
-        // inaudible. The buffer-fill Layer 2 correction (±0.5% = ±220 Hz
-        // per frame) easily absorbs this dead zone. The benefit: about
-        // 2.5× fewer SetFrequency IPC calls, which means 2.5× fewer
-        // chances to hit the bad phase of audiodg's 10ms service cycle.
+        // The dead zone is ±5 Hz (±0.011% around 44100 Hz, inaudible,
+        // easily absorbed by the ±0.5%/frame Layer 2 correction) --
+        // unchanged from the P24 rationale: fewer SetFrequency calls,
+        // fewer chances to land on a bad phase of audiodg's service cycle.
         if (newFreq != drc_play_freq &&
             (newFreq > drc_play_freq + 5 || newFreq + 5 < drc_play_freq))
         {
                 drc_play_freq = newFreq;
-                Buffer->SetFrequency(newFreq);
+                InterlockedExchange(&g_DRCApplyFreq, (LONG)newFreq);
         }
 #endif /* !NSFPLAYER */
 }
@@ -1870,11 +2051,15 @@ void    Run (void)
                 {
                         LONG cacheAge = InterlockedExchangeAdd(&g_DSCacheAge, 1L);
                         // Use cache only when it's fresh (age == 0 before increment
-                        // means it was just written by UpdateDRC this frame).
-                        // On subsequent APU::Run calls in the same frame, cacheAge
-                        // will be 1, 2, ... — still safe to use; position only moves
-                        // forward. After 2 frames without UpdateDRC (shouldn't happen
-                        // normally), we fall back to live IPC (see below).
+                        // means the P30 audio-control thread refreshed it within
+                        // the last ~8ms). cacheAge <= 2 is roughly two NES-frame
+                        // periods (~33ms) of tolerance -- still safe to use;
+                        // position only moves forward. Falling through to the
+                        // live-IPC branch below should now only happen very
+                        // rarely: right after MMR is enabled (worker thread
+                        // hasn't ticked yet) or if the worker thread itself is
+                        // stalled -- in steady state the worker keeps this well
+                        // under the threshold.
                         if (cacheAge <= 2)
                         {
                                 unsigned long sr = (unsigned long)InterlockedExchangeAdd(&g_DSCacheRpos, 0L);
@@ -1885,8 +2070,14 @@ void    Run (void)
                         }
                         else
                         {
-                                // Cache is stale (UpdateDRC hasn't run yet).
+                                // Cache is stale (the P30 worker hasn't ticked yet).
                                 // Fall back to live IPC — same as pre-P27 behavior.
+                                // This is the one place left where the NES thread
+                                // can still stall on audiodg.exe; if diagnostics
+                                // (nintendulator_timing.log) ever show stalls
+                                // correlating with this branch being taken, the
+                                // fix is to widen FRAMEBUF/increase the worker's
+                                // tick rate rather than touching this fallback.
                                 unsigned long pr, pw;
                                 if (SUCCEEDED(Buffer->GetCurrentPosition(&pr, &pw)))
                                 {

@@ -350,6 +350,13 @@ void Enable(BOOL on)
         // HasDXGIVBlank() returns true only after this succeeds.
         StartVBlankThread();
 
+        // P30: start the audio-control worker thread. It owns all
+        // GetCurrentPosition/SetFrequency IPC traffic into audiodg.exe
+        // for as long as MMR is active, so UpdateDRC (called every frame
+        // while MMR is on -- see GFX::DrawScreen) never has to make that
+        // call itself. See APU.cpp for the full rationale.
+        APU::StartAudioCtrlThread();
+
         ResetState();
     }
     else
@@ -359,6 +366,10 @@ void Enable(BOOL on)
         g_CalibActive = false;
         StopVBlankThread();
         APU::ResetDRC();
+        // Stop the P30 worker after ResetDRC() has posted its frequency-
+        // reset request (g_PendingFreq) so the worker gets one more tick
+        // to apply it before exiting.
+        APU::StopAudioCtrlThread();
     }
 }
 

@@ -58,6 +58,18 @@ void    ResetDRC        (void);
 // can reach it without including MonitorSync.h.
 // NSFPLAYER build does not use MonitorSync, so the function is absent there.
 void    NotifyMonitorSyncRegion (void);
+
+// P30: dedicated audio-control background thread.
+//
+// Starts/stops a low-priority worker thread that owns 100% of the
+// IDirectSoundBuffer::GetCurrentPosition / SetFrequency IPC traffic
+// into audiodg.exe. Called from MonitorSync::Enable(TRUE/FALSE), the
+// same lifecycle point that starts/stops the P28 vblank-poller thread.
+// Safe to call even if the DirectSound buffer does not exist yet (the
+// worker simply skips its work for that tick); safe to call StopAudioCtrlThread
+// even if the thread was never started.
+void    StartAudioCtrlThread (void);
+void    StopAudioCtrlThread  (void);
 #endif  /* !NSFPLAYER */
 
 int     MAPINT  IntRead (int, int);
