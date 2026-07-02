@@ -464,6 +464,27 @@ static void ApplyPendingResize()
 // inspect which call caused the stall.
 //
 // Overhead: ~3 QPC reads (150ns total) per frame — negligible.
+//
+// P31 (session 10 full-project audit): the dump itself used to be
+// synchronous fopen/fwrite/fclose of a ~360-line file, called directly
+// from DrawScreen on the NES thread, with NO rate limiting. That means:
+//   - The exact moment a stall is detected (i.e. the exact moment we can
+//     least afford more delay), we also do a synchronous disk write --
+//     opening/creating a file in %TEMP%, which on many systems is picked
+//     up by antivirus real-time scanning or the search indexer. A
+//     borderline, otherwise-bounded 20-25ms hiccup (e.g. WaitForDXGIVBlank
+//     legitimately hitting its own deadline once) could be extended into
+//     a much longer, clearly audible/visible one purely by the act of
+//     diagnosing it.
+//   - With no rate limiting, a single external event that affects several
+//     consecutive frames (plausible for a GPU power-state transition)
+//     re-triggers the dump on EVERY one of those frames, rewriting the
+//     entire 6-second ring buffer to disk each time -- compounding one
+//     hiccup into several.
+// Both are fixed below: DiagDumpLogAsync() snapshots the ring buffer
+// (cheap memcpy, no I/O) on the NES thread, then hands the snapshot to
+// the Windows thread pool (QueueUserWorkItem) to do the actual write.
+// A 3-second cooldown prevents back-to-back re-triggering.
 // ============================================================
 #define DIAG_FRAMES    360          // 6 seconds of history at 60fps
 #define DIAG_STALL_MS  20.0        // stall threshold: 20ms (>1 vblank)
@@ -493,7 +514,7 @@ static double DiagQPCFreq()
         return freq;
 }
 
-static void DiagDumpLog()
+static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
 {
         TCHAR tmpPath[MAX_PATH];
         GetTempPath(MAX_PATH, tmpPath);
@@ -505,13 +526,15 @@ static void DiagDumpLog()
         double freq = DiagQPCFreq();
         _ftprintf(f, _T("Nintendulator frame timing log\n"));
         _ftprintf(f, _T("Stall threshold: %.1f ms\n"), DIAG_STALL_MS);
+        _ftprintf(f, _T("DXGI vblank bypass active: %s\n"),
+                MonitorSync::HasDXGIVBlank() ? _T("YES") : _T("NO (falling back to DWM-composited vsync)"));
         _ftprintf(f, _T("Columns: frame | t0->t1(texUpload) | t1->t2(SwapBuf) | t2->t3(OnFrameEnd) | t3->t4(UpdateDRC) | total(t0->t4)\n\n"));
 
         // Walk the circular buffer from oldest to newest
         for (int i = 0; i < DIAG_FRAMES; i++)
         {
-                int idx = (s_diagHead + i) % DIAG_FRAMES;
-                FrameTimingEntry &e = s_diagBuf[idx];
+                int idx = (head + i) % DIAG_FRAMES;
+                const FrameTimingEntry &e = buf[idx];
                 if (e.frameNum == 0 || e.t4 == 0) continue;
 
                 double d01 = (e.t1 - e.t0) * 1000.0 / freq;  // texUpload ms
@@ -534,6 +557,79 @@ static void DiagDumpLog()
         fclose(f);
 }
 
+// Kept for the (extremely unlikely) case QueueUserWorkItem submission
+// fails -- see DiagDumpLogAsync. Operates directly on the live buffer,
+// exactly as before P31.
+static void DiagDumpLog()
+{
+        DiagWriteLogFile(s_diagBuf, s_diagHead);
+}
+
+// P31: snapshot payload handed to the thread pool. Freed by the worker.
+struct DiagSnapshot
+{
+        FrameTimingEntry buf[DIAG_FRAMES];
+        int              head;
+};
+
+static volatile LONG  s_diagDumping     = 0;   // 1 while an async dump is in flight
+static LONGLONG       s_diagLastDumpQPC = 0;   // NES-thread-only, no lock needed
+
+static DWORD CALLBACK DiagDumpThreadProc(LPVOID param)
+{
+        DiagSnapshot *snap = (DiagSnapshot*)param;
+        DiagWriteLogFile(snap->buf, snap->head);
+        free(snap);
+        InterlockedExchange(&s_diagDumping, 0L);
+        return 0;
+}
+
+// P31: replacement for the direct DiagDumpLog() call on the hot path.
+// Snapshots the ring buffer (cheap memcpy, no I/O, stays on the NES
+// thread) and hands the snapshot to the Windows thread pool to write to
+// disk -- the NES thread never touches the filesystem. Rate-limited to
+// one dump per 3 seconds so a multi-frame stall cascade produces one
+// file instead of several back-to-back asynchronous writes competing
+// with each other.
+static void DiagDumpLogAsync()
+{
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        double freq = DiagQPCFreq();
+        if (s_diagLastDumpQPC != 0 && freq > 0.0 &&
+            (double)(now.QuadPart - s_diagLastDumpQPC) / freq < 3.0)
+                return;
+
+        if (InterlockedCompareExchange(&s_diagDumping, 1L, 0L) != 0)
+                return; // a previous dump is still writing
+
+        s_diagLastDumpQPC = now.QuadPart;
+
+        // Plain malloc, not new: DiagSnapshot is POD (array + int), and this
+        // keeps us out of C++ exception territory (this codebase is built
+        // C-Win32-style throughout; malloc.h is already pulled in via
+        // StdAfx.h). NULL on failure is handled explicitly below.
+        DiagSnapshot *snap = (DiagSnapshot*)malloc(sizeof(DiagSnapshot));
+        if (!snap)
+        {
+                InterlockedExchange(&s_diagDumping, 0L);
+                return;
+        }
+        memcpy(snap->buf, s_diagBuf, sizeof(s_diagBuf));
+        snap->head = s_diagHead;
+
+        if (!QueueUserWorkItem(DiagDumpThreadProc, snap, WT_EXECUTELONGFUNCTION))
+        {
+                // Thread pool submission failed (extremely rare). Rather than
+                // silently losing the diagnostic, fall back to the old
+                // synchronous write -- a guaranteed rare stall beats no
+                // dump at all when actively debugging a glitch.
+                free(snap);
+                InterlockedExchange(&s_diagDumping, 0L);
+                DiagDumpLog();
+        }
+}
+
 // Called from DrawScreen to complete the timing entry for this frame.
 // t3 and t4 are filled here (after SwapBuffers returns) and a stall check
 // is performed.
@@ -554,7 +650,7 @@ static void DiagCompleteFrame(LONGLONG t3, LONGLONG t4)
         double drcMs  = (s_diagBuf[idx].t4 - s_diagBuf[idx].t3) * 1000.0 / freq;
 
         if (swapMs > DIAG_STALL_MS || texMs > DIAG_STALL_MS || drcMs > DIAG_STALL_MS)
-                DiagDumpLog();
+                DiagDumpLogAsync();
 }
 
 static void GL_DrawFrame(void)

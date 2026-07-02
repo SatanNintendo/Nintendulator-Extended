@@ -85,6 +85,13 @@ struct TDeviceInfo
                 DIMOUSESTATE2 MouseState;
                 DIJOYSTATE2 JoyState;
         };
+
+        // P32: earliest s_inputFrameCounter value at which we're allowed to
+        // retry IDirectInputDevice8::Acquire() for this device after it was
+        // reported lost. See the block comment above UpdateInput() for why.
+        // Global array -> zero-initialised at startup, so the first loss is
+        // always retried immediately, same as before this fix.
+        DWORD NextAcquireRetryFrame;
 };
 TDeviceInfo Devices[MAX_CONTROLLERS];
 
@@ -981,11 +988,43 @@ void    ClearDevState (int DevNum)
         }
 }
 
+// P32 (session 10 full-project audit): IDirectInputDevice8::Acquire() is
+// called here to recover a device that reported DIERR_INPUTLOST /
+// DIERR_NOTACQUIRED. This runs on the NES thread, inside the same
+// once-per-frame function (UpdateInput, called from NES::Thread at
+// scanline 241) that also drives the video/audio pipeline every frame.
+// Acquire() is not guaranteed to be cheap: for wireless/Bluetooth input
+// devices in particular, re-acquiring after a signal drop can involve the
+// HID stack/driver re-enumerating the device, which can take single-digit
+// to tens of milliseconds. Without any backoff, a device that stays lost
+// (a wireless controller briefly out of range, or cycling through a
+// power-saving doze mode -- both commonly happen on the order of several
+// seconds) would retry Acquire() every single frame, 60 times a second,
+// for as long as it stays lost -- each attempt a candidate for stealing
+// enough time from the NES thread to miss the next vblank / starve the
+// audio buffer, and a plausible independent source of a periodic-feeling
+// video+audio dropout on machines with a wireless controller or keyboard.
+//
+// FIX: back off to at most one Acquire() attempt every ~500ms (30 frames)
+// per device while it remains lost. Behavior for the common case (a
+// device that reacquires on the very first try) is unchanged -- this only
+// prevents hammering a device that stays lost for an extended period.
+static DWORD s_inputFrameCounter = 0;
+
+static void TryReacquire(TDeviceInfo &dev)
+{
+        if (dev.NextAcquireRetryFrame != 0 && s_inputFrameCounter < dev.NextAcquireRetryFrame)
+                return;
+        dev.DIDevice->Acquire();
+        dev.NextAcquireRetryFrame = s_inputFrameCounter + 30;
+}
+
 void    UpdateInput (void)
 {
         HRESULT hr;
         int i;
         unsigned char Cmd = 0;
+        s_inputFrameCounter++;
         for (i = 0; i < NumDevices; i++)
         {
                 TDeviceInfo &dev = Devices[i];
@@ -997,7 +1036,7 @@ void    UpdateInput (void)
                         if ((hr == DIERR_INPUTLOST) || (hr == DIERR_NOTACQUIRED))
                         {
                                 ClearDevState(0);
-                                dev.DIDevice->Acquire();
+                                TryReacquire(dev);
                         }
                 }
                 else if (i == 1)
@@ -1006,7 +1045,7 @@ void    UpdateInput (void)
                         if ((hr == DIERR_INPUTLOST) || (hr == DIERR_NOTACQUIRED))
                         {
                                 ClearDevState(1);
-                                dev.DIDevice->Acquire();
+                                TryReacquire(dev);
                         }
                 }
                 else
@@ -1015,7 +1054,7 @@ void    UpdateInput (void)
                         if ((hr == DIERR_INPUTLOST) || (hr == DIERR_NOTACQUIRED))
                         {
                                 ClearDevState(i);
-                                dev.DIDevice->Acquire();
+                                TryReacquire(dev);
                                 continue;
                         }
                         hr = dev.DIDevice->GetDeviceState(sizeof(dev.JoyState), &dev.JoyState);
