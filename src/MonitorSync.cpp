@@ -141,8 +141,46 @@ static void DXGI_Release(void* p)
     ((PFN_Release_t)vtbl[2])(p);
 }
 
-// Lazy-initialize: enumerate adapter 0, output 0, cache IDXGIOutput*.
-// Returns true if WaitForVBlank is ready to use.
+// Lazy-initialize: enumerate adapters/outputs, cache the first working
+// IDXGIOutput*. Returns true if WaitForVBlank is ready to use.
+//
+// P33 (session 11, confirmed by the user's timing log: "DXGI vblank
+// bypass active: NO"): this used to hardcode adapter 0 / output 0 and
+// bail out completely if that single combination failed. That fails
+// outright on any system where the FIRST enumerated adapter has no
+// attached display -- the most common case being a laptop with hybrid
+// graphics (NVIDIA Optimus / AMD PowerXpress), where a muxless discrete
+// GPU with zero outputs is commonly enumerated before the integrated GPU
+// that actually drives the screen. On such systems EnumOutputs(adapter 0)
+// returns DXGI_ERROR_NOT_FOUND immediately, InitDXGI silently fails
+// (g_DXGIAvailable stays false), and the entire P28 DXGI vblank bypass
+// never activates for the rest of the process's lifetime (g_DXGITried
+// latches to true so it's never retried). Everything built on top of it
+// since -- P28's bounded wait, P30's audio thread, P31's diagnostics --
+// still runs, but none of it touches the actual problem, because the
+// code never actually left the DWM-composited vsync path in the first
+// place; wglSwapIntervalEXT(1) alone is what's throttling frames, with
+// all the DWM-maintenance-cycle stall exposure that P28's own header
+// comment describes.
+//
+// FIX: try every adapter (up to a generous cap; no real system has more
+// than a handful), and on each adapter try output 0. Use the first
+// (adapter, output) pair where EnumOutputs succeeds. This preserves the
+// exact previous behavior on any system where adapter 0 already has a
+// display (the overwhelming majority of desktops), and now also succeeds
+// on hybrid-graphics laptops where it previously failed silently.
+//
+// KNOWN LIMITATION: this does not try to match the DXGI output to the
+// monitor the game window actually lives on in a multi-monitor setup on
+// a single adapter -- it takes output 0 of the first adapter with any
+// output, same as the pre-P33 code did for adapter 0. If that ever
+// matters (vblank signal from the wrong monitor when window is dragged
+// to a second display with a different refresh rate), the fix is to
+// enumerate every output on every adapter, compare each IDXGIOutput::
+// GetDesc().Monitor against MonitorFromWindow(g_hWnd, ...), and re-run
+// that match on WM_DISPLAYCHANGE / window move. Not implemented here --
+// no evidence yet that this project's reported issue involves more than
+// one monitor.
 static bool InitDXGI()
 {
     if (g_DXGITried) return g_DXGIAvailable;
@@ -160,16 +198,32 @@ static bool InitDXGI()
     g_pDXGIFactory = pFac;
 
     void** fvt = *(void***)pFac;
-    void* pAdp = NULL;
-    if (FAILED(((PFN_EnumAdapters)fvt[7])(pFac, 0, &pAdp)) || !pAdp)
-    { DXGI_Release(pFac); g_pDXGIFactory = NULL; return false; }
-    g_pDXGIAdapter = pAdp;
 
-    void** avt = *(void***)pAdp;
-    void* pOut = NULL;
-    if (FAILED(((PFN_EnumOutputs)avt[7])(pAdp, 0, &pOut)) || !pOut)
-    { DXGI_Release(pAdp); DXGI_Release(pFac); g_pDXGIAdapter = NULL; g_pDXGIFactory = NULL; return false; }
-    g_pDXGIOutput = pOut;
+    for (UINT ai = 0; ai < 16; ai++)
+    {
+        void* pAdp = NULL;
+        if (FAILED(((PFN_EnumAdapters)fvt[7])(pFac, ai, &pAdp)) || !pAdp)
+            break; // DXGI_ERROR_NOT_FOUND -- no more adapters, stop trying
+
+        void** avt = *(void***)pAdp;
+        void* pOut = NULL;
+        if (SUCCEEDED(((PFN_EnumOutputs)avt[7])(pAdp, 0, &pOut)) && pOut)
+        {
+            g_pDXGIAdapter = pAdp;
+            g_pDXGIOutput  = pOut;
+            break;
+        }
+        // This adapter has no outputs (e.g. a muxless discrete GPU with
+        // no display attached) -- release it and try the next adapter.
+        DXGI_Release(pAdp);
+    }
+
+    if (!g_pDXGIOutput)
+    {
+        DXGI_Release(pFac);
+        g_pDXGIFactory = NULL;
+        return false;
+    }
 
     // Success: we'll use interval=0 + our own WaitForVBlank call.
     InterlockedExchange(&g_DXGISwapInterval, 0L);
