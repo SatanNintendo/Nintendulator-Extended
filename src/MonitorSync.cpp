@@ -125,6 +125,17 @@ static bool  g_DXGIAvailable = false;
 static void* g_pDXGIFactory  = NULL;
 static void* g_pDXGIAdapter  = NULL;
 static void* g_pDXGIOutput   = NULL;
+
+// P34: human-readable reason InitDXGI() succeeded/failed, surfaced through
+// GetDXGIFailReason() into the timing log (see GFX.cpp DiagWriteLogFile).
+// Added after two rounds of the log showing a bare "DXGI vblank bypass
+// active: NO" with no way to tell WHERE it failed -- LoadLibrary,
+// CreateDXGIFactory, or adapter/output enumeration all look identical
+// from outside. g_DXGIFailBuf backs the sprintf'd variants;
+// g_DXGIFailReason points at either that buffer or a static string
+// literal for the fixed-text cases.
+static TCHAR       g_DXGIFailBuf[128] = { 0 };
+static const TCHAR *g_DXGIFailReason  = _T("not attempted yet");
 // Swap interval to use in GL_DrawFrame: 0 when DXGI vblank is active
 // (we wait ourselves), 1 otherwise (driver handles it via DWM).
 // Written once by InitDXGI(); read every frame from GL_DrawFrame.
@@ -187,23 +198,31 @@ static bool InitDXGI()
     g_DXGITried = true; // mark so we never retry on failure
 
     HMODULE hDxgi = LoadLibraryW(L"dxgi.dll");
-    if (!hDxgi) return false;
+    if (!hDxgi) { g_DXGIFailReason = _T("LoadLibraryW(dxgi.dll) failed"); return false; }
 
     PFN_CreateDXGIFactory pfnCF =
         (PFN_CreateDXGIFactory)GetProcAddress(hDxgi, "CreateDXGIFactory");
-    if (!pfnCF) return false;
+    if (!pfnCF) { g_DXGIFailReason = _T("GetProcAddress(CreateDXGIFactory) failed"); return false; }
 
     void* pFac = NULL;
-    if (FAILED(pfnCF(&s_IID_IDXGIFactory, &pFac)) || !pFac) return false;
+    HRESULT hrFac = pfnCF(&s_IID_IDXGIFactory, &pFac);
+    if (FAILED(hrFac) || !pFac)
+    {
+        _stprintf_s(g_DXGIFailBuf, _countof(g_DXGIFailBuf), _T("CreateDXGIFactory() failed, hr=0x%08X"), (unsigned)hrFac);
+        g_DXGIFailReason = g_DXGIFailBuf;
+        return false;
+    }
     g_pDXGIFactory = pFac;
 
     void** fvt = *(void***)pFac;
 
+    UINT adaptersTried = 0, adaptersWithNoOutput = 0;
     for (UINT ai = 0; ai < 16; ai++)
     {
         void* pAdp = NULL;
         if (FAILED(((PFN_EnumAdapters)fvt[7])(pFac, ai, &pAdp)) || !pAdp)
             break; // DXGI_ERROR_NOT_FOUND -- no more adapters, stop trying
+        adaptersTried++;
 
         void** avt = *(void***)pAdp;
         void* pOut = NULL;
@@ -215,15 +234,24 @@ static bool InitDXGI()
         }
         // This adapter has no outputs (e.g. a muxless discrete GPU with
         // no display attached) -- release it and try the next adapter.
+        adaptersWithNoOutput++;
         DXGI_Release(pAdp);
     }
 
     if (!g_pDXGIOutput)
     {
+        _stprintf_s(g_DXGIFailBuf, _countof(g_DXGIFailBuf),
+                _T("no adapter had an output (tried %u adapter(s), %u had zero outputs)"),
+                adaptersTried, adaptersWithNoOutput);
+        g_DXGIFailReason = g_DXGIFailBuf;
         DXGI_Release(pFac);
         g_pDXGIFactory = NULL;
         return false;
     }
+
+    _stprintf_s(g_DXGIFailBuf, _countof(g_DXGIFailBuf), _T("OK (found output on adapter index %u of %u tried)"),
+            adaptersTried - 1, adaptersTried);
+    g_DXGIFailReason = g_DXGIFailBuf;
 
     // Success: we'll use interval=0 + our own WaitForVBlank call.
     InterlockedExchange(&g_DXGISwapInterval, 0L);
@@ -740,6 +768,16 @@ namespace MonitorSync
 bool HasDXGIVBlank()
 {
     return g_DXGIAvailable && (g_VBlankThread != NULL);
+}
+
+// P34: exposes the reason string set by InitDXGI(), so the timing log
+// (GFX.cpp DiagWriteLogFile) can print exactly where DXGI init succeeded
+// or failed instead of a bare yes/no. Safe to call from any thread: it
+// only ever points at a static buffer written once, before g_DXGITried
+// latches true, from the NES thread inside Enable(TRUE) -> InitDXGI().
+const TCHAR* GetDXGIFailReason()
+{
+    return g_DXGIFailReason;
 }
 
 // Called from GL_DrawFrame (NES thread) just before SwapBuffers(interval=0).

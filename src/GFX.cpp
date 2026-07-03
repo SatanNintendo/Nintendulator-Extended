@@ -528,6 +528,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         _ftprintf(f, _T("Stall threshold: %.1f ms\n"), DIAG_STALL_MS);
         _ftprintf(f, _T("DXGI vblank bypass active: %s\n"),
                 MonitorSync::HasDXGIVBlank() ? _T("YES") : _T("NO (falling back to DWM-composited vsync)"));
+        _ftprintf(f, _T("DXGI init detail: %s\n"), MonitorSync::GetDXGIFailReason());
         _ftprintf(f, _T("Columns: frame | t0->t1(texUpload) | t1->t2(SwapBuf) | t2->t3(OnFrameEnd) | t3->t4(UpdateDRC) | total(t0->t4)\n\n"));
 
         // Walk the circular buffer from oldest to newest

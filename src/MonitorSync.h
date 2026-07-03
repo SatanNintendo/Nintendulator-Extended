@@ -130,4 +130,11 @@ namespace MonitorSync
         // this is a no-op and SwapBuffers(interval=1) handles timing as before.
         bool    HasDXGIVBlank ();
         void    WaitForDXGIVBlank ();
+
+        // P34: human-readable reason InitDXGI() succeeded or failed --
+        // e.g. "LoadLibraryW(dxgi.dll) failed", "no adapter had an output
+        // (tried 2 adapter(s), 2 had zero outputs)", or "OK (found output
+        // on adapter index 1 of 2 tried)". Valid any time after Enable(TRUE)
+        // has been called at least once; "not attempted yet" before that.
+        const TCHAR* GetDXGIFailReason ();
 }
