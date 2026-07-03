@@ -648,9 +648,21 @@ static void DiagCompleteFrame(LONGLONG t3, LONGLONG t4)
         double freq = DiagQPCFreq();
         double swapMs = (s_diagBuf[idx].t2 - s_diagBuf[idx].t1) * 1000.0 / freq;
         double texMs  = (s_diagBuf[idx].t1 - s_diagBuf[idx].t0) * 1000.0 / freq;
+        double ofeMs  = (s_diagBuf[idx].t3 - s_diagBuf[idx].t2) * 1000.0 / freq;
         double drcMs  = (s_diagBuf[idx].t4 - s_diagBuf[idx].t3) * 1000.0 / freq;
 
-        if (swapMs > DIAG_STALL_MS || texMs > DIAG_STALL_MS || drcMs > DIAG_STALL_MS)
+        // P35: ofeMs (OnFrameEnd duration) was computed for display in the
+        // log columns but never included in the trigger condition below.
+        // A frame where ONLY OnFrameEnd stalls (swap/tex/drc all fine) would
+        // never fire a dump at all -- it would only show up in the log if
+        // some other, unrelated checkpoint on the same frame also happened
+        // to exceed the threshold. That is exactly what happened in the one
+        // log we did get: frame 2 shows ofe=202.92ms, and the dump only
+        // fired because texMs (21.56ms, first-frame texture/shader warmup)
+        // separately tripped the tex>DIAG_STALL_MS branch. Any OnFrameEnd
+        // stall during normal play, with tex/swap/drc all under threshold,
+        // would previously have been invisible to this logger.
+        if (swapMs > DIAG_STALL_MS || texMs > DIAG_STALL_MS || ofeMs > DIAG_STALL_MS || drcMs > DIAG_STALL_MS)
                 DiagDumpLogAsync();
 }
 
@@ -1238,12 +1250,42 @@ void    Start (void)
                 // is already enabled (e.g. loaded from settings at startup or
                 // toggled on before any ROM was loaded), this is the first
                 // moment we can actually load WGL swap control and turn vsync
-                // on. ReinitVSync is a no-op if vsync is already active or
-                // MatchMonitorRate is disabled, so calling it here is always
-                // safe.
+                // on.
+                //
+                // P35: this used to call MonitorSync::ReinitVSync() here, on
+                // the theory that it's "a no-op if vsync is already active or
+                // MatchMonitorRate is disabled". That reasoning is wrong:
+                // ReinitVSync() bails out on `!IsEnabled()`, and IsEnabled()
+                // reflects MonitorSync's OWN internal g_Enabled flag -- which
+                // is only ever set by MonitorSync::Enable(), which in turn is
+                // only ever called from the menu toggle handler
+                // (Nintendulator.cpp, ID_OPTIONS_MATCHRATE). Nothing calls
+                // Enable(TRUE) when MatchMonitorRate is TRUE because it was
+                // loaded from the registry at startup. So in that exact
+                // scenario -- the one this comment claimed to handle --
+                // g_Enabled is still FALSE here, ReinitVSync() no-ops
+                // immediately, and InitDXGI()/StartVBlankThread()/
+                // APU::StartAudioCtrlThread() never run for the rest of the
+                // session. MatchMonitorRate-gated behavior elsewhere (diag
+                // logging, frameskip disabled, TIME_CRITICAL thread priority)
+                // still activates off the raw flag, so nothing *looks* wrong
+                // in the UI -- but none of the actual pacing machinery
+                // (P1-P34) is running underneath it. This is very likely the
+                // real explanation for the "~20-30 second stutter" chased
+                // across sessions 1-12 that a static audit of PaceFrame/
+                // DXGI/DRC code could never catch: on any run started with
+                // the checkbox already on from a previous session, that code
+                // simply never executes at all.
+                //
+                // Fix: call Enable(TRUE) directly. Enable() itself is
+                // idempotent (it compares prev/new state via
+                // InterlockedExchange and returns early if already on), so
+                // it is safe to call unconditionally here without an
+                // IsEnabled() guard -- unlike ReinitVSync(), it does not
+                // assume enablement already happened elsewhere.
                 if (MatchMonitorRate)
                 {
-                        MonitorSync::ReinitVSync();
+                        MonitorSync::Enable(TRUE);
                         // Both fullscreen and windowed modes now use GL-vsync
                         // (interval=1) as the sole sync mechanism. DwmFlush is
                         // disabled by default (see USE_DWMFLUSH in GL_DrawFrame)
