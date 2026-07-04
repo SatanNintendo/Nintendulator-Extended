@@ -117,7 +117,7 @@ namespace MonitorSync
         // No-op if no change is pending. Safe to call every frame.
         void    ApplyPendingVSync ();
 
-        // P28: DXGI vblank bypass for windowed mode.
+        // P28: DXGI vblank bypass.
         //
         // HasDXGIVBlank() returns true if IDXGIOutput::WaitForVBlank is
         // available on this system (Windows 7+, any dGPU or iGPU with
@@ -128,6 +128,16 @@ namespace MonitorSync
         // bypassing DWM's composition scheduler entirely.  Call this in
         // GL_DrawFrame BEFORE SwapBuffers(interval=0).  If DXGI is unavailable
         // this is a no-op and SwapBuffers(interval=1) handles timing as before.
+        //
+        // P36 (session 13): as of GFX.cpp's GL_DrawFrame, this is called
+        // in BOTH windowed and fullscreen mode whenever MMR is active. It
+        // used to be windowed-only, on the assumption that GL's own driver
+        // vsync (interval=1) already paces fullscreen correctly. That
+        // assumption doesn't hold: once InitDXGI() succeeds, the swap
+        // interval is set to 0 for ALL frames (see g_DXGISwapInterval),
+        // fullscreen included -- there is no separate "fullscreen keeps
+        // interval=1" code path. Skipping this call in fullscreen therefore
+        // left fullscreen with no video-side pacing at all.
         bool    HasDXGIVBlank ();
         void    WaitForDXGIVBlank ();
 

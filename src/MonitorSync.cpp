@@ -37,7 +37,8 @@ typedef const char* (WINAPI *PFN_wglGetExtensionsStringARB)(HDC);
 typedef const char* (WINAPI *PFN_wglGetExtensionsStringEXT)(void);
 
 // ------------------------------------------------------------------
-// DXGI WaitForVBlank -- P28: bypass DWM for windowed vsync.
+// DXGI WaitForVBlank -- P28: bypass DWM for vsync (windowed and, as of
+// P36, fullscreen too -- see the call site in GFX.cpp's GL_DrawFrame).
 //
 // ROOT CAUSE of the periodic ~20-30 second dropout:
 //

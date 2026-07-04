@@ -932,11 +932,15 @@ static void GL_DrawFrame(void)
         // windowed presentation. DwmFlush is redundant and only adds
         // stall risk.
         //
-        // The GL swap interval stays at 1 (set by ReinitVSync or
-        // SetDwmSyncMode(false)). SetDwmSyncMode(true) is never called,
-        // so SwapBuffers blocks at vblank — exactly the same behaviour
-        // as fullscreen mode. No DWM warmup is needed because there is
-        // no transition to interval=0.
+        // The GL swap interval is set by ReinitVSync()/SetDwmSyncMode(false)
+        // to whatever g_DXGISwapInterval says: 1 (driver vsync) if the P28
+        // DXGI bypass below is unavailable, or 0 (our own WaitForDXGIVBlank
+        // call takes over pacing) if it is. SetDwmSyncMode(true) is never
+        // called, so DwmFlush itself never runs. Either way SwapBuffers
+        // ends up synced to the real vblank — and, as of P36, the same is
+        // true in fullscreen mode (WaitForDXGIVBlank is no longer skipped
+        // there). No DWM warmup is needed because there is no transition
+        // to interval=0 caused BY DwmFlush specifically.
         //
         // TRADE-OFF:
         // On older drivers (Windows 7/8 with legacy GPU drivers), DWM
@@ -985,12 +989,12 @@ static void GL_DrawFrame(void)
         }
 #endif // USE_DWMFLUSH
 
-        // P28: DXGI vblank bypass for windowed mode.
+        // P28: DXGI vblank bypass.
         //
-        // When WaitForDXGIVBlank() is available and MMR is active in windowed
-        // mode, we wait for the raw GPU vblank interrupt here (bypassing DWM),
-        // then call SwapBuffers with interval=0 so the frame is submitted into
-        // that vblank slot without going through DWM's composition timing path.
+        // When WaitForDXGIVBlank() is available and MMR is active, we wait
+        // for the raw GPU vblank interrupt here (bypassing DWM), then call
+        // SwapBuffers with interval=0 so the frame is submitted into that
+        // vblank slot without going through DWM's composition timing path.
         //
         // Without this, SwapBuffers(interval=1) routes through DWM's
         // "composition ready" signal which is subject to DWM's periodic
@@ -1001,7 +1005,32 @@ static void GL_DrawFrame(void)
         // with very old/broken GPU drivers), WaitForDXGIVBlank() is a no-op
         // and we fall through to SwapBuffers which uses interval=1 (set
         // during Enable() by the non-DXGI path) -- identical to pre-P28.
-        if (MatchMonitorRate && !Fullscreen)
+        //
+        // P36 (session 13): this used to be gated on "&& !Fullscreen", on
+        // the theory that fullscreen already gets a real hardware vblank
+        // from GL's own driver vsync and doesn't need the DXGI bypass.
+        // That reasoning missed that g_DXGISwapInterval is a single,
+        // mode-independent flag: as soon as InitDXGI() succeeds once (the
+        // session-12 log confirms "DXGI init detail: OK" on this machine),
+        // Enable()/ReinitVSync()/SetDwmSyncMode() all post interval=0 for
+        // every future frame -- in fullscreen exactly as much as windowed.
+        // Nothing puts the interval back to 1 specifically for fullscreen.
+        // With the old "!Fullscreen" guard, that left fullscreen with
+        // interval=0 (driver vsync off) AND no WaitForDXGIVBlank() call:
+        // literally nothing on the video side paced the frame. SwapBuffers
+        // returned immediately every time, the NES thread ran unthrottled,
+        // and the only remaining brake was the DirectSound buffer-fill
+        // wait loop in APU.cpp (MonitorSync::PaceFrame), which paces per
+        // audio-lock-slot off the timestamp of the *previous fully-drawn
+        // video frame* -- it was never designed to be the sole/primary
+        // throttle, and does not scale correctly when asked to be one.
+        // The attached timing log (MatchMonitorRate on, DXGI active) shows
+        // swap+ofe totalling ~85-100ms/frame -- 5-6x a real ~16.6ms vblank
+        // period, i.e. almost exactly the reported "8fps instead of 60fps
+        // in fullscreen". Removing the Fullscreen restriction here makes
+        // fullscreen use the same real-hardware-vblank wait as windowed,
+        // restoring a proper ~16.6ms/frame pace in both modes.
+        if (MatchMonitorRate)
                 MonitorSync::WaitForDXGIVBlank();
 
         SwapBuffers(hGLDC);
@@ -1286,17 +1315,19 @@ void    Start (void)
                 if (MatchMonitorRate)
                 {
                         MonitorSync::Enable(TRUE);
-                        // Both fullscreen and windowed modes now use GL-vsync
-                        // (interval=1) as the sole sync mechanism. DwmFlush is
+                        // Both fullscreen and windowed modes now use the same
+                        // sync mechanism: real hardware vblank, either via the
+                        // P28 DXGI bypass (interval=0 + WaitForDXGIVBlank(),
+                        // used in both modes as of P36) if available, or plain
+                        // GL driver vsync (interval=1) if not. DwmFlush is
                         // disabled by default (see USE_DWMFLUSH in GL_DrawFrame)
                         // because it was the primary cause of the periodic
                         // ~30-second video+audio dropouts: DwmFlush occasionally
                         // blocks for 2 vblanks during DWM internal maintenance.
                         // SetDwmSyncMode(false) is called unconditionally below
-                        // to ensure the GL swap interval is 1 in both modes;
-                        // SetDwmSyncMode(true) is never called when DwmFlush is
-                        // disabled, so the interval stays at 1 and SwapBuffers
-                        // blocks at vblank exactly as it does in fullscreen mode.
+                        // to (re-)post the correct interval for the GL context
+                        // that was just (re)created; SetDwmSyncMode(true) is
+                        // never called when DwmFlush is disabled.
                         MonitorSync::SetDwmSyncMode(false);
                 }
 
