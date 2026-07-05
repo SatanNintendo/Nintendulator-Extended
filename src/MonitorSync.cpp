@@ -193,8 +193,59 @@ static void DXGI_Release(void* p)
 // that match on WM_DISPLAYCHANGE / window move. Not implemented here --
 // no evidence yet that this project's reported issue involves more than
 // one monitor.
+// P39 (session 16): kill switch for the entire P28 DXGI-vblank-bypass
+// architecture (InitDXGI/VBlankThreadProc/WaitForDXGIVBlank/g_DXGISwapInterval=0).
+//
+// Sessions 12-15 chased this architecture through four rounds of fixes
+// (P33 hybrid-graphics adapter enumeration, P34 failure-reason logging,
+// P36 fullscreen gating, P37 stale-output HRESULT checking, P38 isolating
+// wglMakeCurrent(NULL) from OnFrameEnd) and NONE of them fixed the user's
+// actual symptom: a permanent ~5-6x frame time inflation (~90-100ms per
+// frame instead of ~16.6ms), reproducing in every window mode, that does
+// not clear up on its own. The session-16 log, with P38's split columns,
+// shows the stall is not concentrated in any single call -- it's spread
+// across BOTH `swap` (SwapBuffers + WaitForDXGIVBlank, ~75-83ms) AND `mcr`
+// (wglMakeCurrent(NULL), ~16.7ms on top) simultaneously, while `ofe`
+// (OnFrameEnd alone) is a confirmed, consistent 0.00ms. A single buggy
+// call would show the delay concentrated in ONE column; a delay smeared
+// across two completely different, unrelated Win32/GL calls, always
+// summing to roughly the same ~90-100ms total, points to something more
+// fundamental than any individual call: most plausibly a genuine present-
+// queue backlog (frames queuing up on the GPU faster than the display can
+// retire them) that the CPU thread ends up waiting out at whichever call
+// happens to touch the GPU/context next -- which this architecture's own
+// mixing of "wait ourselves" (interval=0 + WaitForDXGIVBlank) with the
+// driver's own internal queuing was never designed to prevent, and the
+// already-documented KNOWN LIMITATION (the cached IDXGIOutput* is never
+// matched to the monitor the window is actually on) means the vblank
+// we're waiting for may not even be the right one on multi-monitor
+// systems, silently decoupling our own pacing from the real display.
+//
+// Rather than attempt a fifth targeted fix on unfamiliar hardware with no
+// way to test locally, this switch reverts the whole feature to OFF:
+// InitDXGI() now always fails immediately and cleanly, exactly as if
+// DXGI/WaitForVBlank were unavailable on this machine. That collapses the
+// pacing model back to the simple, well-understood path that predates
+// P28 entirely: plain OpenGL vsync via wglSwapIntervalEXT(1), no custom
+// polling thread, no explicit wait call, no interval=0. SwapBuffers()
+// itself blocks until the real vblank, using the same driver mechanism
+// every other OpenGL application on Windows relies on. The original P28
+// motivation (an occasional ~20-30s DWM-composited-vsync stutter) is a
+// far smaller problem than a permanent 5-6x slowdown, so this is a net
+// improvement until DXGI bypass can be redesigned and actually verified
+// against real hardware rather than iterated on blind from timing logs.
+static const bool g_DXGIBypassKillSwitch = true;
+
 static bool InitDXGI()
 {
+    if (g_DXGIBypassKillSwitch)
+    {
+        g_DXGITried = true;
+        g_DXGIAvailable = false;
+        g_DXGIFailReason = _T("disabled (P39: DXGI vblank bypass reverted after repeated unresolved regressions -- see comment above InitDXGI)");
+        return false;
+    }
+
     if (g_DXGITried) return g_DXGIAvailable;
     g_DXGITried = true; // mark so we never retry on failure
 
