@@ -341,9 +341,18 @@ static bool           g_VSyncActive  = false;
 // Calibration: refine g_MonitorHz by sampling frame-to-frame QPC deltas.
 // ------------------------------------------------------------------
 static const int      CALIB_FRAMES    = 60;
+static const int      CALIB_REJECT_SNAP_AFTER = 3;  // P41: consecutive agreeing rejections before hard-snap
 static int            g_CalibCount    = 0;
 static LARGE_INTEGER  g_CalibStartQPC = {0, 0};
 static bool           g_CalibActive   = false;
+
+// P41 (session 18): track consecutive calibration windows that all
+// disagree with g_MonitorHz by more than the 2Hz noise-rejection
+// tolerance, so a SUSTAINED mismatch (the seed was simply wrong) can be
+// told apart from a one-off noisy window (a single hiccup). See the
+// comment inside OnFrameEnd() for the full rationale.
+static int            g_CalibRejectCount = 0;
+static double         g_CalibRejectRefHz = 0.0;
 
 // QPC timestamp of last OnFrameEnd() call; used by PaceFrame() for
 // drift correction.
@@ -456,6 +465,8 @@ void OnDisplayChange()
 
     g_CalibCount = 0;
     g_CalibStartQPC.QuadPart = 0;
+    g_CalibRejectCount = 0;
+    g_CalibRejectRefHz = 0.0;
     g_CalibActive = IsEnabled();
 }
 
@@ -563,6 +574,8 @@ void ResetState()
 {
     g_CalibCount = 0;
     g_CalibStartQPC.QuadPart = 0;
+    g_CalibRejectCount = 0;
+    g_CalibRejectRefHz = 0.0;
     g_CalibActive = true;
     g_LastFrameEndQPC.QuadPart = 0;
 }
@@ -618,10 +631,64 @@ void OnFrameEnd()
                     {
                         if (fabs(measuredHz - g_MonitorHz) > 2.0)
                         {
+                            // P41 (session 18): this branch used to just
+                            // discard the sample and restart the window,
+                            // forever, with no way to ever leave. That
+                            // was fine for its original purpose -- ignore
+                            // ONE noisy window (a hiccup, a dropped frame)
+                            // -- but it could not tell a one-off outlier
+                            // apart from every single window consistently
+                            // reporting a DIFFERENT real rate, which is
+                            // exactly what happens when the seed value
+                            // (from GetDisplayFrequencyFromEnum() in
+                            // Init()) is simply wrong for the monitor the
+                            // game window is actually on -- confirmed by
+                            // the session-17 log: real frame pacing at
+                            // ~13.2ms/frame (~75Hz) while g_MonitorHz sat
+                            // at exactly 60.0000 forever, because 75-60=15
+                            // is always >2Hz away and got rejected every
+                            // single window. DRC/MMR then has no chance:
+                            // it's compensating for the wrong gap.
+                            //
+                            // Fix: track consecutive rejected windows. If
+                            // several IN A ROW cluster near each other
+                            // (i.e. this isn't random noise, it's the same
+                            // "wrong" number showing up again and again),
+                            // treat it as the real rate and snap to it
+                            // directly instead of slow-blending -- the
+                            // seed was wrong, not the display.
+                            if (g_CalibRejectCount == 0 ||
+                                fabs(measuredHz - g_CalibRejectRefHz) <= 1.0)
+                            {
+                                g_CalibRejectRefHz = (g_CalibRejectCount == 0)
+                                        ? measuredHz
+                                        : 0.5 * g_CalibRejectRefHz + 0.5 * measuredHz;
+                                g_CalibRejectCount++;
+
+                                if (g_CalibRejectCount >= CALIB_REJECT_SNAP_AFTER)
+                                {
+                                    g_MonitorHz = g_CalibRejectRefHz;
+                                    g_CalibRejectCount = 0;
+                                    g_CalibRejectRefHz = 0.0;
+                                }
+                            }
+                            else
+                            {
+                                // This rejection doesn't agree with the
+                                // previous one(s) either -- genuine noise,
+                                // not a sustained rate change. Start a
+                                // fresh streak from this sample.
+                                g_CalibRejectCount = 1;
+                                g_CalibRejectRefHz = measuredHz;
+                            }
                             g_CalibCount = 0;
                             g_CalibStartQPC = now;
                             return;
                         }
+                        // Measurement agrees with the current estimate --
+                        // normal fine-tuning, and any pending reject
+                        // streak was clearly noise, not a real trend.
+                        g_CalibRejectCount = 0;
                         // 90/10 low-pass filter
                         g_MonitorHz = 0.9 * g_MonitorHz + 0.1 * measuredHz;
                     }
