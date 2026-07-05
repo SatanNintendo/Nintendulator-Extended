@@ -701,8 +701,29 @@ static void DiagCompleteFrame(LONGLONG t3, LONGLONG t4)
         // mcr AND ofe would show elevated, near-random splits between them
         // from frame to frame, since starvation can land the descheduling
         // point anywhere).
-        if (swapMs > DIAG_STALL_MS || texMs > DIAG_STALL_MS || mcrMs > DIAG_STALL_MS || ofeMs > DIAG_STALL_MS || drcMs > DIAG_STALL_MS)
+        // P42 (session 19): the stall-triggered dump above is exactly the
+        // wrong tool for watching P41's calibration converge -- once P39
+        // fixed the main slowdown, real stalls became rare, so the log
+        // file just sits forever on whichever dump fired first (almost
+        // always the frame-2 startup texture/shader warmup, at which
+        // point calibration hasn't completed even one 60-frame window
+        // yet, let alone the 3 windows P41 needs to snap). Every log the
+        // user has sent since P39 has been this same stale frame-2 dump,
+        // not a "calibration isn't converging" result. Force one dump
+        // periodically as well, purely to keep the "Live calibrated
+        // monitor Hz" header line current -- DiagDumpLogAsync's existing
+        // 3-second cooldown keeps this cheap.
+        static LONGLONG s_diagLastPeriodicQPC = 0;
+        LONGLONG nowQPC = s_diagBuf[idx].t4;
+        bool periodicDue = (s_diagLastPeriodicQPC == 0) ||
+                ((double)(nowQPC - s_diagLastPeriodicQPC) / freq >= 10.0);
+
+        if (swapMs > DIAG_STALL_MS || texMs > DIAG_STALL_MS || mcrMs > DIAG_STALL_MS || ofeMs > DIAG_STALL_MS || drcMs > DIAG_STALL_MS || periodicDue)
+        {
+                if (periodicDue)
+                        s_diagLastPeriodicQPC = nowQPC;
                 DiagDumpLogAsync();
+        }
 }
 
 static void GL_DrawFrame(void)
