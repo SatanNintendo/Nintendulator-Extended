@@ -493,6 +493,7 @@ struct FrameTimingEntry {
         LONGLONG t0;        // entry to GL_DrawFrame
         LONGLONG t1;        // after glTexSubImage2D
         LONGLONG t2;        // after SwapBuffers
+        LONGLONG t2b;       // after wglMakeCurrent(NULL, NULL) -- P38 (session 15)
         LONGLONG t3;        // after OnFrameEnd (filled in DrawScreen)
         LONGLONG t4;        // after UpdateDRC  (filled in DrawScreen)
         DWORD    frameNum;
@@ -529,7 +530,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         _ftprintf(f, _T("DXGI vblank bypass active: %s\n"),
                 MonitorSync::HasDXGIVBlank() ? _T("YES") : _T("NO (falling back to DWM-composited vsync)"));
         _ftprintf(f, _T("DXGI init detail: %s\n"), MonitorSync::GetDXGIFailReason());
-        _ftprintf(f, _T("Columns: frame | t0->t1(texUpload) | t1->t2(SwapBuf) | t2->t3(OnFrameEnd) | t3->t4(UpdateDRC) | total(t0->t4)\n\n"));
+        _ftprintf(f, _T("Columns: frame | t0->t1(texUpload) | t1->t2(SwapBuf) | t2->t2b(MakeCurrentNULL) | t2b->t3(OnFrameEnd) | t3->t4(UpdateDRC) | total(t0->t4)\n\n"));
 
         // Walk the circular buffer from oldest to newest
         for (int i = 0; i < DIAG_FRAMES; i++)
@@ -538,18 +539,20 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 const FrameTimingEntry &e = buf[idx];
                 if (e.frameNum == 0 || e.t4 == 0) continue;
 
-                double d01 = (e.t1 - e.t0) * 1000.0 / freq;  // texUpload ms
-                double d12 = (e.t2 - e.t1) * 1000.0 / freq;  // SwapBuffers ms
-                double d23 = (e.t3 - e.t2) * 1000.0 / freq;  // OnFrameEnd ms
-                double d34 = (e.t4 - e.t3) * 1000.0 / freq;  // UpdateDRC ms
-                double dtot= (e.t4 - e.t0) * 1000.0 / freq;  // total ms
+                double d01 = (e.t1  - e.t0)  * 1000.0 / freq;  // texUpload ms
+                double d12 = (e.t2  - e.t1)  * 1000.0 / freq;  // SwapBuffers ms
+                double d2b = (e.t2b - e.t2)  * 1000.0 / freq;  // wglMakeCurrent(NULL) ms -- P38
+                double d23 = (e.t3  - e.t2b) * 1000.0 / freq;  // OnFrameEnd ms (isolated, P38)
+                double d34 = (e.t4  - e.t3)  * 1000.0 / freq;  // UpdateDRC ms
+                double dtot= (e.t4  - e.t0)  * 1000.0 / freq;  // total ms
 
                 // Mark stalled stages with '*'
                 _ftprintf(f,
-                        _T("F%06u  tex=%6.2f%s  swap=%7.2f%s  ofe=%6.2f%s  drc=%6.2f%s  tot=%7.2f%s\n"),
+                        _T("F%06u  tex=%6.2f%s  swap=%7.2f%s  mcr=%7.2f%s  ofe=%6.2f%s  drc=%6.2f%s  tot=%7.2f%s\n"),
                         e.frameNum,
                         d01, (d01 > DIAG_STALL_MS ? _T("*") : _T(" ")),
                         d12, (d12 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                        d2b, (d2b > DIAG_STALL_MS ? _T("*") : _T(" ")),
                         d23, (d23 > DIAG_STALL_MS ? _T("*") : _T(" ")),
                         d34, (d34 > DIAG_STALL_MS ? _T("*") : _T(" ")),
                         dtot,(dtot > DIAG_STALL_MS * 1.5 ? _T("*") : _T(" "))
@@ -646,10 +649,11 @@ static void DiagCompleteFrame(LONGLONG t3, LONGLONG t4)
 
         // Stall check: SwapBuffers duration > DIAG_STALL_MS
         double freq = DiagQPCFreq();
-        double swapMs = (s_diagBuf[idx].t2 - s_diagBuf[idx].t1) * 1000.0 / freq;
-        double texMs  = (s_diagBuf[idx].t1 - s_diagBuf[idx].t0) * 1000.0 / freq;
-        double ofeMs  = (s_diagBuf[idx].t3 - s_diagBuf[idx].t2) * 1000.0 / freq;
-        double drcMs  = (s_diagBuf[idx].t4 - s_diagBuf[idx].t3) * 1000.0 / freq;
+        double swapMs = (s_diagBuf[idx].t2  - s_diagBuf[idx].t1)  * 1000.0 / freq;
+        double texMs  = (s_diagBuf[idx].t1  - s_diagBuf[idx].t0)  * 1000.0 / freq;
+        double mcrMs  = (s_diagBuf[idx].t2b - s_diagBuf[idx].t2)  * 1000.0 / freq;
+        double ofeMs  = (s_diagBuf[idx].t3  - s_diagBuf[idx].t2b) * 1000.0 / freq;
+        double drcMs  = (s_diagBuf[idx].t4  - s_diagBuf[idx].t3)  * 1000.0 / freq;
 
         // P35: ofeMs (OnFrameEnd duration) was computed for display in the
         // log columns but never included in the trigger condition below.
@@ -662,7 +666,26 @@ static void DiagCompleteFrame(LONGLONG t3, LONGLONG t4)
         // separately tripped the tex>DIAG_STALL_MS branch. Any OnFrameEnd
         // stall during normal play, with tex/swap/drc all under threshold,
         // would previously have been invisible to this logger.
-        if (swapMs > DIAG_STALL_MS || texMs > DIAG_STALL_MS || ofeMs > DIAG_STALL_MS || drcMs > DIAG_STALL_MS)
+        //
+        // P38 (session 15): sessions 13/14's logs kept showing a ~90-100ms
+        // stall attributed to "ofe" even though OnFrameEnd() itself is
+        // pure QueryPerformanceCounter arithmetic with zero blocking calls
+        // -- and the same pattern reproduced in plain windowed mode with no
+        // fullscreen transition involved at all, which rules out both P36
+        // (fullscreen WaitForDXGIVBlank gating) and P37 (stale DXGI output
+        // after ChangeDisplaySettingsEx) as the cause. The one call that
+        // WAS silently folded into the old t2->t3 "ofe" bucket without ever
+        // being measured on its own is wglMakeCurrent(NULL, NULL) right
+        // after SwapBuffers -- some GL drivers defer the actual present
+        // wait from SwapBuffers to the NEXT call that touches the context,
+        // which would land exactly here. t2b isolates that call so the
+        // next log tells us definitively whether it's the culprit (mcr
+        // stalls, ofe stays near zero) or whether the real cause is
+        // something else entirely, e.g. generic thread starvation (both
+        // mcr AND ofe would show elevated, near-random splits between them
+        // from frame to frame, since starvation can land the descheduling
+        // point anywhere).
+        if (swapMs > DIAG_STALL_MS || texMs > DIAG_STALL_MS || mcrMs > DIAG_STALL_MS || ofeMs > DIAG_STALL_MS || drcMs > DIAG_STALL_MS)
                 DiagDumpLogAsync();
 }
 
@@ -680,6 +703,7 @@ static void GL_DrawFrame(void)
                 s_diagBuf[idx].t0       = diagT0;
                 s_diagBuf[idx].t1       = 0;
                 s_diagBuf[idx].t2       = 0;
+                s_diagBuf[idx].t2b      = 0;
                 s_diagBuf[idx].t3       = 0;
                 s_diagBuf[idx].t4       = 0;
                 s_diagBuf[idx].frameNum = s_diagFrameNum;
@@ -1044,6 +1068,17 @@ static void GL_DrawFrame(void)
         }
 
         wglMakeCurrent(NULL, NULL);
+
+        // P38 (session 15): diagnostic t2b, right after context release.
+        // See DiagCompleteFrame for why this exists -- isolates the cost
+        // of this specific call from OnFrameEnd()'s own (verified-cheap)
+        // arithmetic, which previously shared the same "ofe" bucket.
+        if (MatchMonitorRate)
+        {
+                LARGE_INTEGER qpc2; QueryPerformanceCounter(&qpc2);
+                int idx2 = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+                s_diagBuf[idx2].t2b = qpc2.QuadPart;
+        }
 }
 
 #define Try(action,errormsg) do {\
