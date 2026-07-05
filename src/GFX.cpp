@@ -1362,6 +1362,13 @@ void    Start (void)
 
                                 // Activate exclusive mode without changing resolution
                                 ChangeDisplaySettingsEx(NULL, &SavedDisplayMode, NULL, CDS_FULLSCREEN, NULL);
+                                // P37 (session 14): same rationale as the restore call
+                                // in Stop() -- this mode switch can invalidate the
+                                // cached IDXGIOutput*, so get a fresh one now, before
+                                // GL_DrawFrame starts calling WaitForDXGIVBlank() against
+                                // whatever InitDXGI() found back when the process (or the
+                                // previous windowed session) started.
+                                MonitorSync::ReacquireDXGIOutput();
                         }
 
                         SetWindowLongPtr(hMainWnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
@@ -1628,6 +1635,15 @@ void    Stop (void)
                 {
                         ChangeDisplaySettingsEx(NULL, NULL, NULL, 0, NULL);
                         HasSavedDisplayMode = FALSE;
+                        // P37 (session 14): ChangeDisplaySettingsEx can invalidate
+                        // the IDXGIOutput* cached by MonitorSync's P28 DXGI vblank
+                        // bypass, leaving the background poller thread spinning on
+                        // a dead pointer for the rest of the process -- see the
+                        // ReacquireDXGIOutput() header comment for the full story.
+                        // Get a fresh output now that the real display mode change
+                        // has actually happened, before the windowed GL context
+                        // starts drawing frames again.
+                        MonitorSync::ReacquireDXGIOutput();
                 }
                 // Reset MonitorSync QPC baseline before destroying the GL context.
                 // Without this, PaceFrame() computes elapsed time from the old

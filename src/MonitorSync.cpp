@@ -715,9 +715,49 @@ static DWORD WINAPI VBlankThreadProc(void*)
         if (g_pDXGIOutput)
         {
             void** vtbl = *(void***)g_pDXGIOutput;
-            ((PFN_WaitForVBlank)vtbl[10])(g_pDXGIOutput);
-            if (g_VBlankEvent)
-                SetEvent(g_VBlankEvent);
+            // P37 (session 14): the HRESULT was never checked. If the
+            // cached IDXGIOutput* becomes stale -- the confirmed trigger
+            // is ExclusiveFullscreen's ChangeDisplaySettingsEx() call in
+            // GFX::Start()/Stop(), which can invalidate the adapter/output
+            // pair obtained before the mode switch -- WaitForVBlank()
+            // starts failing and returning almost instantly instead of
+            // blocking for ~16.6ms. With no check, this loop then spun as
+            // fast as the CPU allows at THREAD_PRIORITY_HIGHEST, calling
+            // SetEvent() on every near-instant "failure" as if a real
+            // vblank had just happened. Two visible symptoms, both
+            // confirmed by the session-13/14 timing logs:
+            //   - swap (WaitForDXGIVBlank on the NES thread) reads ~0.01ms
+            //     every frame, because the auto-reset event is already
+            //     signalled by the time the NES thread checks it -- the
+            //     spin loop fires it far faster than any real 60Hz vblank.
+            //   - ofe/tot balloon to ~90-100ms on nearly every frame, not
+            //     because OnFrameEnd() itself blocks (it's pure QueryPerformanceCounter
+            //     arithmetic -- see OnFrameEnd() below) but because this
+            //     thread, spinning flat-out at HIGHEST priority with zero
+            //     yields, starves the NES thread of scheduler time.
+            // This also explains why the slowdown outlives the fullscreen
+            // session: g_DXGITried latches true forever after the first
+            // InitDXGI() call, so the stale pointer is never re-acquired,
+            // and this thread keeps spinning on it for the rest of the
+            // process -- in fullscreen AND after returning to windowed.
+            //
+            // Fix: check the HRESULT. On failure, do NOT SetEvent() (that
+            // would still fake a vblank signal) -- back off with a short
+            // Sleep so the thread stops fighting the NES thread for CPU
+            // time, and let the caller side (GFX.cpp, around the
+            // ChangeDisplaySettingsEx calls) actively re-acquire a fresh
+            // output via MonitorSync::ReacquireDXGIOutput() rather than
+            // silently spinning on the broken one indefinitely.
+            HRESULT hr = ((PFN_WaitForVBlank)vtbl[10])(g_pDXGIOutput);
+            if (SUCCEEDED(hr))
+            {
+                if (g_VBlankEvent)
+                    SetEvent(g_VBlankEvent);
+            }
+            else
+            {
+                Sleep(8);
+            }
         }
         else
         {
@@ -793,6 +833,49 @@ void WaitForDXGIVBlank()
     if (deadlineMs < 20) deadlineMs = 20;
     if (deadlineMs > 50) deadlineMs = 50;
     WaitForSingleObject(g_VBlankEvent, deadlineMs);
+}
+
+// P37 (session 14): re-acquire a fresh IDXGIOutput* after a real display
+// mode change. See the header comment on the declaration for the full
+// rationale; in short, InitDXGI() intentionally latches its result
+// forever to avoid retrying on machines where DXGI is genuinely
+// unavailable, but that means a previously-good output that goes stale
+// mid-session (confirmed trigger: ExclusiveFullscreen's
+// ChangeDisplaySettingsEx() in GFX::Start()/Stop()) was never replaced,
+// and the vblank thread kept spinning on the dead pointer -- with the
+// P37 HRESULT check above, it now backs off instead of spinning, but it
+// still can't recover a working vblank signal on its own. This function
+// does the actual recovery: stop the thread, release the old COM
+// objects, clear every "already tried" flag, and -- if MMR is currently
+// on -- immediately redo InitDXGI() and restart the thread so the very
+// next frame gets a real vblank wait again instead of the ~25ms timeout
+// path (WaitForDXGIVBlank degrades gracefully either way, but a fresh
+// output is what actually fixes the pacing rather than just bounding
+// the damage).
+void ReacquireDXGIOutput()
+{
+    if (!g_Initialized) return;
+
+    bool wasEnabled = IsEnabled();
+
+    StopVBlankThread();
+
+    if (g_pDXGIOutput)  { DXGI_Release(g_pDXGIOutput);  g_pDXGIOutput  = NULL; }
+    if (g_pDXGIAdapter) { DXGI_Release(g_pDXGIAdapter); g_pDXGIAdapter = NULL; }
+    if (g_pDXGIFactory) { DXGI_Release(g_pDXGIFactory); g_pDXGIFactory = NULL; }
+
+    g_DXGITried      = false;
+    g_DXGIAvailable  = false;
+    g_DXGIFailReason = _T("not attempted yet");
+    InterlockedExchange(&g_DXGISwapInterval, 1L);
+
+    if (!wasEnabled)
+        return; // MMR off right now -- leave clean state for the next Enable(TRUE)
+
+    InitDXGI();
+    LONG desiredInterval = InterlockedExchangeAdd(&g_DXGISwapInterval, 0L);
+    InterlockedExchange(&g_PendingVSyncInterval, desiredInterval);
+    StartVBlankThread();
 }
 
 } // namespace MonitorSync

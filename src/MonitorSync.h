@@ -141,6 +141,24 @@ namespace MonitorSync
         bool    HasDXGIVBlank ();
         void    WaitForDXGIVBlank ();
 
+        // P37 (session 14): call this around any real display-mode switch
+        // that can invalidate the cached IDXGIOutput* -- confirmed trigger
+        // is ExclusiveFullscreen's ChangeDisplaySettingsEx() call in
+        // GFX::Start() (entering) and GFX::Stop() (leaving). Before this
+        // existed, InitDXGI() ran exactly once per process and latched its
+        // result forever (by design, to avoid retry storms on machines
+        // where DXGI is genuinely unavailable) -- but that also meant a
+        // *previously working* IDXGIOutput* that goes stale mid-session
+        // was never replaced, and VBlankThreadProc span at full CPU on the
+        // broken pointer for the rest of the process's life, in fullscreen
+        // and after returning to windowed alike. This stops the vblank
+        // thread, releases the cached factory/adapter/output, clears the
+        // "tried" latch, and -- if MMR is currently enabled -- immediately
+        // re-runs InitDXGI() and restarts the thread against a fresh
+        // output. Safe to call even if MMR is off or DXGI was never
+        // available (degrades to a cheap no-op in that case).
+        void    ReacquireDXGIOutput ();
+
         // P34: human-readable reason InitDXGI() succeeded or failed --
         // e.g. "LoadLibraryW(dxgi.dll) failed", "no adapter had an output
         // (tried 2 adapter(s), 2 had zero outputs)", or "OK (found output
