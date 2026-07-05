@@ -530,6 +530,22 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         _ftprintf(f, _T("DXGI vblank bypass active: %s\n"),
                 MonitorSync::HasDXGIVBlank() ? _T("YES") : _T("NO (falling back to DWM-composited vsync)"));
         _ftprintf(f, _T("DXGI init detail: %s\n"), MonitorSync::GetDXGIFailReason());
+        // P40 (session 17): with the P39 rollback, real stalls are rare, so
+        // dumps (which only fire when a column exceeds DIAG_STALL_MS) are
+        // now rare too -- but the user's remaining symptom is a periodic
+        // scroll judder consistent with an uncorrected NES-vs-monitor Hz
+        // drift (NES ~60.0988Hz native, this monitor reports 60Hz), which
+        // MatchMonitorRate's DRC (APU::UpdateDRC, driven by
+        // MonitorSync::GetMonitorHz()) exists specifically to correct via
+        // a small audio pitch shift. Printing the live calibrated value on
+        // every dump -- even ones triggered by something unrelated -- lets
+        // us see across several dumps over a play session whether it is
+        // converging toward the real display rate (good: DRC is working,
+        // the remaining judder is a separate/residual issue) or sitting at
+        // a suspicious round number like exactly 60.0 (bad: calibration
+        // never ran or never moved, so DRC is not correcting anything).
+        _ftprintf(f, _T("Live calibrated monitor Hz: %.4f (NES native: %.4f)\n"),
+                MonitorSync::GetMonitorHz(), MonitorSync::GetNESHz());
         _ftprintf(f, _T("Columns: frame | t0->t1(texUpload) | t1->t2(SwapBuf) | t2->t2b(MakeCurrentNULL) | t2b->t3(OnFrameEnd) | t3->t4(UpdateDRC) | total(t0->t4)\n\n"));
 
         // Walk the circular buffer from oldest to newest
