@@ -546,7 +546,29 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         // never ran or never moved, so DRC is not correcting anything).
         _ftprintf(f, _T("Live calibrated monitor Hz: %.4f (NES native: %.4f)\n"),
                 MonitorSync::GetMonitorHz(), MonitorSync::GetNESHz());
-        _ftprintf(f, _T("Columns: frame | t0->t1(texUpload) | t1->t2(SwapBuf) | t2->t2b(MakeCurrentNULL) | t2b->t3(OnFrameEnd) | t3->t4(UpdateDRC) | total(t0->t4)\n\n"));
+        _ftprintf(f, _T("Columns: frame | gap(t0[n]->t0[n-1], TRUE frame-to-frame period incl. unmeasured CPU/PPU/APU time -- P43) | t0->t1(texUpload) | t1->t2(SwapBuf) | t2->t2b(MakeCurrentNULL) | t2b->t3(OnFrameEnd) | t3->t4(UpdateDRC) | total(t0->t4, video-draw slice only)\n\n"));
+
+        // P43 (session 20): t0->t4 only spans GL_DrawFrame+OnFrameEnd+
+        // UpdateDRC -- the video-draw slice of a frame. It does NOT cover
+        // CPU::ExecOp/PPU rendering/APU::Run/PaceFrame, which all run on
+        // the same NES thread BEFORE GL_DrawFrame is even called for the
+        // next frame. Session 19's log showed "tot" consistently well
+        // under one real vblank period (~9.7-12ms vs. an expected ~16.67ms
+        // at this monitor's confirmed 59.9986Hz) -- that is NOT a bug by
+        // itself: if CPU/PPU/APU work already consumed several ms of the
+        // vblank budget before GL_DrawFrame was reached, SwapBuffers only
+        // needs to wait out the REMAINDER, so "tot" reading under 16.67ms
+        // is expected and fine on its own. What "tot" can never show is
+        // the one thing that actually matters for a visible stutter: the
+        // TRUE frame-to-frame period, including that unmeasured CPU/PPU/
+        // APU time. This new "gap" column is exactly that -- the distance
+        // between this frame's t0 and the PREVIOUS logged frame's t0 --
+        // and is where a real dropped/duplicated video frame (the kind
+        // that would actually look like a scroll stutter) will show up:
+        // a gap far from ~16.67ms, regardless of how the t0->t4 slice
+        // inside it happens to be split.
+        LONGLONG prevT0 = 0;
+        bool     havePrevT0 = false;
 
         // Walk the circular buffer from oldest to newest
         for (int i = 0; i < DIAG_FRAMES; i++)
@@ -560,19 +582,47 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 double d2b = (e.t2b - e.t2)  * 1000.0 / freq;  // wglMakeCurrent(NULL) ms -- P38
                 double d23 = (e.t3  - e.t2b) * 1000.0 / freq;  // OnFrameEnd ms (isolated, P38)
                 double d34 = (e.t4  - e.t3)  * 1000.0 / freq;  // UpdateDRC ms
-                double dtot= (e.t4  - e.t0)  * 1000.0 / freq;  // total ms
+                double dtot= (e.t4  - e.t0)  * 1000.0 / freq;  // total ms (video-draw slice only)
+
+                bool   haveGap = havePrevT0;
+                double dgap = haveGap ? (e.t0 - prevT0) * 1000.0 / freq : 0.0;
+                prevT0 = e.t0;
+                havePrevT0 = true;
+
+                // A real dropped/duplicated frame shows up as a gap far
+                // from one vblank period (~16.67ms at 60Hz) in EITHER
+                // direction -- flag anything more than 8ms off center,
+                // not just "too slow": a too-SHORT gap means two video
+                // frames got drawn within one real vblank (one of them
+                // presumably invisible), which is just as much a visible
+                // stutter as a dropped one.
+                double centerMs   = (MonitorSync::GetMonitorHz() > 1.0) ? 1000.0 / MonitorSync::GetMonitorHz() : 16.667;
+                bool   gapStalled = haveGap && (fabs(dgap - centerMs) > 8.0);
 
                 // Mark stalled stages with '*'
-                _ftprintf(f,
-                        _T("F%06u  tex=%6.2f%s  swap=%7.2f%s  mcr=%7.2f%s  ofe=%6.2f%s  drc=%6.2f%s  tot=%7.2f%s\n"),
-                        e.frameNum,
-                        d01, (d01 > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                        d12, (d12 > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                        d2b, (d2b > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                        d23, (d23 > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                        d34, (d34 > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                        dtot,(dtot > DIAG_STALL_MS * 1.5 ? _T("*") : _T(" "))
-                );
+                if (haveGap)
+                        _ftprintf(f,
+                                _T("F%06u  gap=%7.2f%s  tex=%6.2f%s  swap=%7.2f%s  mcr=%7.2f%s  ofe=%6.2f%s  drc=%6.2f%s  tot=%7.2f%s\n"),
+                                e.frameNum,
+                                dgap, (gapStalled ? _T("*") : _T(" ")),
+                                d01, (d01 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                d12, (d12 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                d2b, (d2b > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                d23, (d23 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                d34, (d34 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                dtot,(dtot > DIAG_STALL_MS * 1.5 ? _T("*") : _T(" "))
+                        );
+                else
+                        _ftprintf(f,
+                                _T("F%06u  gap=    n/a   tex=%6.2f%s  swap=%7.2f%s  mcr=%7.2f%s  ofe=%6.2f%s  drc=%6.2f%s  tot=%7.2f%s\n"),
+                                e.frameNum,
+                                d01, (d01 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                d12, (d12 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                d2b, (d2b > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                d23, (d23 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                d34, (d34 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                dtot,(dtot > DIAG_STALL_MS * 1.5 ? _T("*") : _T(" "))
+                        );
         }
         fclose(f);
 }
