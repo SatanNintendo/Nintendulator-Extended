@@ -50,6 +50,26 @@
 typedef HRESULT (WINAPI *PFN_DwmFlush)(void);
 static PFN_DwmFlush s_pfnDwmFlush = reinterpret_cast<PFN_DwmFlush>(1); // 1 = not yet loaded
 
+// P45 (session 22): moved up from its previous spot right above its use in
+// GL_DrawFrame so it's visible to the log-header diagnostic too (see
+// DiagOpenLogFile). Flipped 0 -> 1: session 21's log (after P44 removed the
+// per-frame wglMakeCurrent stall) showed `swap` reading ~0.00-0.03ms on
+// EVERY single frame for the whole windowed-mode session, both during and
+// after the ~13ms tex-upload stall block -- i.e. SwapBuffers is not
+// blocking on anything close to a real vblank, ever, in this window mode
+// session. With no GL-side backpressure at all, the only remaining pacing
+// mechanism was the DirectSound buffer-fill wait loop in APU::Run, which
+// is quantized to audiodg's own ~10ms service tick and produced a strict,
+// regular 20/20/10ms "gap" cadence (a 3:2-pulldown-style judder, not caught
+// by the >8ms single-frame anomaly threshold because no individual frame
+// deviates from ~16.67ms by that much -- the problem is the repeating
+// pattern itself, not any one frame). This is exactly the "frame doubling/
+// skipping on older drivers" case the comment above USE_DWMFLUSH in
+// GL_DrawFrame already anticipated and built a fix for. Re-enabling it is
+// scoped to windowed mode only (see the `if (MatchMonitorRate &&
+// !Fullscreen)` guard at its use site) -- fullscreen is untouched.
+#define USE_DWMFLUSH 1
+
 // After a fullscreen<->windowed transition, DWM restarts its composition
 // pipeline. The first DwmFlush() calls during this warm-up period can block
 // for more than one vblank (DWM is re-syncing its internal state), causing
@@ -585,6 +605,19 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         _ftprintf(f, _T("DXGI vblank bypass active: %s\n"),
                 MonitorSync::HasDXGIVBlank() ? _T("YES") : _T("NO (falling back to DWM-composited vsync)"));
         _ftprintf(f, _T("DXGI init detail: %s\n"), MonitorSync::GetDXGIFailReason());
+        // P45 (session 22): does wglSwapIntervalEXT(1) actually block
+        // SwapBuffers on this system? IsVSyncActive() reflects whether the
+        // driver *accepted and verified* the interval request -- it says
+        // nothing about whether the request actually produces real
+        // backpressure once DWM composition is in the picture (see the
+        // USE_DWMFLUSH comment block in GL_DrawFrame for why those are two
+        // different questions on Windows 7/8 with older drivers). Printed
+        // here so a log where `swap` reads ~0.00ms on every single frame
+        // can be cross-checked against whether the interval request even
+        // nominally succeeded.
+        _ftprintf(f, _T("GL vsync request verified by driver: %s   DwmFlush windowed-sync mode: %s\n"),
+                MonitorSync::IsVSyncActive() ? _T("YES") : _T("NO"),
+                (USE_DWMFLUSH ? _T("compiled IN") : _T("compiled OUT")));
         // P40 (session 17): with the P39 rollback, real stalls are rare, so
         // dumps (which only fire when a column exceeds DIAG_STALL_MS) are
         // now rare too -- but the user's remaining symptom is a periodic
@@ -1119,7 +1152,10 @@ static void GL_DrawFrame(void)
         // symptom it fixes. If frame doubling/skipping is observed on
         // a specific system, set USE_DWMFLUSH=1 to re-enable the old
         // DwmFlush path (with its warmup logic).
-#define USE_DWMFLUSH 0
+        //
+        // P45 (session 22): that is exactly what session 21's log showed
+        // in windowed mode -- see the USE_DWMFLUSH define near the top of
+        // this file for the data and reasoning. USE_DWMFLUSH is now 1.
 #if USE_DWMFLUSH
         if (MatchMonitorRate && !Fullscreen)
         {
