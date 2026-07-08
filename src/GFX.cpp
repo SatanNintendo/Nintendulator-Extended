@@ -618,6 +618,16 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         _ftprintf(f, _T("GL vsync request verified by driver: %s   DwmFlush windowed-sync mode: %s\n"),
                 MonitorSync::IsVSyncActive() ? _T("YES") : _T("NO"),
                 (USE_DWMFLUSH ? _T("compiled IN") : _T("compiled OUT")));
+        // P46 (session 23): so a log can be identified as windowed /
+        // borderless-fullscreen / exclusive-fullscreen at a glance, since
+        // as of this session those first two now share the same DwmFlush
+        // pacing path (see the P46 comment above the USE_DWMFLUSH guard in
+        // GL_DrawFrame) and are expected to behave the same way, while
+        // exclusive fullscreen deliberately does not use DwmFlush at all.
+        _ftprintf(f, _T("Window mode: %s\n"),
+                !Fullscreen ? _T("windowed") :
+                (ExclusiveFullscreen ? _T("fullscreen (exclusive, DwmFlush not used)")
+                                      : _T("fullscreen (borderless/DWM-composited, DwmFlush path applies)")));
         // P40 (session 17): with the P39 rollback, real stalls are rare, so
         // dumps (which only fire when a column exceeds DIAG_STALL_MS) are
         // now rare too -- but the user's remaining symptom is a periodic
@@ -1156,8 +1166,30 @@ static void GL_DrawFrame(void)
         // P45 (session 22): that is exactly what session 21's log showed
         // in windowed mode -- see the USE_DWMFLUSH define near the top of
         // this file for the data and reasoning. USE_DWMFLUSH is now 1.
+        //
+        // P46 (session 23): the guard below used to be `!Fullscreen`, which
+        // excludes BOTH fullscreen variants this codebase has:
+        //   - Fullscreen=true, ExclusiveFullscreen=false: a WS_POPUP window
+        //     sized to the screen (see ID_PPU_FULLSCREEN in Nintendulator.cpp)
+        //     -- still just a normal window as far as DWM is concerned, still
+        //     composited exactly like the windowed case P45 just fixed. There
+        //     is no reason this mode would behave any differently from
+        //     windowed mode with respect to wglSwapIntervalEXT(1) not
+        //     providing real backpressure under DWM -- it was excluded from
+        //     the P45 fix purely because the old guard tested the wrong flag.
+        //   - Fullscreen=true, ExclusiveFullscreen=true: calls
+        //     ChangeDisplaySettingsEx(..., CDS_FULLSCREEN, ...) (see
+        //     ID_PPU_EXCLUSIVEFS), a real exclusive display-mode switch that
+        //     bypasses DWM composition entirely. This is the one case where
+        //     DwmFlush is actually pointless (nothing is compositing us) and
+        //     could only add latency -- this is the case that should stay
+        //     excluded.
+        // Changed the condition to test ExclusiveFullscreen instead of
+        // Fullscreen so borderless fullscreen gets the same fix as windowed
+        // mode, while true exclusive fullscreen (the only mode where GL
+        // vsync alone should already be correct) is left untouched.
 #if USE_DWMFLUSH
-        if (MatchMonitorRate && !Fullscreen)
+        if (MatchMonitorRate && !ExclusiveFullscreen)
         {
                 // Lazy-load dwmapi.dll once.
                 if (s_pfnDwmFlush == reinterpret_cast<PFN_DwmFlush>(1))
