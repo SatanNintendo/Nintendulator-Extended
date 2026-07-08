@@ -379,6 +379,61 @@ static void GL_Destroy(void)
         UsingOpenGL = FALSE;
 }
 
+// ------------------------------------------------------------------
+// P44 (session 21) — stop binding/unbinding the GL context every frame.
+//
+// ROOT CAUSE (found via the P43 "gap" column + P38's isolated mcr/ofe
+// split, session 21 log analysis): GL_DrawFrame used to call
+// wglMakeCurrent(hGLDC, hGLRC) at entry and wglMakeCurrent(NULL, NULL)
+// right after SwapBuffers, every single frame. The P38 comment predicted
+// that some GL drivers defer the actual vblank-wait from SwapBuffers to
+// the NEXT call that touches the context -- and the logs confirm it
+// exactly: across 360 logged frames, "ofe" (OnFrameEnd, pure QPC math)
+// never once moved off 0.00ms, while "mcr" (this wglMakeCurrent(NULL,NULL)
+// call) swung from ~0.3ms up to sustained ~13ms blocks and isolated 17ms
+// spikes. A generically starved/descheduled thread would show BOTH
+// columns jittering; only one of them ever moving means the stall is
+// deterministically attached to this specific call, not to scheduling
+// in general. Those mcr spikes eat most of the frame's slack, and the
+// "gap" column shows the real symptom: periodic genuine dropped frames
+// (~2x period followed by a short catch-up gap) landing disproportionately
+// during those same low-slack windows -- the visible scroll stutter,
+// worse in windowed mode because DWM composition (unavoidable there) is
+// what makes the driver take this deferred-wait path in the first place.
+//
+// FIX: bind the context ONCE when the NES thread starts and release it
+// ONCE when the NES thread is about to exit, instead of every frame.
+// GL_DrawFrame no longer calls wglMakeCurrent at all in its hot path.
+// This is safe because:
+//   - GL_DrawFrame is only ever called from the NES thread (via
+//     DrawScreen, only reached from PPU.cpp during CPU::ExecOp, which
+//     only runs inside NES::Thread()'s loop).
+//   - Every UI-thread trigger that used to call wglMakeCurrent directly
+//     (WM_SIZE resize, ApplyGLFilter, MatchMonitorRate toggle) was
+//     already converted in earlier sessions to a deferred
+//     post-and-apply-in-GL_DrawFrame pattern specifically to avoid
+//     racing the NES thread's ownership of the context -- see the
+//     g_PendingResize / g_PendingBilinear comments above.
+//   - GFX::Stop() (which calls GL_Destroy(), the only other code path
+//     that touches hGLRC while a session might have been active) is
+//     only ever called from the UI thread AFTER NES::Stop() has fully
+//     joined the NES thread (NES::Stop()'s "while (Running) Sleep(1)"
+//     wait), so by the time GL_Destroy() tries to take the context back,
+//     ReleaseGLContext() has already run on the NES thread and the
+//     thread itself has exited. No two threads ever contend for hGLRC.
+// ------------------------------------------------------------------
+void AcquireGLContext(void)
+{
+        if (UsingOpenGL && hGLDC && hGLRC)
+                wglMakeCurrent(hGLDC, hGLRC);
+}
+
+void ReleaseGLContext(void)
+{
+        if (UsingOpenGL && hGLDC && hGLRC)
+                wglMakeCurrent(NULL, NULL);
+}
+
 // Called ONLY from the NES emulation thread (via ApplyPendingResize inside
 // GL_DrawFrame), where the GL context is already current. Never call directly
 // from the UI thread — use PostGLResize instead.
@@ -493,7 +548,7 @@ struct FrameTimingEntry {
         LONGLONG t0;        // entry to GL_DrawFrame
         LONGLONG t1;        // after glTexSubImage2D
         LONGLONG t2;        // after SwapBuffers
-        LONGLONG t2b;       // after wglMakeCurrent(NULL, NULL) -- P38 (session 15)
+        LONGLONG t2b;       // right after t2, no GL call between them as of P44 (session 21) -- see below
         LONGLONG t3;        // after OnFrameEnd (filled in DrawScreen)
         LONGLONG t4;        // after UpdateDRC  (filled in DrawScreen)
         DWORD    frameNum;
@@ -546,7 +601,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         // never ran or never moved, so DRC is not correcting anything).
         _ftprintf(f, _T("Live calibrated monitor Hz: %.4f (NES native: %.4f)\n"),
                 MonitorSync::GetMonitorHz(), MonitorSync::GetNESHz());
-        _ftprintf(f, _T("Columns: frame | gap(t0[n]->t0[n-1], TRUE frame-to-frame period incl. unmeasured CPU/PPU/APU time -- P43) | t0->t1(texUpload) | t1->t2(SwapBuf) | t2->t2b(MakeCurrentNULL) | t2b->t3(OnFrameEnd) | t3->t4(UpdateDRC) | total(t0->t4, video-draw slice only)\n\n"));
+        _ftprintf(f, _T("Columns: frame | gap(t0[n]->t0[n-1], TRUE frame-to-frame period incl. unmeasured CPU/PPU/APU time -- P43) | t0->t1(texUpload) | t1->t2(SwapBuf) | t2->t2b(should be ~0 as of P44, context no longer released here) | t2b->t3(OnFrameEnd) | t3->t4(UpdateDRC) | total(t0->t4, video-draw slice only)\n\n"));
 
         // P43 (session 20): t0->t4 only spans GL_DrawFrame+OnFrameEnd+
         // UpdateDRC -- the video-draw slice of a frame. It does NOT cover
@@ -801,7 +856,9 @@ static void GL_DrawFrame(void)
         for (int i = 0; i < 256 * 240; i++)
                 frameBuf[i] = Palette32[src[i]];
 
-        wglMakeCurrent(hGLDC, hGLRC);
+        // P44 (session 21): no per-frame wglMakeCurrent(hGLDC, hGLRC) here
+        // anymore -- AcquireGLContext() bound it once for the whole session
+        // (see NES::Thread()). The context is already current on this thread.
 
         // Apply any pending vsync interval change posted by MonitorSync::Enable()
         // from the UI thread. Must happen here, after wglMakeCurrent and before
@@ -1154,12 +1211,19 @@ static void GL_DrawFrame(void)
                 s_diagBuf[idx].t2 = qpc.QuadPart;
         }
 
-        wglMakeCurrent(NULL, NULL);
-
-        // P38 (session 15): diagnostic t2b, right after context release.
-        // See DiagCompleteFrame for why this exists -- isolates the cost
-        // of this specific call from OnFrameEnd()'s own (verified-cheap)
-        // arithmetic, which previously shared the same "ofe" bucket.
+        // P44 (session 21): no per-frame wglMakeCurrent(NULL, NULL) here
+        // anymore. This WAS the call the P38 diagnostic isolated as the
+        // actual stall point (some GL drivers defer the vblank-wait from
+        // SwapBuffers to the next call touching the context) -- session 21's
+        // "gap" log confirmed it: ofe stayed at 0.00ms on every one of 360
+        // frames while mcr swung up to sustained ~13ms blocks. Context now
+        // stays current for the whole NES-thread session (ReleaseGLContext()
+        // runs once, at thread exit -- see NES::Thread()), so there is no
+        // "next context touch" left in the hot path for the driver to defer
+        // its wait onto. t2b is kept as a pure QPC checkpoint (no GL call
+        // between t2 and t2b anymore) specifically so the next log makes
+        // this verifiable: d2b ("mcr") should now read ~0.00ms on every
+        // frame, the same way ofe always has.
         if (MatchMonitorRate)
         {
                 LARGE_INTEGER qpc2; QueryPerformanceCounter(&qpc2);

@@ -1183,6 +1183,13 @@ DWORD   WINAPI  Thread (void *param)
                 SetThreadPriority(GetCurrentThread(), prio);
         }
 
+        // P44 (session 21): bind the GL context ONCE for this thread's whole
+        // lifetime instead of every frame inside GL_DrawFrame. See the
+        // AcquireGLContext()/ReleaseGLContext() block comment in GFX.cpp for
+        // the full rationale. Must happen before anything below can reach
+        // CPU::ExecOp -> PPU -> GFX::DrawScreen -> GL_DrawFrame.
+        GFX::AcquireGLContext();
+
 #ifdef  CPU_BENCHMARK
         // Run with cyctest.nes
         int i;
@@ -1283,6 +1290,13 @@ DWORD   WINAPI  Thread (void *param)
         Movie::ShowFrame();
 
 #endif  /* CPU_BENCHMARK */
+        // P44 (session 21): release the GL context before this thread exits,
+        // mirroring AcquireGLContext() above. Must happen before Running is
+        // cleared -- NES::Stop() only returns (letting GFX::Stop()/GL_Destroy()
+        // proceed on the UI thread) once Running == FALSE, so this guarantees
+        // the context is already released by the time anything else tries to
+        // take it.
+        GFX::ReleaseGLContext();
         UpdateTitlebar();
         Running = FALSE;
         // If Stop was triggered from within the emulation thread

@@ -60,6 +60,11 @@ void    Repaint (void);
 void    GL_Resize (int, int);
 void    PostGLResize (int, int);   // thread-safe deferred resize (posts to NES thread)
 void    ApplyGLFilter (void);
+// P44 (session 21): bind/unbind the GL context ONCE per NES-thread session
+// instead of every frame. Called from NES::Thread() at start/end. See the
+// block comment above these functions' definitions in GFX.cpp for why.
+void    AcquireGLContext (void);
+void    ReleaseGLContext (void);
 BOOL    UseOpenGL (void);
 void    SyncMenuChecks (void);
 void    LoadPalette (PALETTE);
