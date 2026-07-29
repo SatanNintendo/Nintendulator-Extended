@@ -65,6 +65,11 @@ void    ApplyGLFilter (void);
 // block comment above these functions' definitions in GFX.cpp for why.
 void    AcquireGLContext (void);
 void    ReleaseGLContext (void);
+// P47: reset DwmFlush warmup/arm state. Called from MonitorSync::Enable(TRUE)
+// so cold starts (MMR on from registry) and runtime toggles also run the
+// 180-frame GL-vsync warmup before DwmFlush+interval=0 takes over. See
+// MATCH_MONITOR_RATE.md section 9.
+void    ResetDwmWarmup (void);
 BOOL    UseOpenGL (void);
 void    SyncMenuChecks (void);
 void    LoadPalette (PALETTE);

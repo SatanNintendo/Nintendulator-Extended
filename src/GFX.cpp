@@ -454,6 +454,40 @@ void ReleaseGLContext(void)
                 wglMakeCurrent(NULL, NULL);
 }
 
+// P47: reset the DwmFlush warmup / arm / sentinel state. Called from
+// MonitorSync::Enable(TRUE) (and from GFX::Stop) so that a COLD start of
+// MMR -- MMR loaded TRUE from registry at first ROM start, or toggled ON
+// via the menu at runtime -- also runs the 180-frame GL-vsync-only warmup
+// before DwmFlush+interval=0 takes over pacing.
+//
+// Before P47, s_DwmWarmupFrames was reset to DWM_WARMUP_FRAMES only in
+// GFX::Stop's "if (UsingOpenGL && Fullscreen)" branch (i.e. only when
+// leaving fullscreen). On a cold start that branch never runs, so
+// s_DwmWarmupFrames stayed 0 and the DwmFlush path in GL_DrawFrame
+// immediately entered its "armed" branch on frame 1 -- but the GL swap
+// interval was still 1 at that point (posted by SetDwmSyncMode(false) in
+// GFX::Start, and ApplyPendingVSync on frame 1 applies interval=1 before
+// the DwmFlush path runs). DwmFlush blocks ~16ms AND SwapBuffers with
+// interval=1 blocks another ~16ms in the SAME frame = ~33ms (2 vblank)
+// double-block on frame 1 -- a visible stutter right after start. This
+// is exactly the "F000002-F000005 stutter right after start" report from
+// session 24 that the handoff doc attributed to warmup; the audit showed
+// the warmup was in fact not running at all on cold start.
+//
+// Thread safety: Enable() runs on the UI thread (WM_COMMAND). The three
+// statics are read frame-by-frame on the NES thread inside GL_DrawFrame's
+// DwmFlush block. int/bool writes are atomic on x86; SetDwmSyncMode(true)
+// is only ever called from the NES thread's armed branch (gated on
+// s_DwmModeArmed), so a UI-thread reset before the next NES-frame read is
+// safe -- the NES thread will observe s_DwmWarmupFrames=180 and count
+// down from there. See MATCH_MONITOR_RATE.md section 9.
+void ResetDwmWarmup(void)
+{
+        s_pfnDwmFlush      = reinterpret_cast<PFN_DwmFlush>(1);
+        s_DwmWarmupFrames  = DWM_WARMUP_FRAMES;
+        s_DwmModeArmed     = false;
+}
+
 // Called ONLY from the NES emulation thread (via ApplyPendingResize inside
 // GL_DrawFrame), where the GL context is already current. Never call directly
 // from the UI thread — use PostGLResize instead.
@@ -1905,13 +1939,10 @@ void    Stop (void)
                 // clamps slotMs to 1ms, and causes 2-3 seconds of audio stutter /
                 // apparent slowdown after returning to windowed mode.
                 MonitorSync::ResetState();
-                // The DwmFlush sentinel / warmup / DwmModeArmed variables below
-                // are only used when USE_DWMFLUSH=1 (see GL_DrawFrame). With the
-                // default USE_DWMFLUSH=0 they are dead code, but we reset them
-                // anyway for safety in case DwmFlush is re-enabled later.
-                s_pfnDwmFlush = reinterpret_cast<PFN_DwmFlush>(1);
-                s_DwmWarmupFrames = DWM_WARMUP_FRAMES;
-                s_DwmModeArmed    = false;
+                // P47: reset DwmFlush warmup/arm state via the shared helper
+                // (also called from MonitorSync::Enable(TRUE) so cold starts
+                // get the warmup too -- see ResetDwmWarmup's block comment).
+                ResetDwmWarmup();
                 // Restore GL vsync (interval=1) for the windowed context that
                 // GFX::Start() is about to create. With DwmFlush disabled, this
                 // interval is the sole pacing mechanism in both windowed and
