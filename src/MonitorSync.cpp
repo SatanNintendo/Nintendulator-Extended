@@ -503,6 +503,14 @@ void Enable(BOOL on)
         APU::StartAudioCtrlThread();
 
         ResetState();
+
+        // P47: reset DwmFlush warmup/arm state on every MMR enable, not
+        // just on fullscreen exit (GFX::Stop). Without this a cold start
+        // (MMR loaded TRUE from registry) or a runtime menu toggle leaves
+        // s_DwmWarmupFrames=0, and the first DwmFlush() fires while the GL
+        // swap interval is still 1 -> ~33ms (2-vblank) double-block on
+        // frame 1. See GFX::ResetDwmWarmup() and MATCH_MONITOR_RATE.md sec 9.
+        GFX::ResetDwmWarmup();
     }
     else
     {
