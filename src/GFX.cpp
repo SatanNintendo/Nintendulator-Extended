@@ -494,6 +494,130 @@ void ResetDwmWarmup(void)
         s_DwmModeArmed     = false;
 }
 
+
+// Called ONLY from the NES emulation thread (via ApplyPendingResize inside
+// GL_DrawFrame), where the GL context is already current. Never call directly
+// from the UI thread — use PostGLResize instead.
+static void GL_ResizeInternal(int w, int h)
+{
+        if (w <= 0) w = 1;
+        if (h <= 0) h = 1;
+
+        glWinW = w;
+        glWinH = h;
+
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(0, w, h, 0, -1, 1);
+
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+}
+
+// Legacy entry point — kept for GFX::Start() which runs on the NES thread
+// before rendering has started (no concurrent GL_DrawFrame in flight).
+void GL_Resize(int w, int h)
+{
+        if (!UsingOpenGL || !hGLRC || !hGLDC)
+                return;
+
+        // If the NES thread is already running (emulation active), defer the
+        // resize so it lands inside GL_DrawFrame where the context is current.
+        // If we are NOT yet running (called from GFX::Start setup), it is safe
+        // to apply directly — there is no concurrent GL_DrawFrame.
+        if (NES::Running)
+        {
+                PostGLResize(w, h);
+                return;
+        }
+
+        if (w <= 0) w = 1;
+        if (h <= 0) h = 1;
+
+        wglMakeCurrent(hGLDC, hGLRC);
+        GL_ResizeInternal(w, h);
+        wglMakeCurrent(NULL, NULL);
+}
+
+// Post a deferred resize from the UI thread (WM_SIZE). The new dimensions are
+// packed into a single 64-bit atomic so the read in GL_DrawFrame is always
+// consistent — no partial-word tearing between width and height.
+void PostGLResize(int w, int h)
+{
+        if (w <= 0) w = 1;
+        if (h <= 0) h = 1;
+
+        LONGLONG packed = ((LONGLONG)(DWORD)w << 32) | (LONGLONG)(DWORD)h;
+        InterlockedExchange64(&g_PendingResize, packed);
+}
+
+// Read and apply any deferred resize. Called at the start of GL_DrawFrame,
+// after wglMakeCurrent, so the GL context is current on this thread.
+static void ApplyPendingResize()
+{
+        LONGLONG packed = InterlockedExchange64(&g_PendingResize, -1LL);
+        if (packed == -1LL)
+                return;
+
+        int w = (int)(DWORD)(packed >> 32);
+        int h = (int)(DWORD)(packed & 0xFFFFFFFFLL);
+        GL_ResizeInternal(w, h);
+}
+
+// ============================================================
+// Per-frame timing diagnostics (active when MatchMonitorRate is on).
+//
+// Each frame we record QPC timestamps at 5 checkpoints:
+//   t0 = entry to GL_DrawFrame (after palette conversion)
+//   t1 = after glTexSubImage2D
+//   t2 = after SwapBuffers (= vblank wakeup)
+//   t3 = after MonitorSync::OnFrameEnd
+//   t4 = after APU::UpdateDRC
+//
+// The buffer holds the last DIAG_FRAMES frames (~5 seconds at 60fps).
+// When any inter-checkpoint delta exceeds DIAG_STALL_MS milliseconds,
+// the buffer is flushed to %TEMP%\nintendulator_timing.log so you can
+// inspect which call caused the stall.
+//
+// Overhead: ~3 QPC reads (150ns total) per frame — negligible.
+//
+// P31 (session 10 full-project audit): the dump itself used to be
+// synchronous fopen/fwrite/fclose of a ~360-line file, called directly
+// from DrawScreen on the NES thread, with NO rate limiting. That means:
+//   - The exact moment a stall is detected (i.e. the exact moment we can
+//     least afford more delay), we also do a synchronous disk write --
+//     opening/creating a file in %TEMP%, which on many systems is picked
+//     up by antivirus real-time scanning or the search indexer. A
+//     borderline, otherwise-bounded 20-25ms hiccup (e.g. WaitForDXGIVBlank
+//     legitimately hitting its own deadline once) could be extended into
+//     a much longer, clearly audible/visible one purely by the act of
+//     diagnosing it.
+//   - With no rate limiting, a single external event that affects several
+//     consecutive frames (plausible for a GPU power-state transition)
+//     re-triggers the dump on EVERY one of those frames, rewriting the
+//     entire 6-second ring buffer to disk each time -- compounding one
+//     hiccup into several.
+// Both are fixed below: DiagDumpLogAsync() snapshots the ring buffer
+// (cheap memcpy, no I/O) on the NES thread, then hands the snapshot to
+// the Windows thread pool (QueueUserWorkItem) to do the actual write.
+// A 3-second cooldown prevents back-to-back re-triggering.
+// ============================================================
+#define DIAG_FRAMES    360          // 6 seconds of history at 60fps
+#define DIAG_STALL_MS  20.0        // stall threshold: 20ms (>1 vblank)
+
+struct FrameTimingEntry {
+        LONGLONG t0;        // entry to GL_DrawFrame
+        LONGLONG t1;        // after glTexSubImage2D
+        LONGLONG t2;        // after SwapBuffers
+        LONGLONG t2b;       // right after t2, no GL call between them as of P44 (session 21) -- see below
+        LONGLONG t3;        // after OnFrameEnd (filled in DrawScreen)
+        LONGLONG t4;        // after UpdateDRC  (filled in DrawScreen)
+        DWORD    frameNum;
+};
+static FrameTimingEntry s_diagBuf[DIAG_FRAMES];
+static int  s_diagHead      = 0;
+static DWORD s_diagFrameNum = 0;
+
 // ============================================================
 // P54 (Stage 2): Two-threaded architecture — FrameQueue + RenderThread.
 //
@@ -859,128 +983,6 @@ void StopRenderThread(void)
         FQ_Destroy();
 }
 
-// Called ONLY from the NES emulation thread (via ApplyPendingResize inside
-// GL_DrawFrame), where the GL context is already current. Never call directly
-// from the UI thread — use PostGLResize instead.
-static void GL_ResizeInternal(int w, int h)
-{
-        if (w <= 0) w = 1;
-        if (h <= 0) h = 1;
-
-        glWinW = w;
-        glWinH = h;
-
-        glMatrixMode(GL_PROJECTION);
-        glLoadIdentity();
-        glOrtho(0, w, h, 0, -1, 1);
-
-        glMatrixMode(GL_MODELVIEW);
-        glLoadIdentity();
-}
-
-// Legacy entry point — kept for GFX::Start() which runs on the NES thread
-// before rendering has started (no concurrent GL_DrawFrame in flight).
-void GL_Resize(int w, int h)
-{
-        if (!UsingOpenGL || !hGLRC || !hGLDC)
-                return;
-
-        // If the NES thread is already running (emulation active), defer the
-        // resize so it lands inside GL_DrawFrame where the context is current.
-        // If we are NOT yet running (called from GFX::Start setup), it is safe
-        // to apply directly — there is no concurrent GL_DrawFrame.
-        if (NES::Running)
-        {
-                PostGLResize(w, h);
-                return;
-        }
-
-        if (w <= 0) w = 1;
-        if (h <= 0) h = 1;
-
-        wglMakeCurrent(hGLDC, hGLRC);
-        GL_ResizeInternal(w, h);
-        wglMakeCurrent(NULL, NULL);
-}
-
-// Post a deferred resize from the UI thread (WM_SIZE). The new dimensions are
-// packed into a single 64-bit atomic so the read in GL_DrawFrame is always
-// consistent — no partial-word tearing between width and height.
-void PostGLResize(int w, int h)
-{
-        if (w <= 0) w = 1;
-        if (h <= 0) h = 1;
-
-        LONGLONG packed = ((LONGLONG)(DWORD)w << 32) | (LONGLONG)(DWORD)h;
-        InterlockedExchange64(&g_PendingResize, packed);
-}
-
-// Read and apply any deferred resize. Called at the start of GL_DrawFrame,
-// after wglMakeCurrent, so the GL context is current on this thread.
-static void ApplyPendingResize()
-{
-        LONGLONG packed = InterlockedExchange64(&g_PendingResize, -1LL);
-        if (packed == -1LL)
-                return;
-
-        int w = (int)(DWORD)(packed >> 32);
-        int h = (int)(DWORD)(packed & 0xFFFFFFFFLL);
-        GL_ResizeInternal(w, h);
-}
-
-// ============================================================
-// Per-frame timing diagnostics (active when MatchMonitorRate is on).
-//
-// Each frame we record QPC timestamps at 5 checkpoints:
-//   t0 = entry to GL_DrawFrame (after palette conversion)
-//   t1 = after glTexSubImage2D
-//   t2 = after SwapBuffers (= vblank wakeup)
-//   t3 = after MonitorSync::OnFrameEnd
-//   t4 = after APU::UpdateDRC
-//
-// The buffer holds the last DIAG_FRAMES frames (~5 seconds at 60fps).
-// When any inter-checkpoint delta exceeds DIAG_STALL_MS milliseconds,
-// the buffer is flushed to %TEMP%\nintendulator_timing.log so you can
-// inspect which call caused the stall.
-//
-// Overhead: ~3 QPC reads (150ns total) per frame — negligible.
-//
-// P31 (session 10 full-project audit): the dump itself used to be
-// synchronous fopen/fwrite/fclose of a ~360-line file, called directly
-// from DrawScreen on the NES thread, with NO rate limiting. That means:
-//   - The exact moment a stall is detected (i.e. the exact moment we can
-//     least afford more delay), we also do a synchronous disk write --
-//     opening/creating a file in %TEMP%, which on many systems is picked
-//     up by antivirus real-time scanning or the search indexer. A
-//     borderline, otherwise-bounded 20-25ms hiccup (e.g. WaitForDXGIVBlank
-//     legitimately hitting its own deadline once) could be extended into
-//     a much longer, clearly audible/visible one purely by the act of
-//     diagnosing it.
-//   - With no rate limiting, a single external event that affects several
-//     consecutive frames (plausible for a GPU power-state transition)
-//     re-triggers the dump on EVERY one of those frames, rewriting the
-//     entire 6-second ring buffer to disk each time -- compounding one
-//     hiccup into several.
-// Both are fixed below: DiagDumpLogAsync() snapshots the ring buffer
-// (cheap memcpy, no I/O) on the NES thread, then hands the snapshot to
-// the Windows thread pool (QueueUserWorkItem) to do the actual write.
-// A 3-second cooldown prevents back-to-back re-triggering.
-// ============================================================
-#define DIAG_FRAMES    360          // 6 seconds of history at 60fps
-#define DIAG_STALL_MS  20.0        // stall threshold: 20ms (>1 vblank)
-
-struct FrameTimingEntry {
-        LONGLONG t0;        // entry to GL_DrawFrame
-        LONGLONG t1;        // after glTexSubImage2D
-        LONGLONG t2;        // after SwapBuffers
-        LONGLONG t2b;       // right after t2, no GL call between them as of P44 (session 21) -- see below
-        LONGLONG t3;        // after OnFrameEnd (filled in DrawScreen)
-        LONGLONG t4;        // after UpdateDRC  (filled in DrawScreen)
-        DWORD    frameNum;
-};
-static FrameTimingEntry s_diagBuf[DIAG_FRAMES];
-static int  s_diagHead      = 0;
-static DWORD s_diagFrameNum = 0;
 
 // Returns the QPC frequency (cached).
 static double DiagQPCFreq()
