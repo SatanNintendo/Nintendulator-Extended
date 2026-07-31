@@ -652,6 +652,37 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         _ftprintf(f, _T("GL vsync request verified by driver: %s   DwmFlush windowed-sync mode: %s\n"),
                 MonitorSync::IsVSyncActive() ? _T("YES") : _T("NO"),
                 (USE_DWMFLUSH ? _T("compiled IN") : _T("compiled OUT")));
+        // P48/P50 (session 25): the post-P47 log showed swap=0.03ms on every
+        // frame AND a 20/20/10ms (3:2 pulldown) gap pattern — meaning NEITHER
+        // GL vsync NOR DwmFlush was providing any backpressure on this
+        // system. "verified by driver: NO" only tells us wglGetSwapIntervalEXT
+        // didn't confirm interval=1; it does not tell us whether DwmFlush
+        // loaded, armed, or actually blocks. Print those facts here so the
+        // next log can be diagnosed without another round-trip:
+        //   - pfnWglSwapIntervalEXT loaded? (if NULL, no vsync path at all)
+        //   - DwmFlush loaded? (NULL = LoadLibrary/GetProcAddress failed;
+        //     sentinel = not yet attempted; valid = loaded)
+        //   - DwmFlush armed? (s_DwmModeArmed — true after SetDwmSyncMode(true))
+        //   - DwmFlush warmup remaining? (s_DwmWarmupFrames — counts down
+        //     from DWM_WARMUP_FRAMES; while >0 DwmFlush is intentionally
+        //     not called and the timer paces alone)
+        //   - g_DwmSyncMode? (1 = SetDwmSyncMode(true) posted interval=0)
+        //   - glWinW x glWinH? (the GL viewport; P49 fullscreen bug check)
+        {
+            const TCHAR *dwmState;
+            if (s_pfnDwmFlush == reinterpret_cast<PFN_DwmFlush>(1))
+                dwmState = _T("sentinel (not yet loaded)");
+            else if (s_pfnDwmFlush == NULL)
+                dwmState = _T("NULL (LoadLibrary/GetProcAddress failed)");
+            else
+                dwmState = _T("loaded");
+            _ftprintf(f, _T("DwmFlush: %s, armed=%s, warmup=%d, g_DwmSyncMode=%d, glViewport=%dx%d\n"),
+                    dwmState,
+                    s_DwmModeArmed ? _T("YES") : _T("NO"),
+                    s_DwmWarmupFrames,
+                    MonitorSync::GetDwmSyncMode(),
+                    glWinW, glWinH);
+        }
         // P46 (session 23): so a log can be identified as windowed /
         // borderless-fullscreen / exclusive-fullscreen at a glance, since
         // as of this session those first two now share the same DwmFlush
@@ -1668,6 +1699,23 @@ void    Start (void)
                         SetWindowPos(hMainWnd, zOrder,
                                 0, 0, scrW, scrH, SWP_FRAMECHANGED);
                         ShowWindow(hMainWnd, SW_MAXIMIZE);
+
+                        // P49: force the GL viewport to the fullscreen
+                        // dimensions immediately. Before this fix, GL_Init/
+                        // the UsingOpenGL re-init block above ran with the
+                        // WINDOWED client rect (winW/winH, captured BEFORE
+                        // SetWindowPos), so glWinW/glWinH/glViewport were
+                        // left at the old windowed size. The WM_SIZE that
+                        // SetWindowPos posts only lands as a deferred
+                        // PostGLResize (g_PendingResize) which ApplyPendingResize
+                        // picks up on the FIRST GL_DrawFrame — but the very
+                        // first GL_DrawFrame draws with the stale windowed
+                        // viewport, showing only a corner of the screen.
+                        // GL_Resize applies directly here (NES::Running is
+                        // false at this point — NES::Stop() was synchronous
+                        // before GFX::Stop/GFX::Start), so there is no race
+                        // with GL_DrawFrame and wglMakeCurrent is safe.
+                        GL_Resize(scrW, scrH);
 
                         if (dbgVisible)
                                 ShowWindow(hDebug, SW_MINIMIZE);

@@ -567,6 +567,11 @@ double GetNESHz()
     return g_NESHz;
 }
 
+int GetDwmSyncMode()
+{
+    return (int)InterlockedExchangeAdd(&g_DwmSyncMode, 0);
+}
+
 void SetNESRegion(int region)
 {
     switch (region)
@@ -710,12 +715,34 @@ void OnFrameEnd()
 
 void PaceFrame()
 {
-    if (!g_VSyncActive)
-    {
-        Sleep(0);
-        return;
-    }
-
+    // P48: removed the `if (!g_VSyncActive) { Sleep(0); return; }` gate.
+    //
+    // Previously, when g_VSyncActive was false — which happens whenever
+    // wglSwapIntervalEXT is not verified by the driver (see
+    // ApplyPendingVSync: "verified by driver: NO" in the log header) OR
+    // DwmFlush has not yet armed (first 180 warmup frames, or DwmFlush
+    // failed to load) — PaceFrame did `Sleep(0)` and returned, providing
+    // NO pacing at all. The only remaining throttle was the DirectSound
+    // buffer-fill busy-wait in APU::Run, which is quantized to audiodg's
+    // ~10ms service tick and produces a strict 20/20/10ms (3:2 pulldown)
+    // judder pattern — exactly the "scrolling goes in jerks in windowed
+    // mode" symptom reported after P47.
+    //
+    // Now: always use the QPC-drift-corrected waitable timer. If a real
+    // backpressure (vsync or DwmFlush) is ALSO active on this system, the
+    // QPC drift correction (slotMs -= elapsedMs since the last
+    // OnFrameEnd, which runs right after SwapBuffers) makes the timer
+    // wait ~0ms — so there is no double-pacing: the timer self-regulates
+    // to fill only the gap that the real backpressure left unfilled. If
+    // NO backpressure is active (the current reported case: swap=0.03ms
+    // on every frame), the timer provides the full ~16.67ms pacing
+    // itself, giving a steady frame cadence instead of the 3:2 pulldown.
+    //
+    // Safety: the waitable timer path below was already the code path used
+    // when g_VSyncActive was true (i.e. on systems where vsync DID work),
+    // so this change only extends that same path to the g_VSyncActive=
+    // false case — it does not change behaviour on systems where vsync
+    // already works. See MATCH_MONITOR_RATE.md section 10.
     if (g_PaceTimer == NULL)
     {
         PFN_CreateWaitableTimerExW pfnEx =

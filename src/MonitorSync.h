@@ -165,4 +165,12 @@ namespace MonitorSync
         // on adapter index 1 of 2 tried)". Valid any time after Enable(TRUE)
         // has been called at least once; "not attempted yet" before that.
         const TCHAR* GetDXGIFailReason ();
+
+        // P50 (session 25): diagnostic getter for the DWM-sync mode flag.
+        // Returns 1 if SetDwmSyncMode(true) has been called (GL swap
+        // interval posted = 0, DwmFlush is the intended pacer), 0
+        // otherwise. Used by the timing-log header so a log where
+        // swap=0.03ms can be cross-checked against whether the
+        // interval=0 switch actually happened.
+        int     GetDwmSyncMode ();
 }
