@@ -86,6 +86,12 @@ static PFN_DwmFlush s_pfnDwmFlush = reinterpret_cast<PFN_DwmFlush>(1); // 1 = no
 #define DWM_WARMUP_FRAMES 180
 static int  s_DwmWarmupFrames = 0;
 static bool s_DwmModeArmed    = false; // true once SetDwmSyncMode(true) has been called
+// P52: diagnostic counter — incremented on every entry to the #if USE_DWMFLUSH
+// block in GL_DrawFrame (before the MatchMonitorRate check). Read by
+// DiagWriteLogFile to determine whether the DwmFlush path is even being
+// reached. Must be at file scope (not inside GL_DrawFrame) so the log
+// writer can access it.
+static volatile LONG s_DwmFlushPathReached = 0;
 
 namespace GFX
 {
@@ -682,6 +688,20 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                     s_DwmWarmupFrames,
                     MonitorSync::GetDwmSyncMode(),
                     glWinW, glWinH);
+            // P52: the post-P51b log showed DwmFlush=sentinel, warmup=180
+            // even after 781+ frames — meaning the DwmFlush path never
+            // executed despite USE_DWMFLUSH=1, MatchMonitorRate=TRUE, and
+            // ExclusiveFullscreen=FALSE. Print those values here so the
+            // next log can confirm whether the #if block is compiling and
+            // whether the runtime condition evaluates as expected.
+            // s_DwmFlushPathReached increments on every entry to the
+            // #if USE_DWMFLUSH block (before the MatchMonitorRate check).
+            // If it's >0 but warmup=180, LoadLibrary failed. If it's 0,
+            // the #if block isn't compiling (impossible per rg) or
+            // GL_DrawFrame isn't being called (impossible per diagT0).
+            _ftprintf(f, _T("DwmFlushPath: reached=%ld, MatchMonitorRate=%d, ExclusiveFullscreen=%d, UsingOpenGL=%d, USE_DWMFLUSH=%d\n"),
+                    (long)InterlockedExchangeAdd(&s_DwmFlushPathReached, 0),
+                    MatchMonitorRate, ExclusiveFullscreen, UsingOpenGL, USE_DWMFLUSH);
         }
         // P46 (session 23): so a log can be identified as windowed /
         // borderless-fullscreen / exclusive-fullscreen at a glance, since
@@ -1254,6 +1274,13 @@ static void GL_DrawFrame(void)
         // mode, while true exclusive fullscreen (the only mode where GL
         // vsync alone should already be correct) is left untouched.
 #if USE_DWMFLUSH
+        // P52: increment the diagnostic counter (file-scope static, read
+        // by DiagWriteLogFile). This runs on EVERY GL_DrawFrame call
+        // where USE_DWMFLUSH compiled in — before the MatchMonitorRate
+        // check. If the log shows reached=0, the #if block isn't
+        // compiling. If reached>0 but warmup=180, LoadLibrary failed.
+        InterlockedIncrement(&s_DwmFlushPathReached);
+
         if (MatchMonitorRate && !ExclusiveFullscreen)
         {
                 // Lazy-load dwmapi.dll once.
