@@ -173,4 +173,21 @@ namespace MonitorSync
         // swap=0.03ms can be cross-checked against whether the
         // interval=0 switch actually happened.
         int     GetDwmSyncMode ();
+
+        // P51 (session 25): returns true when neither GL vsync nor
+        // DwmFlush provides real backpressure on this system (swap < 1ms
+        // for 60 consecutive frames, confirmed via NotifySwapDuration).
+        // When true, PaceFrame is the ONLY pacing mechanism and APU::Run
+        // must NOT gate its write-slot on GetCurrentPosition (which is
+        // quantized to ~10ms by audiodg and produces 3:2 pulldown
+        // judder). Instead, APU::Run calls PaceFrame and writes the
+        // slot unconditionally, with a bounded safety valve for the
+        // rare case of buffer overflow.
+        bool    IsPacingAuthoritative ();
+
+        // P51: called from GL_DrawFrame after SwapBuffers, with the
+        // measured swap duration in milliseconds. Updates the internal
+        // backpressure tracker that drives IsPacingAuthoritative().
+        // swap < 1.0ms increments the counter; swap >= 1.0ms resets it.
+        void    NotifySwapDuration (double swapMs);
 }

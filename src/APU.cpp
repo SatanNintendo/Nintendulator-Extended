@@ -2029,24 +2029,82 @@ void    Run (void)
                 if (AVI::IsActive())
                         AVI::AddAudio();
 
-                // Pre-check: with vsync on, the DS slot we want to write is
-                // almost always already free by the time we arrive here
-                // (~1ms after vblank). Check once before entering the wait-
-                // loop. If the slot is free, skip the loop entirely — zero
-                // SwitchToThread() calls, zero timing jitter added.
-                // If it is still busy (rare scheduler hiccup), fall through.
+                // ============================================================
+                // P51 (session 25): AUTHORITATIVE PACER PATH
                 //
-                // P27 FIX: use the cached DS position instead of a live
-                // GetCurrentPosition IPC call. The cache is written by
-                // UpdateDRC() post-vblank (at most ~16ms ago), which is
-                // fresh enough for a pre-check heuristic. A stale pre-check
-                // that wrongly indicates "free" will be caught by Lock() or
-                // the wait-loop's own GetCurrentPosition. A stale pre-check
-                // that wrongly indicates "busy" causes one extra wait-loop
-                // iteration — the same cost as the pre-cache behavior.
-                // Either way, we eliminate an IPC call from inside the
-                // CPU::ExecOp loop, which was the source of the 0-10ms stall
-                // that could push SwapBuffers past the next vblank.
+                // When neither GL vsync nor DwmFlush provides real backpressure
+                // (swap < 1ms for 60 consecutive frames — confirmed on this
+                // system via MonitorSync::NotifySwapDuration), the ONLY pacing
+                // mechanism is PaceFrame's QPC-drift-corrected waitable timer
+                // (~16.67ms). In this mode we must NOT gate the write-slot on
+                // GetCurrentPosition, because audiodg updates the play cursor
+                // in ~10ms quanta, producing a strict 20/20/10ms (3:2 pulldown)
+                // judder pattern.
+                //
+                // Instead: PaceFrame waits the precise frame time, then we write
+                // the slot unconditionally. The 6-slot buffer (100ms) with
+                // target_fill=0.42 has ±42ms of headroom — more than enough to
+                // absorb ±1ms timer jitter. DRC (Layer 2) compensates any slow
+                // drift over minutes.
+                //
+                // GetCurrentPosition is kept ONLY as a safety valve: if the
+                // buffer is critically overfull (e.g. after a pause or a long
+                // stall), we do a bounded wait to prevent overflow. This is
+                // rare in steady state.
+                // ============================================================
+                if (isEnabled && Buffer && GFX::MatchMonitorRate
+                        && MonitorSync::IsPacingAuthoritative())
+                {
+                        // PaceFrame waits the precise remaining frame time
+                        // (QPC-based, ~16.67ms minus elapsed since last
+                        // OnFrameEnd). After this, exactly one slot-period
+                        // has elapsed since the previous write, so the slot
+                        // we want to write has been played out by audiodg.
+                        MonitorSync::PaceFrame();
+
+                        // Safety valve: check if buffer is critically overfull.
+                        // This should almost never trigger in steady state;
+                        // it exists to handle pauses, DRC overshoot, or long
+                        // tex stalls that could otherwise overflow the ring.
+                        LONG cacheAge = InterlockedExchangeAdd(&g_DSCacheAge, 1L);
+                        if (cacheAge <= 2)
+                        {
+                                unsigned long sr = (unsigned long)InterlockedExchangeAdd(&g_DSCacheRpos, 0L);
+                                unsigned long sw = (unsigned long)InterlockedExchangeAdd(&g_DSCacheWpos, 0L);
+                                if (sw < sr) sw += FRAMEBUF;
+                                // If the slot is STILL occupied (buffer overfull),
+                                // do a bounded wait — but use PaceFrame, not
+                                // GetCurrentPosition polling, to avoid
+                                // re-introducing the 10ms quantization.
+                                int safetyLoops = 0;
+                                while ((sr <= next_pos) && (next_pos <= sw) && safetyLoops < 3)
+                                {
+                                        MonitorSync::PaceFrame();
+                                        // Re-read cache (the audio-control worker
+                                        // refreshes it every ~8ms, so after one
+                                        // PaceFrame (~16ms) it should be fresh).
+                                        sr = (unsigned long)InterlockedExchangeAdd(&g_DSCacheRpos, 0L);
+                                        sw = (unsigned long)InterlockedExchangeAdd(&g_DSCacheWpos, 0L);
+                                        if (sw < sr) sw += FRAMEBUF;
+                                        safetyLoops++;
+                                }
+                                // After 3 safety loops (~50ms), write anyway
+                                // rather than stalling forever — a single
+                                // overwritten slot is a brief glitch, an
+                                // infinite stall is a freeze.
+                        }
+                        // else: cache stale — write unconditionally (the buffer
+                        // has 100ms of headroom; one blind write is safe).
+
+                        goto write_slot;
+                }
+
+                // ============================================================
+                // ORIGINAL PATH: vsync/DwmFlush provides real backpressure,
+                // or MMR is off. Use the cached pre-check + wait-loop with
+                // GetCurrentPosition polling (quantized to ~10ms, but that's
+                // acceptable when a real backpressure is also pacing the frame).
+                // ============================================================
                 if (isEnabled && Buffer)
                 {
                         LONG cacheAge = InterlockedExchangeAdd(&g_DSCacheAge, 1L);

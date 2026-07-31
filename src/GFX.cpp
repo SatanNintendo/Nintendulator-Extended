@@ -1342,6 +1342,18 @@ static void GL_DrawFrame(void)
                 LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
                 int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
                 s_diagBuf[idx].t2 = qpc.QuadPart;
+
+                // P51: feed the swap duration to MonitorSync so it can
+                // detect whether SwapBuffers/DwmFlush provides real
+                // backpressure. If swap < 1.0ms for 60 consecutive frames,
+                // IsPacingAuthoritative() returns true and APU::Run
+                // switches to the authoritative-pacer path (no
+                // GetCurrentPosition polling). This is what breaks the
+                // 3:2 pulldown judder on systems where vsync/DwmFlush
+                // do not block.
+                double swapMs = (double)(s_diagBuf[idx].t2 - s_diagBuf[idx].t1)
+                        * 1000.0 / DiagQPCFreq();
+                MonitorSync::NotifySwapDuration(swapMs);
         }
 
         // P44 (session 21): no per-frame wglMakeCurrent(NULL, NULL) here

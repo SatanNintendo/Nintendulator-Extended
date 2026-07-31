@@ -367,6 +367,17 @@ static volatile LONG  g_PendingVSyncInterval = -1;
 // DWM-sync mode: interval=0 but g_VSyncActive stays true.
 static volatile LONG  g_DwmSyncMode = 0;
 
+// P51: track whether SwapBuffers provides real backpressure.
+// Updated every frame from GL_DrawFrame via NotifySwapDuration().
+// If swap < 1.0ms for BACKPRESSURE_CONFIRM_FRAMES consecutive frames,
+// we conclude that neither GL vsync nor DwmFlush is blocking, and
+// PaceFrame must be the authoritative pacer (APU::Run stops gating
+// its write-slot on GetCurrentPosition, which is quantized to ~10ms
+// by audiodg and produces 3:2 pulldown judder).
+static volatile LONG g_SwapBackpressureFrames = 0;
+static volatile LONG g_PacingAuthoritative    = 0;
+#define BACKPRESSURE_CONFIRM_FRAMES 60   // ~1 sec of evidence at 60fps
+
 // ------------------------------------------------------------------
 // Waitable timer for PaceFrame.
 // ------------------------------------------------------------------
@@ -517,6 +528,9 @@ void Enable(BOOL on)
         InterlockedExchange(&g_PendingVSyncInterval, 1L);
         g_VSyncActive = false;
         g_CalibActive = false;
+        // P51: reset the authoritative-pacer tracker when MMR is disabled.
+        InterlockedExchange(&g_SwapBackpressureFrames, 0);
+        InterlockedExchange(&g_PacingAuthoritative, 0);
         StopVBlankThread();
         APU::ResetDRC();
         // Stop the P30 worker after ResetDRC() has posted its frequency-
@@ -570,6 +584,33 @@ double GetNESHz()
 int GetDwmSyncMode()
 {
     return (int)InterlockedExchangeAdd(&g_DwmSyncMode, 0);
+}
+
+bool IsPacingAuthoritative()
+{
+    return InterlockedExchangeAdd(&g_PacingAuthoritative, 0) != 0;
+}
+
+// P51: called from GL_DrawFrame after SwapBuffers, with the measured
+// swap duration in milliseconds. Updates the backpressure tracker.
+// If swap < 1.0ms for BACKPRESSURE_CONFIRM_FRAMES consecutive frames,
+// we conclude that neither GL vsync nor DwmFlush is blocking, and
+// PaceFrame becomes the authoritative pacer (APU::Run stops polling
+// GetCurrentPosition). If swap >= 1.0ms (real backpressure detected),
+// reset the tracker and clear the authoritative flag.
+void NotifySwapDuration(double swapMs)
+{
+    if (swapMs < 1.0)
+    {
+        LONG n = InterlockedIncrement(&g_SwapBackpressureFrames);
+        if (n >= BACKPRESSURE_CONFIRM_FRAMES)
+            InterlockedExchange(&g_PacingAuthoritative, 1);
+    }
+    else
+    {
+        InterlockedExchange(&g_SwapBackpressureFrames, 0);
+        InterlockedExchange(&g_PacingAuthoritative, 0);
+    }
 }
 
 void SetNESRegion(int region)
