@@ -71,6 +71,25 @@ void    ReleaseGLContext (void);
 // MATCH_MONITOR_RATE.md section 9.
 void    ResetDwmWarmup (void);
 BOOL    UseOpenGL (void);
+
+// P54 (Stage 2, two-threaded): when MMR is active and the render thread is
+// running, the emulation thread does NOT call GL_DrawFrame. Instead it
+// produces a frame (PPU palette -> RGBA) into a lock-free queue, and the
+// render thread consumes it and calls GL_DrawFrameFromBuffer. This
+// decouples video presentation (DwmFlush/SwapBuffers on vblank) from
+// emulation, so a DwmFlush stall no longer freezes audio.
+bool    IsRenderThreadActive (void);
+
+// P54: produce a frame to the render queue. Called from DrawScreen on the
+// emulation thread. src must point to a 256*240*4 byte RGBA/BGRA buffer.
+// No-op if the render thread is not active (falls back to single-thread).
+void    ProduceFrameToQueue (const unsigned char *rgba);
+
+// P54: start/stop the render thread. Start is called from GFX::Start after
+// GL_Init when MMR is on; Stop is called from GFX::Stop before GL_Destroy.
+// Stop is synchronous: it signals the thread to exit and waits for it.
+void    StartRenderThread (void);
+void    StopRenderThread (void);
 void    SyncMenuChecks (void);
 void    LoadPalette (PALETTE);
 void    SetFrameskip (int);

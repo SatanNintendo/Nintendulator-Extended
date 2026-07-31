@@ -1188,7 +1188,13 @@ DWORD   WINAPI  Thread (void *param)
         // AcquireGLContext()/ReleaseGLContext() block comment in GFX.cpp for
         // the full rationale. Must happen before anything below can reach
         // CPU::ExecOp -> PPU -> GFX::DrawScreen -> GL_DrawFrame.
-        GFX::AcquireGLContext();
+        //
+        // P54 (Stage 2): when the render thread is active (MMR on, two-
+        // threaded mode), it owns the GL context — the emulation thread
+        // must NOT acquire it. DrawScreen checks IsRenderThreadActive()
+        // and produces frames to the queue instead of calling GL_DrawFrame.
+        if (!GFX::IsRenderThreadActive())
+                GFX::AcquireGLContext();
 
 #ifdef  CPU_BENCHMARK
         // Run with cyctest.nes
@@ -1296,7 +1302,12 @@ DWORD   WINAPI  Thread (void *param)
         // proceed on the UI thread) once Running == FALSE, so this guarantees
         // the context is already released by the time anything else tries to
         // take it.
-        GFX::ReleaseGLContext();
+        //
+        // P54 (Stage 2): only release if we acquired it. When the render
+        // thread is active, it owns the context — the emulation thread
+        // never acquired it, so it must not release it either.
+        if (!GFX::IsRenderThreadActive())
+                GFX::ReleaseGLContext();
         UpdateTitlebar();
         Running = FALSE;
         // If Stop was triggered from within the emulation thread

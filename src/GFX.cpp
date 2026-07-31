@@ -494,6 +494,371 @@ void ResetDwmWarmup(void)
         s_DwmModeArmed     = false;
 }
 
+// ============================================================
+// P54 (Stage 2): Two-threaded architecture — FrameQueue + RenderThread.
+//
+// When MMR is active, the emulation thread (NES::Thread) does NOT call
+// GL_DrawFrame. Instead, DrawScreen converts the PPU palette buffer to
+// RGBA and pushes it into a small ring buffer (FrameQueue). A separate
+// render thread (TIME_CRITICAL) consumes the latest frame and calls
+// GL_DrawFrameFromBuffer, which does the texture upload + DwmFlush +
+// SwapBuffers on vblank.
+//
+// This decouples video presentation from emulation: when DwmFlush stalls
+// (periodic DWM maintenance, ~33ms), the render thread simply drops a
+// frame and catches the next vblank, while the emulation thread keeps
+// running — audio never drops.
+//
+// The GL context is owned by the render thread (AcquireGLContext at
+// thread start, ReleaseGLContext at exit). The emulation thread does
+// NOT acquire the context when the render thread is active.
+// ============================================================
+
+#define FQ_SLOTS 3
+#define FQ_FRAME_SIZE (256 * 240 * 4)
+static unsigned char s_FQ_Buf[FQ_SLOTS][FQ_FRAME_SIZE];
+static CRITICAL_SECTION s_FQ_CS;
+static bool s_FQ_CS_Init = false;
+static int  s_FQ_Head = 0, s_FQ_Tail = 0, s_FQ_Count = 0;
+static HANDLE s_FrameEvent = NULL;
+// Consumer-side scratch buffer: FQ_Consume copies into this so the
+// returned pointer stays valid even after the producer overwrites the
+// ring slot.
+static unsigned char s_FQ_ConsumeCopy[FQ_FRAME_SIZE];
+
+static volatile LONG s_RenderThreadActive = 0;
+static HANDLE        s_RenderThread = NULL;
+static volatile LONG s_RenderThreadStop = 0;
+
+static void FQ_Init(void)
+{
+        s_FQ_Head = s_FQ_Tail = s_FQ_Count = 0;
+        if (!s_FQ_CS_Init) { InitializeCriticalSection(&s_FQ_CS); s_FQ_CS_Init = true; }
+        if (!s_FrameEvent) s_FrameEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+}
+
+static void FQ_Destroy(void)
+{
+        if (s_FrameEvent) { CloseHandle(s_FrameEvent); s_FrameEvent = NULL; }
+        s_FQ_Head = s_FQ_Tail = s_FQ_Count = 0;
+}
+
+// Producer (emulation thread): write a frame, signal the render thread.
+// Latest-wins: if the queue is full (3 frames backed up — render thread
+// is stalled), drop the oldest by advancing the tail.
+static void FQ_Produce(const unsigned char *src)
+{
+        EnterCriticalSection(&s_FQ_CS);
+        int slot = s_FQ_Head;
+        memcpy(s_FQ_Buf[slot], src, FQ_FRAME_SIZE);
+        s_FQ_Head = (s_FQ_Head + 1) % FQ_SLOTS;
+        if (s_FQ_Count >= FQ_SLOTS)
+        {
+                // Overwrite oldest
+                s_FQ_Tail = (s_FQ_Tail + 1) % FQ_SLOTS;
+        }
+        else
+        {
+                s_FQ_Count++;
+        }
+        LeaveCriticalSection(&s_FQ_CS);
+        if (s_FrameEvent) SetEvent(s_FrameEvent);
+}
+
+// Consumer (render thread): get the latest available frame. If multiple
+// frames are queued, skip to the newest (drop intermediates) so the
+// render thread always shows the freshest frame. Returns NULL if empty.
+// The returned pointer is into s_FQ_ConsumeCopy (stable until next call).
+static const unsigned char *FQ_Consume(void)
+{
+        EnterCriticalSection(&s_FQ_CS);
+        if (s_FQ_Count <= 0)
+        {
+                LeaveCriticalSection(&s_FQ_CS);
+                return NULL;
+        }
+        // Skip to the latest queued frame (drop intermediates).
+        while (s_FQ_Count > 1)
+        {
+                s_FQ_Tail = (s_FQ_Tail + 1) % FQ_SLOTS;
+                s_FQ_Count--;
+        }
+        memcpy(s_FQ_ConsumeCopy, s_FQ_Buf[s_FQ_Tail], FQ_FRAME_SIZE);
+        s_FQ_Tail = (s_FQ_Tail + 1) % FQ_SLOTS;
+        s_FQ_Count--;
+        LeaveCriticalSection(&s_FQ_CS);
+        return s_FQ_ConsumeCopy;
+}
+
+bool IsRenderThreadActive(void)
+{
+        return InterlockedExchangeAdd(&s_RenderThreadActive, 0) != 0;
+}
+
+void ProduceFrameToQueue(const unsigned char *rgba)
+{
+        if (!IsRenderThreadActive()) return;
+        FQ_Produce(rgba);
+}
+
+// P54: forward declarations — GL_DrawFrameFromBuffer (below) uses these
+// static helpers which are defined later in the file. Forward-declaring
+// them here keeps the two-threaded code grouped together for readability.
+static double DiagQPCFreq(void);
+static void DiagCompleteFrame(LONGLONG t3, LONGLONG t4);
+static void ApplyPendingResize(void);
+
+// P54: GL_DrawFrameFromBuffer — renders a frame from a pre-filled RGBA
+// buffer (produced by the emulation thread) instead of reading PPU's
+// palette array. Called on the RENDER THREAD, where the GL context is
+// current. This is GL_DrawFrame with the palette-conversion step
+// removed (the buffer is already converted) and the diagnostic timing
+// kept (gap/tex/swap still measured here).
+static void GL_DrawFrameFromBuffer(const unsigned char *rgba)
+{
+        LONGLONG diagT0 = 0, diagT1 = 0;
+        if (MatchMonitorRate)
+        {
+                LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc); diagT0 = qpc.QuadPart;
+                s_diagFrameNum++;
+                int idx = s_diagHead;
+                s_diagBuf[idx].t0       = diagT0;
+                s_diagBuf[idx].t1       = 0;
+                s_diagBuf[idx].t2       = 0;
+                s_diagBuf[idx].t2b      = 0;
+                s_diagBuf[idx].t3       = 0;
+                s_diagBuf[idx].t4       = 0;
+                s_diagBuf[idx].frameNum = s_diagFrameNum;
+                s_diagHead = (s_diagHead + 1) % DIAG_FRAMES;
+        }
+
+        MonitorSync::ApplyPendingVSync();
+        ApplyPendingResize();
+        {
+                LONG pendingBilinear = InterlockedExchange(&g_PendingBilinear, -1L);
+                if (pendingBilinear >= 0)
+                        Bilinear = (pendingBilinear != 0) ? TRUE : FALSE;
+        }
+
+        glViewport(0, 0, glWinW, glWinH);
+        glBindTexture(GL_TEXTURE_2D, glTex);
+
+        // Texture upload from the pre-filled buffer (no palette conversion).
+        if (s_PBOReady)
+        {
+                GLuint writePBO = s_PBO[s_PBOIndex];
+                pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, writePBO);
+                pfn_glBufferData(GL_PIXEL_UNPACK_BUFFER, PBO_SIZE, NULL, GL_STREAM_DRAW);
+                void* pboMem = pfn_glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY);
+                if (pboMem)
+                {
+                        memcpy(pboMem, rgba, FQ_FRAME_SIZE);
+                        pfn_glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+                        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 240,
+                                GL_BGRA_EXT, GL_UNSIGNED_BYTE, NULL);
+                }
+                else
+                {
+                        pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+                        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 240,
+                                GL_BGRA_EXT, GL_UNSIGNED_BYTE, rgba);
+                }
+                pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+                s_PBOIndex ^= 1;
+        }
+        else
+        {
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 240,
+                        GL_BGRA_EXT, GL_UNSIGNED_BYTE, rgba);
+        }
+
+        if (MatchMonitorRate)
+        {
+                LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc); diagT1 = qpc.QuadPart;
+                int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+                s_diagBuf[idx].t1 = diagT1;
+        }
+
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        int dstX, dstY, dstW, dstH;
+        if (IntegerScale)
+        {
+                int scale = 1;
+                for (int m = 2; m <= 16; m++)
+                {
+                        if (256 * m <= glWinW && 240 * m <= glWinH) scale = m;
+                        else break;
+                }
+                dstW = 256 * scale; dstH = 240 * scale;
+                dstX = (glWinW - dstW) / 2; dstY = (glWinH - dstH) / 2;
+                ISMult = scale; ISBorderX = dstX; ISBorderY = dstY;
+        }
+        else
+        {
+                int hw = 240 * glWinW;
+                int wh = 256 * glWinH;
+                if (hw > wh) { dstW = wh / 240; dstH = glWinH; }
+                else         { dstW = glWinW; dstH = hw / 256; }
+                dstX = (glWinW - dstW) / 2; dstY = (glWinH - dstH) / 2;
+        }
+
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, glTex);
+        {
+                static BOOL s_lastBilinear = -1;
+                if (Bilinear != s_lastBilinear)
+                {
+                        s_lastBilinear = Bilinear;
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                                Bilinear ? GL_LINEAR : GL_NEAREST);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                                Bilinear ? GL_LINEAR : GL_NEAREST);
+                }
+        }
+        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+        glBegin(GL_QUADS);
+                glTexCoord2f(0.0f, 0.0f); glVertex2i(dstX,        dstY);
+                glTexCoord2f(1.0f, 0.0f); glVertex2i(dstX + dstW, dstY);
+                glTexCoord2f(1.0f, 1.0f); glVertex2i(dstX + dstW, dstY + dstH);
+                glTexCoord2f(0.0f, 1.0f); glVertex2i(dstX,        dstY + dstH);
+        glEnd();
+
+        if (Scanlines)
+        {
+                glDisable(GL_TEXTURE_2D);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glColor4f(0.0f, 0.0f, 0.0f, 0.25f);
+                glBegin(GL_LINES);
+                for (int y = dstY; y < dstY + dstH; y += 2)
+                {
+                        glVertex2i(dstX, y);
+                        glVertex2i(dstX + dstW, y);
+                }
+                glEnd();
+                glDisable(GL_BLEND);
+                glEnable(GL_TEXTURE_2D);
+                glColor4f(1, 1, 1, 1);
+        }
+
+        // DwmFlush path (same as GL_DrawFrame — P53 fixed condition).
+#if USE_DWMFLUSH
+        InterlockedIncrement(&s_DwmFlushPathReached);
+        if (MatchMonitorRate && !(Fullscreen && ExclusiveFullscreen))
+        {
+                if (s_pfnDwmFlush == reinterpret_cast<PFN_DwmFlush>(1))
+                {
+                        HMODULE hDwm = LoadLibrary(_T("dwmapi.dll"));
+                        s_pfnDwmFlush = hDwm ? (PFN_DwmFlush)GetProcAddress(hDwm, "DwmFlush") : NULL;
+                }
+                if (s_pfnDwmFlush)
+                {
+                        if (s_DwmWarmupFrames > 0)
+                        {
+                                --s_DwmWarmupFrames;
+                        }
+                        else
+                        {
+                                if (!s_DwmModeArmed)
+                                {
+                                        MonitorSync::SetDwmSyncMode(true);
+                                        s_DwmModeArmed = true;
+                                }
+                                s_pfnDwmFlush();
+                        }
+                }
+        }
+#endif
+        if (MatchMonitorRate)
+                MonitorSync::WaitForDXGIVBlank();
+
+        SwapBuffers(hGLDC);
+
+        if (MatchMonitorRate)
+        {
+                LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
+                int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+                s_diagBuf[idx].t2 = qpc.QuadPart;
+                double swapMs = (double)(s_diagBuf[idx].t2 - s_diagBuf[idx].t1)
+                        * 1000.0 / DiagQPCFreq();
+                MonitorSync::NotifySwapDuration(swapMs);
+        }
+        if (MatchMonitorRate)
+        {
+                LARGE_INTEGER qpc2; QueryPerformanceCounter(&qpc2);
+                int idx2 = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+                s_diagBuf[idx2].t2b = qpc2.QuadPart;
+
+                // P54: complete the diag entry from the render thread.
+                // t3/t4 are the same as t2b here (no OnFrameEnd/UpdateDRC
+                // on the render thread — those run on the emulation thread).
+                s_diagBuf[idx2].t3 = qpc2.QuadPart;
+                s_diagBuf[idx2].t4 = qpc2.QuadPart;
+                DiagCompleteFrame(qpc2.QuadPart, qpc2.QuadPart);
+        }
+}
+
+// P54: render thread entry point. Owns the GL context for its lifetime.
+static DWORD WINAPI RenderThreadProc(void *)
+{
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        AcquireGLContext();
+        InterlockedExchange(&s_RenderThreadActive, 1);
+
+        // Wait timeout: slightly longer than one frame period. If no frame
+        // arrives (emulation paused/stalled), we still present to keep DWM
+        // composition alive.
+        double nesHz = MonitorSync::GetNESHz();
+        DWORD waitMs = (nesHz > 0.0) ? (DWORD)(1000.0 / nesHz + 4.0) : 21;
+
+        while (!InterlockedExchangeAdd(&s_RenderThreadStop, 0))
+        {
+                WaitForSingleObject(s_FrameEvent, waitMs);
+                const unsigned char *pixels = FQ_Consume();
+                if (pixels)
+                {
+                        GL_DrawFrameFromBuffer(pixels);
+                }
+                else
+                {
+                        // No new frame: present the previous frame again to
+                        // keep DWM happy (SwapBuffers on vblank). Avoids a
+                        // black flash if emulation briefly stalls.
+                        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                        glClear(GL_COLOR_BUFFER_BIT);
+                        SwapBuffers(hGLDC);
+                }
+        }
+
+        ReleaseGLContext();
+        InterlockedExchange(&s_RenderThreadActive, 0);
+        return 0;
+}
+
+void StartRenderThread(void)
+{
+        if (s_RenderThread) return;
+        FQ_Init();
+        InterlockedExchange(&s_RenderThreadStop, 0);
+        s_RenderThread = CreateThread(NULL, 0, RenderThreadProc, NULL, 0, NULL);
+        // Wait for the thread to signal it's running (context acquired).
+        for (int i = 0; i < 200 && !IsRenderThreadActive(); i++)
+                Sleep(1);
+}
+
+void StopRenderThread(void)
+{
+        if (!s_RenderThread) return;
+        InterlockedExchange(&s_RenderThreadStop, 1);
+        if (s_FrameEvent) SetEvent(s_FrameEvent);  // wake it up if blocked
+        WaitForSingleObject(s_RenderThread, 1000);
+        CloseHandle(s_RenderThread);
+        s_RenderThread = NULL;
+        FQ_Destroy();
+}
+
 // Called ONLY from the NES emulation thread (via ApplyPendingResize inside
 // GL_DrawFrame), where the GL context is already current. Never call directly
 // from the UI thread — use PostGLResize instead.
@@ -1724,6 +2089,15 @@ void    Start (void)
                         // that was just (re)created; SetDwmSyncMode(true) is
                         // never called when DwmFlush is disabled.
                         MonitorSync::SetDwmSyncMode(false);
+
+                        // P54 (Stage 2): start the render thread now that the
+                        // GL context exists. The render thread acquires the GL
+                        // context and owns it for its lifetime — the emulation
+                        // thread (NES::Thread) will NOT acquire it. This
+                        // decouples DwmFlush/SwapBuffers (vblank presentation)
+                        // from CPU/PPU/APU emulation, so a DwmFlush stall no
+                        // longer freezes audio.
+                        StartRenderThread();
                 }
 
                 if (Fullscreen)
@@ -2073,6 +2447,10 @@ void    Stop (void)
                 // fullscreen modes — SwapBuffers blocks at vblank, throttling
                 // the emulator to the monitor refresh rate.
                 MonitorSync::SetDwmSyncMode(false);
+                // P54: stop the render thread BEFORE GL_Destroy so it
+                // releases the GL context. StopRenderThread is synchronous
+                // — it signals the thread to exit and waits for it.
+                StopRenderThread();
                 GL_Destroy();
                 SetWindowLongPtr(hMainWnd, GWL_STYLE, WS_OVERLAPPEDWINDOW);
                 SetMenu(hMainWnd, hMenu);
@@ -2096,6 +2474,9 @@ void    Stop (void)
                 NES::UpdateInterface();
                 return;
         }
+        // P54: stop the render thread BEFORE GL_Destroy (DirectDraw path —
+        // render thread shouldn't be active here, but stop defensively).
+        StopRenderThread();
         GL_Destroy();
 
         if (!DirectDraw)
@@ -2243,7 +2624,25 @@ void    DrawScreen (void)
                 Sleep(SlowRate * 1000 / WantFPS);
         if ((++FPSCnt > FSkip) || forceNoSkip)
         {
-                Update();
+                // P54 (Stage 2): two-threaded path. When the render thread is
+                // active (MMR on), the emulation thread does NOT call
+                // GL_DrawFrame. Instead it converts the PPU palette buffer to
+                // RGBA and pushes it to the FrameQueue. The render thread
+                // consumes it and does GL_DrawFrameFromBuffer on vblank.
+                // This decouples DwmFlush stalls from emulation/audio.
+                if (IsRenderThreadActive())
+                {
+                        static unsigned char rgbaBuf[256 * 240 * 4];
+                        unsigned short *src = PPU::DrawArray;
+                        unsigned long *dst = (unsigned long *)rgbaBuf;
+                        for (int i = 0; i < 256 * 240; i++)
+                                dst[i] = Palette32[src[i]];
+                        ProduceFrameToQueue(rgbaBuf);
+                }
+                else
+                {
+                        Update();
+                }
                 FPSCnt = 0;
                 // When Match Monitor Rate is enabled, Update() (which calls
                 // SwapBuffers) has just blocked until the next monitor vblank
@@ -2256,23 +2655,15 @@ void    DrawScreen (void)
 
                         // Diagnostic t3: after OnFrameEnd.
                         LONGLONG diagT3 = 0, diagT4 = 0;
-                        if (MatchMonitorRate)
+                        if (MatchMonitorRate && !IsRenderThreadActive())
                         {
                                 LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
                                 diagT3 = qpc.QuadPart;
                         }
 
-                        // Dynamic Rate Control: call UpdateDRC AFTER SwapBuffers,
-                        // not before. UpdateDRC calls IDirectSoundBuffer::GetCurrentPosition,
-                        // which is an IPC call into audiodg.exe. When this was placed
-                        // before Update()/SwapBuffers, the 0-5ms IPC stall consumed part
-                        // of the inter-vblank budget, occasionally causing us to miss
-                        // the next vblank. Post-vblank is the safest moment: we have
-                        // a full ~16ms window and the same stall costs nothing visible.
                         APU::UpdateDRC();
 
-                        // Diagnostic t4: after UpdateDRC. Complete the entry and check.
-                        if (MatchMonitorRate)
+                        if (MatchMonitorRate && !IsRenderThreadActive())
                         {
                                 LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
                                 diagT4 = qpc.QuadPart;
