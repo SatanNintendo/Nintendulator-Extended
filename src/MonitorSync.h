@@ -190,4 +190,20 @@ namespace MonitorSync
         // backpressure tracker that drives IsPacingAuthoritative().
         // swap < 1.0ms increments the counter; swap >= 1.0ms resets it.
         void    NotifySwapDuration (double swapMs);
+
+        // P51b: authoritative slot pacer. Used by APU::Run when
+        // IsPacingAuthoritative() is true. Unlike PaceFrame (which
+        // drift-corrects from OnFrameEnd), PaceSlot drift-corrects
+        // from the PREVIOUS slot write (g_LastSlotWriteQPC, updated
+        // by NotifySlotWritten). This is the correct base point: each
+        // slot write should land exactly (1000/NESHz) ms after the
+        // previous one, forming a self-synchronising cycle without
+        // audiodg's 10ms quantization.
+        void    PaceSlot ();
+
+        // P51b: called from APU::Run immediately AFTER the slot write
+        // (Lock/memcpy/Unlock). Records the QPC timestamp so the next
+        // PaceSlot can drift-correct from this point. Harmless if
+        // called when the authoritative path is not active.
+        void    NotifySlotWritten ();
 }

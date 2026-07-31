@@ -358,6 +358,17 @@ static double         g_CalibRejectRefHz = 0.0;
 // drift correction.
 static LARGE_INTEGER  g_LastFrameEndQPC = {0, 0};
 
+// P51b: QPC timestamp of the last DirectSound slot write (from APU::Run
+// write_slot). Used by PaceSlot() for drift correction in the
+// authoritative-pacer path. This is the CORRECT base point for slot
+// pacing: each slot write should happen exactly (1000/NESHz) ms after
+// the PREVIOUS slot write, not after OnFrameEnd (which fires later in
+// the frame, after CPU+GL_DrawFrame work). Using g_LastFrameEndQPC
+// (as the original P51 did via PaceFrame) made each frame's gap grow
+// by the CPU+GL work after APU::Run, producing the 22-26ms "game runs
+// slow" regression reported after P51.
+static LARGE_INTEGER  g_LastSlotWriteQPC = {0, 0};
+
 // ------------------------------------------------------------------
 // Deferred vsync interval (written by Enable/UI thread, applied by
 // NES thread in ApplyPendingVSync inside GL_DrawFrame).
@@ -632,6 +643,9 @@ void ResetState()
     g_CalibRejectRefHz = 0.0;
     g_CalibActive = true;
     g_LastFrameEndQPC.QuadPart = 0;
+    // P51b: reset the slot-write base point too, so the first PaceSlot
+    // after a reset waits the full slot period (no drift correction).
+    g_LastSlotWriteQPC.QuadPart = 0;
 }
 
 void SetDwmSyncMode(bool useDwm)
@@ -820,6 +834,89 @@ void PaceFrame()
     else
     {
         SwitchToThread();
+    }
+}
+
+// P51b: authoritative slot pacer. Used by APU::Run when
+// IsPacingAuthoritative() is true (neither vsync nor DwmFlush provides
+// backpressure). Unlike PaceFrame (which drift-corrects from
+// g_LastFrameEndQPC = OnFrameEnd), PaceSlot drift-corrects from
+// g_LastSlotWriteQPC = the previous slot write. This is the CORRECT
+// base point: each slot write should happen exactly (1000/NESHz) ms
+// after the PREVIOUS slot write, forming a self-synchronising cycle
+// (just like the original GetCurrentPosition wait-loop, but without
+// audiodg's 10ms quantization).
+//
+// Why PaceFrame was wrong here (the P51 regression): APU::Run runs
+// mid-frame, BEFORE GL_DrawFrame/SwapBuffers/OnFrameEnd. Using
+// g_LastFrameEndQPC as the base made PaceFrame wait "16ms from
+// OnFrameEnd", but the remaining CPU+GL_DrawFrame work after APU::Run
+// added another ~5-10ms, so gap grew to 22-26ms = "game runs slow".
+// PaceSlot fixes this by anchoring to the slot write itself, which is
+// exactly what the original wait-loop did (it waited until audiodg had
+// played one slot = 16.67ms since the previous write).
+void PaceSlot()
+{
+    // Reuse the same waitable timer as PaceFrame (created lazily here
+    // if PaceFrame never ran — e.g. if g_VSyncActive was true and the
+    // original path took PaceFrame before the authoritative path kicked
+    // in). Safe: both functions are only called from the NES thread.
+    if (g_PaceTimer == NULL)
+    {
+        PFN_CreateWaitableTimerExW pfnEx =
+            (PFN_CreateWaitableTimerExW)GetProcAddress(
+                GetModuleHandleW(L"kernel32.dll"), "CreateWaitableTimerExW");
+        HANDLE ht = NULL;
+        if (pfnEx)
+            ht = pfnEx(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG, TIMER_ALL_ACCESS);
+        if (!ht)
+            ht = CreateWaitableTimer(NULL, FALSE, NULL);
+        g_PaceTimer = ht ? ht : INVALID_HANDLE_VALUE;
+    }
+
+    if (g_PaceTimer != INVALID_HANDLE_VALUE)
+    {
+        // Full slot period (no -0.5 here: we want each write to land
+        // exactly one slot after the previous, so audiodg never
+        // underflows or overflows. The -0.5 in PaceFrame was a tuning
+        // for the vsync-backed path; PaceSlot is the sole pacer and
+        // must be exact).
+        double slotMs = (g_NESHz > 0.0) ? (1000.0 / g_NESHz) : 16.667;
+        if (slotMs < 1.0) slotMs = 1.0;
+
+        if (g_QPCFreq.QuadPart > 0 && g_LastSlotWriteQPC.QuadPart != 0)
+        {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            double elapsedMs = (double)(now.QuadPart - g_LastSlotWriteQPC.QuadPart)
+                * 1000.0 / (double)g_QPCFreq.QuadPart;
+            slotMs -= elapsedMs;
+            if (slotMs < 1.0) slotMs = 1.0;
+        }
+
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)(slotMs * 10000.0);
+        SetWaitableTimer(g_PaceTimer, &due, 0, NULL, NULL, FALSE);
+        WaitForSingleObject(g_PaceTimer, 20);
+    }
+    else
+    {
+        SwitchToThread();
+    }
+}
+
+// P51b: called from APU::Run immediately AFTER the slot write
+// (Lock/memcpy/Unlock). Records the QPC timestamp so the next PaceSlot
+// can drift-correct from this point. Must be called on every slot write
+// while the authoritative path is active; harmless if called when it's
+// not (g_LastSlotWriteQPC is just unused in that case).
+void NotifySlotWritten()
+{
+    if (g_QPCFreq.QuadPart > 0)
+    {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        g_LastSlotWriteQPC = now;
     }
 }
 

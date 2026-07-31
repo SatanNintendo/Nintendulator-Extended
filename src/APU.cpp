@@ -2055,12 +2055,22 @@ void    Run (void)
                 if (isEnabled && Buffer && GFX::MatchMonitorRate
                         && MonitorSync::IsPacingAuthoritative())
                 {
-                        // PaceFrame waits the precise remaining frame time
-                        // (QPC-based, ~16.67ms minus elapsed since last
-                        // OnFrameEnd). After this, exactly one slot-period
-                        // has elapsed since the previous write, so the slot
-                        // we want to write has been played out by audiodg.
-                        MonitorSync::PaceFrame();
+                        // P51b: PaceSlot (NOT PaceFrame) waits the precise
+                        // remaining slot time, drift-corrected from the
+                        // PREVIOUS slot write (g_LastSlotWriteQPC). This is
+                        // the correct base point — each write lands exactly
+                        // (1000/NESHz) ms after the previous one, forming a
+                        // self-synchronising cycle like the original wait-loop
+                        // but without audiodg's 10ms quantization.
+                        //
+                        // P51 used PaceFrame here, which drift-corrects from
+                        // OnFrameEnd (g_LastFrameEndQPC). That was WRONG:
+                        // APU::Run runs mid-frame, BEFORE GL_DrawFrame/
+                        // SwapBuffers/OnFrameEnd, so using OnFrameEnd as the
+                        // base made each gap grow by the CPU+GL work after
+                        // APU::Run (~5-10ms), producing the 22-26ms "game
+                        // runs slow" regression.
+                        MonitorSync::PaceSlot();
 
                         // Safety valve: check if buffer is critically overfull.
                         // This should almost never trigger in steady state;
@@ -2073,16 +2083,16 @@ void    Run (void)
                                 unsigned long sw = (unsigned long)InterlockedExchangeAdd(&g_DSCacheWpos, 0L);
                                 if (sw < sr) sw += FRAMEBUF;
                                 // If the slot is STILL occupied (buffer overfull),
-                                // do a bounded wait — but use PaceFrame, not
+                                // do a bounded wait — but use PaceSlot, not
                                 // GetCurrentPosition polling, to avoid
                                 // re-introducing the 10ms quantization.
                                 int safetyLoops = 0;
                                 while ((sr <= next_pos) && (next_pos <= sw) && safetyLoops < 3)
                                 {
-                                        MonitorSync::PaceFrame();
+                                        MonitorSync::PaceSlot();
                                         // Re-read cache (the audio-control worker
                                         // refreshes it every ~8ms, so after one
-                                        // PaceFrame (~16ms) it should be fresh).
+                                        // PaceSlot (~16ms) it should be fresh).
                                         sr = (unsigned long)InterlockedExchangeAdd(&g_DSCacheRpos, 0L);
                                         sw = (unsigned long)InterlockedExchangeAdd(&g_DSCacheWpos, 0L);
                                         if (sw < sr) sw += FRAMEBUF;
@@ -2175,6 +2185,13 @@ void    Run (void)
                         memcpy(bufPtr, buffer, bufBytes);
                         Try(Buffer->Unlock(bufPtr, bufBytes, NULL, 0), Lang::GetString(LANG_ERR_APU_BUFFER));
                         next_pos = (next_pos + 1) % FRAMEBUF;
+
+                        // P51b: record the QPC timestamp of this slot write
+                        // so the next PaceSlot (authoritative-pacer path)
+                        // can drift-correct from here. Harmless when the
+                        // authoritative path is not active — g_LastSlotWriteQPC
+                        // is simply unused in that case.
+                        MonitorSync::NotifySlotWritten();
 
                         // NOTE: SetFrequency is NO LONGER called from here.
                         // It was moved to UpdateDRC() (called from GFX::DrawScreen
