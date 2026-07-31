@@ -931,6 +931,34 @@ static DWORD WINAPI RenderThreadProc(void *)
         AcquireGLContext();
         InterlockedExchange(&s_RenderThreadActive, 1);
 
+        // P55: waitable timer to prevent the render thread from running
+        // FASTER than one frame period. DwmFlush alone is an unreliable
+        // pacer — it sometimes returns in ~6-9ms (catching the tail of a
+        // composition tick) instead of blocking a full ~16.67ms vblank.
+        // That produced the 2:1 pulldown pattern (gap 6/16/16/6/16...)
+        // seen in the P54 log. The timer ensures each GL_DrawFrameFromBuffer
+        // call lands at least (1000/NESHz) ms after the previous one,
+        // with DwmFlush providing vblank alignment on top.
+        typedef HANDLE (WINAPI *PFN_CreateWaitableTimerExW)(
+                LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
+        static const DWORD CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG = 0x00000002;
+        HANDLE hTimer = NULL;
+        {
+                PFN_CreateWaitableTimerExW pfnEx = (PFN_CreateWaitableTimerExW)
+                        GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                       "CreateWaitableTimerExW");
+                if (pfnEx)
+                        hTimer = pfnEx(NULL, NULL,
+                                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG,
+                                TIMER_ALL_ACCESS);
+                if (!hTimer)
+                        hTimer = CreateWaitableTimer(NULL, FALSE, NULL);
+        }
+        // QPC for drift correction (reuse MonitorSync's frequency).
+        LARGE_INTEGER qpcFreq;
+        QueryPerformanceFrequency(&qpcFreq);
+        LONGLONG lastRenderQPC = 0;
+
         // Wait timeout: slightly longer than one frame period. If no frame
         // arrives (emulation paused/stalled), we still present to keep DWM
         // composition alive.
@@ -940,6 +968,29 @@ static DWORD WINAPI RenderThreadProc(void *)
         while (!InterlockedExchangeAdd(&s_RenderThreadStop, 0))
         {
                 WaitForSingleObject(s_FrameEvent, waitMs);
+
+                // P55: enforce minimum frame period via waitable timer.
+                // Compute how long since the last GL_DrawFrameFromBuffer;
+                // if less than one frame, wait the remainder. This caps
+                // the render thread at NES native rate regardless of how
+                // fast DwmFlush returns.
+                if (hTimer && lastRenderQPC != 0 && qpcFreq.QuadPart > 0)
+                {
+                        LARGE_INTEGER now;
+                        QueryPerformanceCounter(&now);
+                        double elapsedMs = (double)(now.QuadPart - lastRenderQPC)
+                                * 1000.0 / (double)qpcFreq.QuadPart;
+                        double targetMs = (nesHz > 0.0) ? (1000.0 / nesHz) : 16.667;
+                        double remainMs = targetMs - elapsedMs;
+                        if (remainMs > 1.0)
+                        {
+                                LARGE_INTEGER due;
+                                due.QuadPart = -(LONGLONG)(remainMs * 10000.0);
+                                SetWaitableTimer(hTimer, &due, 0, NULL, NULL, FALSE);
+                                WaitForSingleObject(hTimer, 20);
+                        }
+                }
+
                 const unsigned char *pixels = FQ_Consume();
                 if (pixels)
                 {
@@ -954,8 +1005,18 @@ static DWORD WINAPI RenderThreadProc(void *)
                         glClear(GL_COLOR_BUFFER_BIT);
                         SwapBuffers(hGLDC);
                 }
+
+                // Record the QPC of this render for the next iteration's
+                // drift correction.
+                if (qpcFreq.QuadPart > 0)
+                {
+                        LARGE_INTEGER now;
+                        QueryPerformanceCounter(&now);
+                        lastRenderQPC = now.QuadPart;
+                }
         }
 
+        if (hTimer) CloseHandle(hTimer);
         ReleaseGLContext();
         InterlockedExchange(&s_RenderThreadActive, 0);
         return 0;
@@ -2007,6 +2068,21 @@ void    Start (void)
                         {
                                 MonitorSync::Enable(TRUE);
                                 MonitorSync::SetDwmSyncMode(false);
+                                // P55: (re)start the render thread on every
+                                // GFX::Start when MMR is on. This early-return
+                                // path (UsingOpenGL already true, e.g. after
+                                // Alt+Enter fullscreen toggle or new ROM load)
+                                // used to skip StartRenderThread — leaving
+                                // IsRenderThreadActive()=false after
+                                // StopRenderThread ran in GFX::Stop. That made
+                                // NES::Thread fall through to the no-context
+                                // path (it skips AcquireGLContext when the
+                                // render thread is "supposed" to own it) but
+                                // the render thread wasn't running, so
+                                // GL_DrawFrame silently failed — black screen
+                                // / broken fullscreen. Starting it here fixes
+                                // the fullscreen regression introduced by P54.
+                                StartRenderThread();
                         }
 
                         // Restore menu checkmarks (may have been reset)
