@@ -1281,7 +1281,21 @@ static void GL_DrawFrame(void)
         // compiling. If reached>0 but warmup=180, LoadLibrary failed.
         InterlockedIncrement(&s_DwmFlushPathReached);
 
-        if (MatchMonitorRate && !ExclusiveFullscreen)
+        // P53: the old condition `!ExclusiveFullscreen` was wrong.
+        // ExclusiveFullscreen is a menu toggle that can be TRUE even
+        // when Fullscreen is FALSE (the user toggled it in windowed
+        // mode — see ID_PPU_EXCLUSIVEFS in Nintendulator.cpp, which
+        // only restarts GFX if Fullscreen is already on). That left
+        // ExclusiveFullscreen=1 in windowed mode, which made
+        // `!ExclusiveFullscreen` = FALSE, blocking the entire DwmFlush
+        // path. The P52 log confirmed exactly this:
+        //   ExclusiveFullscreen=1, Window mode: windowed
+        // The CORRECT test for "true exclusive fullscreen" (the only
+        // mode where DwmFlush is pointless because DWM is bypassed)
+        // is `Fullscreen && ExclusiveFullscreen`. In windowed mode
+        // (Fullscreen=0) DwmFlush must always run regardless of the
+        // ExclusiveFullscreen toggle state.
+        if (MatchMonitorRate && !(Fullscreen && ExclusiveFullscreen))
         {
                 // Lazy-load dwmapi.dll once.
                 if (s_pfnDwmFlush == reinterpret_cast<PFN_DwmFlush>(1))
@@ -1605,6 +1619,29 @@ void    Start (void)
                                 SwapBuffers(hGLDC);
                                 wglMakeCurrent(NULL, NULL);
                         }
+
+                        // P53: Re-enter MMR sync state on every GFX::Start.
+                        // The primary initialization path (below, after
+                        // GL_Init) calls MonitorSync::Enable(TRUE) when MMR
+                        // is on. But this early-return path (taken when GL
+                        // is already initialized — e.g. loading a new ROM
+                        // without changing video mode) used to skip it
+                        // entirely. The P52 log confirmed the damage:
+                        //   - DXGI init detail: "not attempted yet"
+                        //     (InitDXGI never ran — it's in Enable)
+                        //   - Live calibrated monitor Hz: 60.0000 (round =
+                        //     g_CalibActive false, calibration never ran)
+                        //   - DwmFlush warmup=0 (ResetDwmWarmup, normally
+                        //     called from Enable(TRUE), never ran)
+                        // Calling Enable(TRUE) here fixes all three.
+                        // Enable is idempotent (returns early if already on),
+                        // so this is safe even if MMR was already active.
+                        if (MatchMonitorRate)
+                        {
+                                MonitorSync::Enable(TRUE);
+                                MonitorSync::SetDwmSyncMode(false);
+                        }
+
                         // Restore menu checkmarks (may have been reset)
                         SyncMenuChecks();
                         return;
