@@ -525,7 +525,20 @@ void GL_Resize(int w, int h)
         // resize so it lands inside GL_DrawFrame where the context is current.
         // If we are NOT yet running (called from GFX::Start setup), it is safe
         // to apply directly — there is no concurrent GL_DrawFrame.
-        if (NES::Running)
+        //
+        // P57: ALSO defer when the P54 render thread is active, even if
+        // NES::Running is false. GFX::Start's first-init path calls
+        // StartRenderThread() (which acquires the GL context on the render
+        // thread) BEFORE reaching the fullscreen GL_Resize(scrW, scrH) call.
+        // A direct wglMakeCurrent here would STEAL the context from the
+        // render thread; the subsequent wglMakeCurrent(NULL,NULL) leaves it
+        // current on NO thread. The render thread's glViewport/glClear then
+        // fail silently → viewport stays at the windowed dimensions captured
+        // by GL_Init → "fullscreen shows only part of the screen" regression.
+        // Deferring via PostGLResize lets the render thread's ApplyPendingResize
+        // (called in both GL_DrawFrameFromBuffer and the idle loop) apply the
+        // resize on the correct thread where the context is current.
+        if (NES::Running || IsRenderThreadActive())
         {
                 PostGLResize(w, h);
                 return;
@@ -959,28 +972,50 @@ static DWORD WINAPI RenderThreadProc(void *)
         QueryPerformanceFrequency(&qpcFreq);
         LONGLONG lastRenderQPC = 0;
 
-        // Wait timeout: slightly longer than one frame period. If no frame
-        // arrives (emulation paused/stalled), we still present to keep DWM
-        // composition alive.
-        double nesHz = MonitorSync::GetNESHz();
-        DWORD waitMs = (nesHz > 0.0) ? (DWORD)(1000.0 / nesHz + 4.0) : 21;
-
         while (!InterlockedExchangeAdd(&s_RenderThreadStop, 0))
         {
+                // P56: take the QPC at the START of the iteration. The
+                // timer drift-corrects from start-to-start (the true
+                // frame-to-frame gap). The previous code set lastRenderQPC
+                // at the END, which made elapsed = time-since-end-of-last-
+                // render ≈ 0, so the timer ALWAYS waited the full target
+                // period ON TOP OF whatever DwmFlush/SwapBuffers had
+                // already blocked → 33ms double-pacing (gap=33ms,
+                // swap=16.5ms) seen in the F000181+ log block after DwmFlush
+                // armed. With the QPC taken here, elapsed measures the
+                // actual gap; if DwmFlush already blocked ~16.5ms,
+                // remainMs ≈ 0.2ms → no extra timer wait → no double-block.
+                LARGE_INTEGER iterStart;
+                QueryPerformanceCounter(&iterStart);
+
+                // P56: pace the render thread to the MONITOR refresh rate,
+                // not the NES rate. The render thread PRESENTS to the
+                // screen, so it must match the monitor's vblank period.
+                // Pacing to NES Hz (16.64ms) when the monitor is 59.83 Hz
+                // (16.71ms) caused a 0.07ms/frame drift → one dropped/
+                // duplicated frame every ~240 frames ≈ every 4 seconds →
+                // the "constant scroll judder" symptom. Read dynamically
+                // each iteration: calibration refines g_MonitorHz over
+                // the first ~60 frames, and WM_DISPLAYCHANGE can change it.
+                double monHz = MonitorSync::GetMonitorHz();
+                double targetMs = (monHz > 1.0) ? (1000.0 / monHz) : 16.667;
+                // Wait timeout: slightly longer than one frame period. If
+                // no frame arrives (emulation paused/stalled), we still
+                // present to keep DWM composition alive.
+                DWORD waitMs = (DWORD)(targetMs + 4.0);
+
                 WaitForSingleObject(s_FrameEvent, waitMs);
 
-                // P55: enforce minimum frame period via waitable timer.
-                // Compute how long since the last GL_DrawFrameFromBuffer;
-                // if less than one frame, wait the remainder. This caps
-                // the render thread at NES native rate regardless of how
-                // fast DwmFlush returns.
+                // P55/P56: enforce minimum frame period via waitable timer.
+                // elapsed = iterStart - lastRenderQPC = the true start-to-
+                // start gap of the PREVIOUS iteration (includes WaitForSingle
+                // Object + timer wait + GL_DrawFrameFromBuffer work). If the
+                // previous frame already took ≥ targetMs (DwmFlush blocked,
+                // or emulation was slow), remainMs ≤ 0 → no extra wait.
                 if (hTimer && lastRenderQPC != 0 && qpcFreq.QuadPart > 0)
                 {
-                        LARGE_INTEGER now;
-                        QueryPerformanceCounter(&now);
-                        double elapsedMs = (double)(now.QuadPart - lastRenderQPC)
+                        double elapsedMs = (double)(iterStart.QuadPart - lastRenderQPC)
                                 * 1000.0 / (double)qpcFreq.QuadPart;
-                        double targetMs = (nesHz > 0.0) ? (1000.0 / nesHz) : 16.667;
                         double remainMs = targetMs - elapsedMs;
                         if (remainMs > 1.0)
                         {
@@ -990,6 +1025,10 @@ static DWORD WINAPI RenderThreadProc(void *)
                                 WaitForSingleObject(hTimer, 20);
                         }
                 }
+
+                // P56: record the start-of-iteration QPC (NOT end-of-work).
+                // This is the anchor for the next iteration's drift correction.
+                lastRenderQPC = iterStart.QuadPart;
 
                 const unsigned char *pixels = FQ_Consume();
                 if (pixels)
@@ -1001,18 +1040,15 @@ static DWORD WINAPI RenderThreadProc(void *)
                         // No new frame: present the previous frame again to
                         // keep DWM happy (SwapBuffers on vblank). Avoids a
                         // black flash if emulation briefly stalls.
+                        // P57: apply any pending resize here too (not just in
+                        // GL_DrawFrameFromBuffer) so the idle loop uses the
+                        // correct viewport — needed for fullscreen entry
+                        // where GL_Resize defers via PostGLResize.
+                        ApplyPendingResize();
+                        glViewport(0, 0, glWinW, glWinH);
                         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
                         glClear(GL_COLOR_BUFFER_BIT);
                         SwapBuffers(hGLDC);
-                }
-
-                // Record the QPC of this render for the next iteration's
-                // drift correction.
-                if (qpcFreq.QuadPart > 0)
-                {
-                        LARGE_INTEGER now;
-                        QueryPerformanceCounter(&now);
-                        lastRenderQPC = now.QuadPart;
                 }
         }
 
