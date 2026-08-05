@@ -1006,13 +1006,33 @@ static DWORD WINAPI RenderThreadProc(void *)
 
                 WaitForSingleObject(s_FrameEvent, waitMs);
 
+                const unsigned char *pixels = FQ_Consume();
+
+                // P58: the timer is ONLY needed when DwmFlush is NOT the
+                // pacer for this iteration. DwmFlush is the pacer when it
+                // is armed (g_DwmSyncMode=1) AND a frame is available
+                // (GL_DrawFrameFromBuffer calls DwmFlush internally).
+                //
+                // When DwmFlush is the pacer, stacking the timer on top
+                // causes phase drift: DwmFlush returns 14.8ms (short) on
+                // frame N → timer adds 1.5ms on frame N+1 → DwmFlush then
+                // blocks 16.2ms → total 17.7ms (overcorrected) → the next
+                // DwmFlush catches a different vblank → 14.8ms again.
+                // This produced the 18/16/16 judder pattern in the log.
+                //
+                // By skipping the timer when DwmFlush is armed+frame-ready,
+                // DwmFlush becomes the SOLE pacer. It self-corrects because
+                // it aligns to the DWM composition tick — a short frame is
+                // automatically compensated by the next tick alignment.
+                //
+                // The timer is still used for:
+                //   - Warmup phase (DwmFlush not armed, returns instantly)
+                //   - Idle loop (no frame → no DwmFlush call → need timer)
+                bool dwmArmed = (MonitorSync::GetDwmSyncMode() != 0);
+                bool needTimer = !dwmArmed || (pixels == NULL);
+
                 // P55/P56: enforce minimum frame period via waitable timer.
-                // elapsed = iterStart - lastRenderQPC = the true start-to-
-                // start gap of the PREVIOUS iteration (includes WaitForSingle
-                // Object + timer wait + GL_DrawFrameFromBuffer work). If the
-                // previous frame already took ≥ targetMs (DwmFlush blocked,
-                // or emulation was slow), remainMs ≤ 0 → no extra wait.
-                if (hTimer && lastRenderQPC != 0 && qpcFreq.QuadPart > 0)
+                if (hTimer && needTimer && lastRenderQPC != 0 && qpcFreq.QuadPart > 0)
                 {
                         double elapsedMs = (double)(iterStart.QuadPart - lastRenderQPC)
                                 * 1000.0 / (double)qpcFreq.QuadPart;
@@ -1027,10 +1047,8 @@ static DWORD WINAPI RenderThreadProc(void *)
                 }
 
                 // P56: record the start-of-iteration QPC (NOT end-of-work).
-                // This is the anchor for the next iteration's drift correction.
                 lastRenderQPC = iterStart.QuadPart;
 
-                const unsigned char *pixels = FQ_Consume();
                 if (pixels)
                 {
                         GL_DrawFrameFromBuffer(pixels);
@@ -2067,57 +2085,45 @@ void    Start (void)
                 // If already initialized - just update viewport
                 if (UsingOpenGL)
                 {
+                        // P59: DON'T steal the GL context from the render
+                        // thread. The old code did wglMakeCurrent + glViewport
+                        // + glClear + SwapBuffers + wglMakeCurrent(NULL,NULL)
+                        // here, which (a) stole the context from a running
+                        // render thread and (b) left it current on NO thread
+                        // after the release — breaking all subsequent GL calls
+                        // on the render thread. Instead, post the resize via
+                        // PostGLResize; the render thread's ApplyPendingResize
+                        // (in GL_DrawFrameFromBuffer and the idle loop) applies
+                        // it on the correct thread where the context is current.
+                        //
+                        // P59: also handle fullscreen here. The old early-return
+                        // path never called SetWindowPos for fullscreen — it
+                        // just set glViewport to the windowed client rect and
+                        // returned, leaving the window at windowed size.
                         if (winW > 0 && winH > 0)
                         {
-                                glWinW = winW;
-                                glWinH = winH;
-                                wglMakeCurrent(hGLDC, hGLRC);
-                                glViewport(0, 0, winW, winH);
-                                glMatrixMode(GL_PROJECTION);
-                                glLoadIdentity();
-                                glOrtho(0, winW, winH, 0, -1, 1);
-                                glMatrixMode(GL_MODELVIEW);
-                                glLoadIdentity();
-                                glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-                                glClear(GL_COLOR_BUFFER_BIT);
-                                SwapBuffers(hGLDC);
-                                wglMakeCurrent(NULL, NULL);
+                                if (Fullscreen)
+                                {
+                                        int scrW = GetSystemMetrics(SM_CXSCREEN);
+                                        int scrH = GetSystemMetrics(SM_CYSCREEN);
+                                        SetWindowLongPtr(hMainWnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+                                        SetMenu(hMainWnd, NULL);
+                                        HWND zOrder = (ExclusiveFullscreen || AlwaysOnTop) ? HWND_TOPMOST : HWND_TOP;
+                                        SetWindowPos(hMainWnd, zOrder, 0, 0, scrW, scrH, SWP_FRAMECHANGED);
+                                        ShowWindow(hMainWnd, SW_MAXIMIZE);
+                                        PostGLResize(scrW, scrH);
+                                }
+                                else
+                                {
+                                        PostGLResize(winW, winH);
+                                }
                         }
 
                         // P53: Re-enter MMR sync state on every GFX::Start.
-                        // The primary initialization path (below, after
-                        // GL_Init) calls MonitorSync::Enable(TRUE) when MMR
-                        // is on. But this early-return path (taken when GL
-                        // is already initialized — e.g. loading a new ROM
-                        // without changing video mode) used to skip it
-                        // entirely. The P52 log confirmed the damage:
-                        //   - DXGI init detail: "not attempted yet"
-                        //     (InitDXGI never ran — it's in Enable)
-                        //   - Live calibrated monitor Hz: 60.0000 (round =
-                        //     g_CalibActive false, calibration never ran)
-                        //   - DwmFlush warmup=0 (ResetDwmWarmup, normally
-                        //     called from Enable(TRUE), never ran)
-                        // Calling Enable(TRUE) here fixes all three.
-                        // Enable is idempotent (returns early if already on),
-                        // so this is safe even if MMR was already active.
                         if (MatchMonitorRate)
                         {
                                 MonitorSync::Enable(TRUE);
                                 MonitorSync::SetDwmSyncMode(false);
-                                // P55: (re)start the render thread on every
-                                // GFX::Start when MMR is on. This early-return
-                                // path (UsingOpenGL already true, e.g. after
-                                // Alt+Enter fullscreen toggle or new ROM load)
-                                // used to skip StartRenderThread — leaving
-                                // IsRenderThreadActive()=false after
-                                // StopRenderThread ran in GFX::Stop. That made
-                                // NES::Thread fall through to the no-context
-                                // path (it skips AcquireGLContext when the
-                                // render thread is "supposed" to own it) but
-                                // the render thread wasn't running, so
-                                // GL_DrawFrame silently failed — black screen
-                                // / broken fullscreen. Starting it here fixes
-                                // the fullscreen regression introduced by P54.
                                 StartRenderThread();
                         }
 
@@ -2189,29 +2195,18 @@ void    Start (void)
                 if (MatchMonitorRate)
                 {
                         MonitorSync::Enable(TRUE);
-                        // Both fullscreen and windowed modes now use the same
-                        // sync mechanism: real hardware vblank, either via the
-                        // P28 DXGI bypass (interval=0 + WaitForDXGIVBlank(),
-                        // used in both modes as of P36) if available, or plain
-                        // GL driver vsync (interval=1) if not. DwmFlush is
-                        // disabled by default (see USE_DWMFLUSH in GL_DrawFrame)
-                        // because it was the primary cause of the periodic
-                        // ~30-second video+audio dropouts: DwmFlush occasionally
-                        // blocks for 2 vblanks during DWM internal maintenance.
-                        // SetDwmSyncMode(false) is called unconditionally below
-                        // to (re-)post the correct interval for the GL context
-                        // that was just (re)created; SetDwmSyncMode(true) is
-                        // never called when DwmFlush is disabled.
                         MonitorSync::SetDwmSyncMode(false);
-
-                        // P54 (Stage 2): start the render thread now that the
-                        // GL context exists. The render thread acquires the GL
-                        // context and owns it for its lifetime — the emulation
-                        // thread (NES::Thread) will NOT acquire it. This
-                        // decouples DwmFlush/SwapBuffers (vblank presentation)
-                        // from CPU/PPU/APU emulation, so a DwmFlush stall no
-                        // longer freezes audio.
-                        StartRenderThread();
+                        // P59: StartRenderThread() is deliberately NOT called
+                        // here — it is moved to AFTER the if(Fullscreen) block
+                        // below. GL_Resize(scrW,scrH) in the fullscreen branch
+                        // must run while IsRenderThreadActive()=FALSE, so it
+                        // applies DIRECTLY (wglMakeCurrent + GL_ResizeInternal)
+                        // instead of deferring via PostGLResize. If the render
+                        // thread were already running, GL_Resize would defer,
+                        // and the render thread's ApplyPendingResize would
+                        // race with the first frame draw → "fullscreen shows
+                        // only part of screen" for the first 1-2 frames (or
+                        // persistently if the race is lost).
                 }
 
                 if (Fullscreen)
@@ -2315,6 +2310,17 @@ void    Start (void)
                                 SWP_FRAMECHANGED);
 
                         ShowWindow(hMainWnd, SW_RESTORE);
+                }
+
+                // P59: start the render thread AFTER the fullscreen/windowed
+                // setup is complete. This ensures GL_Resize(scrW,scrH) in the
+                // fullscreen branch above ran with IsRenderThreadActive()=FALSE
+                // → applied DIRECTLY (not deferred) → viewport is correct from
+                // the very first frame. The render thread starts with the
+                // right GL state already set up.
+                if (MatchMonitorRate)
+                {
+                        StartRenderThread();
                 }
 
                 Depth  = 32;
