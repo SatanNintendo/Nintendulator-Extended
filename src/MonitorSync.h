@@ -102,6 +102,10 @@ namespace MonitorSync
         // at its native NES rate rather than changing game speed.
         double  GetTargetHz ();
 
+        // Nominal frame cadence of the selected NES video mode (60.0 Hz NTSC,
+        // 50.0 Hz PAL/Dendy). Kept separate from the native PPU master clock.
+        double  GetFrameHz ();
+
         // Native NES refresh rate for the current region, in Hz.
         // NTSC = 60.0988, PAL = 50.0069, Dendy = 50.0039.
         double  GetNESHz ();

@@ -663,7 +663,6 @@ static unsigned char s_FQ_Buf[FQ_SLOTS][FQ_FRAME_SIZE];
 static CRITICAL_SECTION s_FQ_CS;
 static bool s_FQ_CS_Init = false;
 static int  s_FQ_Head = 0, s_FQ_Tail = 0, s_FQ_Count = 0;
-static HANDLE s_FrameEvent = NULL;
 // Consumer-side scratch buffer: FQ_Consume copies into this so the
 // returned pointer stays valid even after the producer overwrites the
 // ring slot.
