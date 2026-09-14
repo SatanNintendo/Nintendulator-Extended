@@ -708,14 +708,30 @@ case ID_PPU_BILINEAR:
         CheckMenuItem(hMenu, ID_PPU_BILINEAR, MF_UNCHECKED);
     break;
 case ID_PPU_MATCHRATE:
-                        GFX::MatchMonitorRate = !GFX::MatchMonitorRate;
-        // Hand off to the MonitorSync module: this is where vsync is enabled,
-        // the monitor rate is (re)measured, and DRC state is reset.
-        MonitorSync::Enable(GFX::MatchMonitorRate ? TRUE : FALSE);
+{
+        // MMR owns a separate render thread and that thread owns the OpenGL
+        // context. A hot toggle cannot safely transfer that context while the
+        // emulation thread is still running. Restart the emulation/video pair
+        // exactly like the other video-mode changes so ownership is always
+        // deterministic: NES thread stops -> MMR worker/render thread stops ->
+        // video context is destroyed -> mode changes -> context is recreated ->
+        // the appropriate thread receives the context.
+        BOOL wasRunning = NES::Running;
+        NES::Stop();
+        MonitorSync::Enable(FALSE);
+        GFX::Stop();
+
+        GFX::MatchMonitorRate = !GFX::MatchMonitorRate;
+        GFX::Start();
+        if (wasRunning)
+                NES::Start(FALSE);
+
         if (GFX::MatchMonitorRate)
-                                CheckMenuItem(hMenu, ID_PPU_MATCHRATE, MF_CHECKED);
-        else    CheckMenuItem(hMenu, ID_PPU_MATCHRATE, MF_UNCHECKED);
+                CheckMenuItem(hMenu, ID_PPU_MATCHRATE, MF_CHECKED);
+        else
+                CheckMenuItem(hMenu, ID_PPU_MATCHRATE, MF_UNCHECKED);
         break;
+}
 
 case ID_PPU_INTSCALE:
     NES::Stop();
@@ -941,6 +957,15 @@ case WM_APP_SETTITLE:
         }
 }
 break;
+
+case WM_EXITSIZEMOVE:
+        // Moving the emulator between physical monitors does not necessarily
+        // generate WM_DISPLAYCHANGE. Re-query once after a drag/resize so MMR
+        // follows the display that actually contains the window without doing
+        // a DWM timing query for every WM_MOVE message.
+        if (GFX::MatchMonitorRate)
+                MonitorSync::OnDisplayChange();
+        break;
 
 case WM_DISPLAYCHANGE:
         // The display resolution or refresh rate has changed (user

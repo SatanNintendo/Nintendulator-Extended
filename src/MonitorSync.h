@@ -1,22 +1,19 @@
 /* Nintendulator - Win32 NES emulator written in C++
  * MonitorSync: real monitor-rate matching for the "Match Monitor Rate" feature.
  *
- * This module replaces the previous frame-throttle hack (CreateWaitableTimerExW
- * with a fixed 500us delay) with a proper monitor-rate aware sync layer:
+ * The critical invariant for Match Monitor Rate is now:
  *
- *   - Measures the actual monitor refresh rate via QPC sampling (refined
- *     every 60 frames using the frame-to-frame delta, which equals the
- *     monitor refresh when OpenGL vsync is on) and falls back to
- *     EnumDisplaySettings when no measurement has been taken yet.
- *   - Enables OpenGL vsync (WGL_EXT_swap_control) so SwapBuffers blocks
- *     until the next monitor vblank, throttling the emulation thread to
- *     the monitor's true refresh rate.
- *   - Provides a monitor-aware Dynamic Rate Control target so the audio
- *     playback frequency tracks (monitor_hz / nes_hz) * 44100, eliminating
- *     the periodic audio-buffer drift that caused the ~10-second micro-
- *     stutter when the monitor and NES rates differ by ~0.1 Hz.
- *   - Re-measures on WM_DISPLAYCHANGE so changing monitors or refresh
- *     rates at runtime keeps the sync correct.
+ *   - Measure the monitor refresh independently of emulator frame timing
+ *     (DWM exposes the fractional rate; display-mode enumeration is the
+ *     fallback).
+ *   - Pace the EMULATION/AUDIO frame cadence itself to that measured rate
+ *     when the monitor is close enough to the NES region rate. This avoids
+ *     the 60.0988 Hz vs 59.94/60.00 Hz beat that otherwise drops or repeats
+ *     a visual frame every several seconds.
+ *   - The render thread presents queued frames; it does not add a second
+ *     independent software timer on top of DwmFlush/SwapBuffers.
+ *   - Update DRC to the same target cadence so the DirectSound buffer sees
+ *     a stable producer/consumer relationship.
  *
  * Compatibility: Windows 7 and later. The only Windows API used directly
  * (vs the ones loaded dynamically) is EnumDisplaySettings, available on
@@ -62,17 +59,13 @@ namespace MonitorSync
         // invalidate the cached measurement.
         void    OnDisplayChange ();
 
-        // Called from GFX::DrawScreen after Update() has finished the
-        // SwapBuffers / Blt. Updates the calibration counter used to refine
-        // the monitor-rate measurement, which the next APU::UpdateDRC call
-        // picks up to compute the DRC target frequency.
+        // Called from GFX::DrawScreen after a frame is produced. Kept only
+        // as a lightweight compatibility hook for the existing diagnostics.
+        // It no longer calibrates the monitor rate from emulator timing.
         void    OnFrameEnd ();
 
-        // Called from APU::Run inside the audio-buffer fill wait loop in
-        // place of the old Sleep(1) / waitable-timer hack. Currently uses
-        // Sleep(1) (precise because timeBeginPeriod(1) is active), but kept
-        // as a separate function so future versions can swap in a smarter
-        // wait without touching APU.cpp.
+        // Authoritative MMR cadence hook. Kept as a compatibility wrapper;
+        // new code should use PaceSlot(), which targets the display clock.
         void    PaceFrame ();
 
         // Reset per-frame timing state. Called when (re)starting emulation
@@ -99,9 +92,15 @@ namespace MonitorSync
         void    SetDwmSyncMode (bool useDwm);
 
         // Current measured monitor refresh rate, in Hz.
-        // Always returns a value in [30, 1000]; falls back to 60.0 if no
-        // measurement has been taken yet.
+        // Fractional rates such as 59.940 Hz are preserved when Windows exposes
+        // them through DWM. Falls back to the current display mode otherwise.
         double  GetMonitorHz ();
+
+        // Actual target cadence used by MMR. When the monitor is within 5% of
+        // the current NES region rate, this is the monitor rate; for a gross
+        // mismatch (for example 75/120/144 Hz with NTSC), the emulator stays
+        // at its native NES rate rather than changing game speed.
+        double  GetTargetHz ();
 
         // Native NES refresh rate for the current region, in Hz.
         // NTSC = 60.0988, PAL = 50.0069, Dendy = 50.0039.
@@ -174,36 +173,11 @@ namespace MonitorSync
         // interval=0 switch actually happened.
         int     GetDwmSyncMode ();
 
-        // P51 (session 25): returns true when neither GL vsync nor
-        // DwmFlush provides real backpressure on this system (swap < 1ms
-        // for 60 consecutive frames, confirmed via NotifySwapDuration).
-        // When true, PaceFrame is the ONLY pacing mechanism and APU::Run
-        // must NOT gate its write-slot on GetCurrentPosition (which is
-        // quantized to ~10ms by audiodg and produces 3:2 pulldown
-        // judder). Instead, APU::Run calls PaceFrame and writes the
-        // slot unconditionally, with a bounded safety valve for the
-        // rare case of buffer overflow.
-        bool    IsPacingAuthoritative ();
 
-        // P51: called from GL_DrawFrame after SwapBuffers, with the
-        // measured swap duration in milliseconds. Updates the internal
-        // backpressure tracker that drives IsPacingAuthoritative().
-        // swap < 1.0ms increments the counter; swap >= 1.0ms resets it.
-        void    NotifySwapDuration (double swapMs);
-
-        // P51b: authoritative slot pacer. Used by APU::Run when
-        // IsPacingAuthoritative() is true. Unlike PaceFrame (which
-        // drift-corrects from OnFrameEnd), PaceSlot drift-corrects
-        // from the PREVIOUS slot write (g_LastSlotWriteQPC, updated
-        // by NotifySlotWritten). This is the correct base point: each
-        // slot write should land exactly (1000/NESHz) ms after the
-        // previous one, forming a self-synchronising cycle without
-        // audiodg's 10ms quantization.
+        // Authoritative emulator-frame/audio-slot pacer. Each slot is paced
+        // from the PREVIOUS slot write using GetTargetHz(), so the emulator
+        // cadence itself matches the monitor clock (for supported near-rate
+        // combinations) instead of relying on frame-dropping in the renderer.
         void    PaceSlot ();
 
-        // P51b: called from APU::Run immediately AFTER the slot write
-        // (Lock/memcpy/Unlock). Records the QPC timestamp so the next
-        // PaceSlot can drift-correct from this point. Harmless if
-        // called when the authoritative path is not active.
-        void    NotifySlotWritten ();
 }

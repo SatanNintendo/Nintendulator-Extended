@@ -242,6 +242,10 @@ static __declspec(align(8)) volatile LONGLONG g_PendingResize = -1LL;
 // 0 = nearest (off), 1 = linear (on), -1 = no pending change.
 static volatile LONG g_PendingBilinear = -1L;
 
+// Render-thread wake event. Declared here because UI-side resize/filter posts
+// may need to wake the render thread even when emulation is paused.
+static HANDLE s_FrameEvent = NULL;
+
 void ApplyGLFilter(void)
 {
         // Post the change for deferred application in GL_DrawFrame.
@@ -562,6 +566,8 @@ void PostGLResize(int w, int h)
 
         LONGLONG packed = ((LONGLONG)(DWORD)w << 32) | (LONGLONG)(DWORD)h;
         InterlockedExchange64(&g_PendingResize, packed);
+        if (s_FrameEvent)
+                SetEvent(s_FrameEvent);
 }
 
 // Read and apply any deferred resize. Called at the start of GL_DrawFrame,
@@ -918,9 +924,6 @@ static void GL_DrawFrameFromBuffer(const unsigned char *rgba)
                 LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
                 int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
                 s_diagBuf[idx].t2 = qpc.QuadPart;
-                double swapMs = (double)(s_diagBuf[idx].t2 - s_diagBuf[idx].t1)
-                        * 1000.0 / DiagQPCFreq();
-                MonitorSync::NotifySwapDuration(swapMs);
         }
         if (MatchMonitorRate)
         {
@@ -944,133 +947,38 @@ static DWORD WINAPI RenderThreadProc(void *)
         AcquireGLContext();
         InterlockedExchange(&s_RenderThreadActive, 1);
 
-        // P55: waitable timer to prevent the render thread from running
-        // FASTER than one frame period. DwmFlush alone is an unreliable
-        // pacer — it sometimes returns in ~6-9ms (catching the tail of a
-        // composition tick) instead of blocking a full ~16.67ms vblank.
-        // That produced the 2:1 pulldown pattern (gap 6/16/16/6/16...)
-        // seen in the P54 log. The timer ensures each GL_DrawFrameFromBuffer
-        // call lands at least (1000/NESHz) ms after the previous one,
-        // with DwmFlush providing vblank alignment on top.
-        typedef HANDLE (WINAPI *PFN_CreateWaitableTimerExW)(
-                LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
-        static const DWORD CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG = 0x00000002;
-        HANDLE hTimer = NULL;
-        {
-                PFN_CreateWaitableTimerExW pfnEx = (PFN_CreateWaitableTimerExW)
-                        GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
-                                       "CreateWaitableTimerExW");
-                if (pfnEx)
-                        hTimer = pfnEx(NULL, NULL,
-                                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG,
-                                TIMER_ALL_ACCESS);
-                if (!hTimer)
-                        hTimer = CreateWaitableTimer(NULL, FALSE, NULL);
-        }
-        // QPC for drift correction (reuse MonitorSync's frequency).
-        LARGE_INTEGER qpcFreq;
-        QueryPerformanceFrequency(&qpcFreq);
-        LONGLONG lastRenderQPC = 0;
-
+        // IMPORTANT: the render thread deliberately has NO independent
+        // software cadence timer. The emulation thread is already paced to
+        // the actual monitor refresh by MonitorSync::PaceSlot(). Adding a
+        // second timer here creates a second clock and reintroduces the exact
+        // phase-error/2:1 pulldown patterns seen in P54-P56.
+        //
+        // DwmFlush/SwapBuffers remain responsible only for present/vblank
+        // alignment. When they stall, the emulation thread continues producing
+        // frames into the queue; when the render thread wakes it consumes the
+        // newest frame.
         while (!InterlockedExchangeAdd(&s_RenderThreadStop, 0))
         {
-                // P56: take the QPC at the START of the iteration. The
-                // timer drift-corrects from start-to-start (the true
-                // frame-to-frame gap). The previous code set lastRenderQPC
-                // at the END, which made elapsed = time-since-end-of-last-
-                // render ≈ 0, so the timer ALWAYS waited the full target
-                // period ON TOP OF whatever DwmFlush/SwapBuffers had
-                // already blocked → 33ms double-pacing (gap=33ms,
-                // swap=16.5ms) seen in the F000181+ log block after DwmFlush
-                // armed. With the QPC taken here, elapsed measures the
-                // actual gap; if DwmFlush already blocked ~16.5ms,
-                // remainMs ≈ 0.2ms → no extra timer wait → no double-block.
-                LARGE_INTEGER iterStart;
-                QueryPerformanceCounter(&iterStart);
-
-                // P56: pace the render thread to the MONITOR refresh rate,
-                // not the NES rate. The render thread PRESENTS to the
-                // screen, so it must match the monitor's vblank period.
-                // Pacing to NES Hz (16.64ms) when the monitor is 59.83 Hz
-                // (16.71ms) caused a 0.07ms/frame drift → one dropped/
-                // duplicated frame every ~240 frames ≈ every 4 seconds →
-                // the "constant scroll judder" symptom. Read dynamically
-                // each iteration: calibration refines g_MonitorHz over
-                // the first ~60 frames, and WM_DISPLAYCHANGE can change it.
-                double monHz = MonitorSync::GetMonitorHz();
-                double targetMs = (monHz > 1.0) ? (1000.0 / monHz) : 16.667;
-                // Wait timeout: slightly longer than one frame period. If
-                // no frame arrives (emulation paused/stalled), we still
-                // present to keep DWM composition alive.
-                DWORD waitMs = (DWORD)(targetMs + 4.0);
-
-                WaitForSingleObject(s_FrameEvent, waitMs);
+                DWORD wait = WaitForSingleObject(s_FrameEvent, INFINITE);
+                if (wait != WAIT_OBJECT_0)
+                        continue;
+                if (InterlockedExchangeAdd(&s_RenderThreadStop, 0))
+                        break;
 
                 const unsigned char *pixels = FQ_Consume();
-
-                // P58: the timer is ONLY needed when DwmFlush is NOT the
-                // pacer for this iteration. DwmFlush is the pacer when it
-                // is armed (g_DwmSyncMode=1) AND a frame is available
-                // (GL_DrawFrameFromBuffer calls DwmFlush internally).
-                //
-                // When DwmFlush is the pacer, stacking the timer on top
-                // causes phase drift: DwmFlush returns 14.8ms (short) on
-                // frame N → timer adds 1.5ms on frame N+1 → DwmFlush then
-                // blocks 16.2ms → total 17.7ms (overcorrected) → the next
-                // DwmFlush catches a different vblank → 14.8ms again.
-                // This produced the 18/16/16 judder pattern in the log.
-                //
-                // By skipping the timer when DwmFlush is armed+frame-ready,
-                // DwmFlush becomes the SOLE pacer. It self-corrects because
-                // it aligns to the DWM composition tick — a short frame is
-                // automatically compensated by the next tick alignment.
-                //
-                // The timer is still used for:
-                //   - Warmup phase (DwmFlush not armed, returns instantly)
-                //   - Idle loop (no frame → no DwmFlush call → need timer)
-                bool dwmArmed = (MonitorSync::GetDwmSyncMode() != 0);
-                bool needTimer = !dwmArmed || (pixels == NULL);
-
-                // P55/P56: enforce minimum frame period via waitable timer.
-                if (hTimer && needTimer && lastRenderQPC != 0 && qpcFreq.QuadPart > 0)
-                {
-                        double elapsedMs = (double)(iterStart.QuadPart - lastRenderQPC)
-                                * 1000.0 / (double)qpcFreq.QuadPart;
-                        double remainMs = targetMs - elapsedMs;
-                        if (remainMs > 1.0)
-                        {
-                                LARGE_INTEGER due;
-                                due.QuadPart = -(LONGLONG)(remainMs * 10000.0);
-                                SetWaitableTimer(hTimer, &due, 0, NULL, NULL, FALSE);
-                                WaitForSingleObject(hTimer, 20);
-                        }
-                }
-
-                // P56: record the start-of-iteration QPC (NOT end-of-work).
-                lastRenderQPC = iterStart.QuadPart;
-
                 if (pixels)
                 {
                         GL_DrawFrameFromBuffer(pixels);
                 }
                 else
                 {
-                        // No new frame: present the previous frame again to
-                        // keep DWM happy (SwapBuffers on vblank). Avoids a
-                        // black flash if emulation briefly stalls.
-                        // P57: apply any pending resize here too (not just in
-                        // GL_DrawFrameFromBuffer) so the idle loop uses the
-                        // correct viewport — needed for fullscreen entry
-                        // where GL_Resize defers via PostGLResize.
+                        // No frame is pending. Do not clear or call
+                        // SwapBuffers: keeping the already-displayed surface
+                        // visible is both cheaper and visually correct.
                         ApplyPendingResize();
-                        glViewport(0, 0, glWinW, glWinH);
-                        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-                        glClear(GL_COLOR_BUFFER_BIT);
-                        SwapBuffers(hGLDC);
                 }
         }
 
-        if (hTimer) CloseHandle(hTimer);
         ReleaseGLContext();
         InterlockedExchange(&s_RenderThreadActive, 0);
         return 0;
@@ -1209,8 +1117,8 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         // the remaining judder is a separate/residual issue) or sitting at
         // a suspicious round number like exactly 60.0 (bad: calibration
         // never ran or never moved, so DRC is not correcting anything).
-        _ftprintf(f, _T("Live calibrated monitor Hz: %.4f (NES native: %.4f)\n"),
-                MonitorSync::GetMonitorHz(), MonitorSync::GetNESHz());
+        _ftprintf(f, _T("Monitor refresh Hz: %.6f | MMR target Hz: %.6f | Frame cadence Hz: %.6f | NES native Hz: %.6f\n"),
+                MonitorSync::GetMonitorHz(), MonitorSync::GetTargetHz(), MonitorSync::GetFrameHz(), MonitorSync::GetNESHz());
         _ftprintf(f, _T("Columns: frame | gap(t0[n]->t0[n-1], TRUE frame-to-frame period incl. unmeasured CPU/PPU/APU time -- P43) | t0->t1(texUpload) | t1->t2(SwapBuf) | t2->t2b(should be ~0 as of P44, context no longer released here) | t2b->t3(OnFrameEnd) | t3->t4(UpdateDRC) | total(t0->t4, video-draw slice only)\n\n"));
 
         // P43 (session 20): t0->t4 only spans GL_DrawFrame+OnFrameEnd+
@@ -1261,7 +1169,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 // frames got drawn within one real vblank (one of them
                 // presumably invisible), which is just as much a visible
                 // stutter as a dropped one.
-                double centerMs   = (MonitorSync::GetMonitorHz() > 1.0) ? 1000.0 / MonitorSync::GetMonitorHz() : 16.667;
+                double centerMs   = (MonitorSync::GetTargetHz() > 1.0) ? 1000.0 / MonitorSync::GetTargetHz() : 16.667;
                 bool   gapStalled = haveGap && (fabs(dgap - centerMs) > 8.0);
 
                 // Mark stalled stages with '*'
@@ -1866,17 +1774,6 @@ static void GL_DrawFrame(void)
                 int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
                 s_diagBuf[idx].t2 = qpc.QuadPart;
 
-                // P51: feed the swap duration to MonitorSync so it can
-                // detect whether SwapBuffers/DwmFlush provides real
-                // backpressure. If swap < 1.0ms for 60 consecutive frames,
-                // IsPacingAuthoritative() returns true and APU::Run
-                // switches to the authoritative-pacer path (no
-                // GetCurrentPosition polling). This is what breaks the
-                // 3:2 pulldown judder on systems where vsync/DwmFlush
-                // do not block.
-                double swapMs = (double)(s_diagBuf[idx].t2 - s_diagBuf[idx].t1)
-                        * 1000.0 / DiagQPCFreq();
-                MonitorSync::NotifySwapDuration(swapMs);
         }
 
         // P44 (session 21): no per-frame wglMakeCurrent(NULL, NULL) here
@@ -2124,6 +2021,8 @@ void    Start (void)
                         {
                                 MonitorSync::Enable(TRUE);
                                 MonitorSync::SetDwmSyncMode(false);
+                                MonitorSync::OnDisplayChange();
+                                MonitorSync::ResetState();
                                 StartRenderThread();
                         }
 
@@ -2196,6 +2095,8 @@ void    Start (void)
                 {
                         MonitorSync::Enable(TRUE);
                         MonitorSync::SetDwmSyncMode(false);
+                        MonitorSync::OnDisplayChange();
+                        MonitorSync::ResetState();
                         // P59: StartRenderThread() is deliberately NOT called
                         // here — it is moved to AFTER the if(Fullscreen) block
                         // below. GL_Resize(scrW,scrH) in the fullscreen branch
@@ -2764,11 +2665,10 @@ void    DrawScreen (void)
                         Update();
                 }
                 FPSCnt = 0;
-                // When Match Monitor Rate is enabled, Update() (which calls
-                // SwapBuffers) has just blocked until the next monitor vblank
-                // thanks to OpenGL vsync turned on by MonitorSync::Enable.
-                // Use this post-vblank moment to refine the monitor-rate
-                // measurement and apply an extra DwmFlush sync hint.
+                // MMR's cadence is established in APU::Run/PaceSlot before
+                // this frame is produced. OnFrameEnd is now only a lightweight
+                // compatibility hook; monitor-rate measurement is independent
+                // of emulator frame timing.
                 if (MatchMonitorRate)
                 {
                         MonitorSync::OnFrameEnd();

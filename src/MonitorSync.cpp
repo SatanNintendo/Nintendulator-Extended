@@ -2,20 +2,22 @@
  * MonitorSync implementation. See MonitorSync.h for the design overview.
  *
  * Strategy:
- *   1. Enable OpenGL vsync via WGL_EXT_swap_control. SwapBuffers then
- *      blocks until the next monitor vblank, throttling the emulation
- *      thread to the monitor's true refresh rate. This is what eliminates
- *      the ~10-second micro-stutter when monitor and NES rates differ.
+ *   1. Measure the display cadence independently of emulator timing. Prefer
+ *      DWM's fractional refresh timing and fall back to the active display mode.
+ *      This avoids the circular calibration of measuring an emulator that is
+ *      itself already being paced to the display.
  *
- *   2. Continuously measure the actual frame rate via QueryPerformanceCounter
- *      sampling. With vsync on, the measured FPS equals the monitor refresh
- *      rate, which we feed into the DRC target so the audio playback rate
- *      tracks (monitor_hz / nes_hz) * 44100 instead of being pinned to 44100.
+ *   2. Pace the emulator's 60/50-Hz audio/video slot cadence against that
+ *      measured display rate when the rates are close. This removes the
+ *      60.0988-vs-59.94/60.00 beat that otherwise forces occasional dropped
+ *      or repeated visual frames.
  *
- * Every external API is loaded dynamically so the binary still runs on a
- * fresh Windows 7 install without any redistributables. Missing APIs are
- * silently skipped -- the emulator continues to work, just without the
- * benefit that API would have provided.
+ *   3. The render thread is separately responsible for presentation/vblank
+ *      alignment. It does not run a second software frame timer.
+ *
+ * Every external API is loaded dynamically where practical so the binary still
+ * runs on Windows 7+. Missing optional APIs fall back to the display-mode
+ * timing path.
  */
 
 #include "stdafx.h"
@@ -26,6 +28,7 @@
 #include "GFX.h"
 #include "NES.h"
 #include "APU.h"
+#include <dwmapi.h>
 
 // ------------------------------------------------------------------
 // WGL swap-control extension (present in every Windows OpenGL ICD
@@ -331,43 +334,26 @@ static PFN_wglSwapIntervalEXT    pfnWglSwapIntervalEXT    = NULL;
 static PFN_wglGetSwapIntervalEXT pfnWglGetSwapIntervalEXT = NULL;
 
 // Measured / cached values.
-static double         g_MonitorHz  = 60.0;     // last confirmed monitor rate
-static double         g_NESHz      = 60.0988;  // NTSC default; updated by SetNESRegion
+// g_MonitorHz is the ACTUAL display/compositor refresh rate, preferably
+// obtained from DWM's fractional timing information (59.940, 59.9986,
+// 60.000, etc.) rather than the integer dmDisplayFrequency value.
+static volatile LONG  g_MonitorHzMilli = 60000; // 60.000 Hz, milli-Hz fixed point
+static double         g_NESHz     = 60.0988;  // hardware/PPU native rate
+// APU/GFX produce one audio/video slot per these nominal frame rates
+// (60 NTSC/Dendy in this codebase, 50 PAL).  Match Monitor Rate must pace
+// against this cadence, not the fractional PPU crystal rate above, because
+// APU::LockSize is explicitly derived from WantFPS (60/50).
+static double         g_FrameHz   = 60.0;     // emulation slot cadence
 
 // Did we successfully enable OpenGL vsync?
-static bool           g_VSyncActive  = false;
+static bool           g_VSyncActive = false;
 
-// ------------------------------------------------------------------
-// Calibration: refine g_MonitorHz by sampling frame-to-frame QPC deltas.
-// ------------------------------------------------------------------
-static const int      CALIB_FRAMES    = 60;
-static const int      CALIB_REJECT_SNAP_AFTER = 3;  // P41: consecutive agreeing rejections before hard-snap
-static int            g_CalibCount    = 0;
-static LARGE_INTEGER  g_CalibStartQPC = {0, 0};
-static bool           g_CalibActive   = false;
-
-// P41 (session 18): track consecutive calibration windows that all
-// disagree with g_MonitorHz by more than the 2Hz noise-rejection
-// tolerance, so a SUSTAINED mismatch (the seed was simply wrong) can be
-// told apart from a one-off noisy window (a single hiccup). See the
-// comment inside OnFrameEnd() for the full rationale.
-static int            g_CalibRejectCount = 0;
-static double         g_CalibRejectRefHz = 0.0;
-
-// QPC timestamp of last OnFrameEnd() call; used by PaceFrame() for
-// drift correction.
-static LARGE_INTEGER  g_LastFrameEndQPC = {0, 0};
-
-// P51b: QPC timestamp of the last DirectSound slot write (from APU::Run
-// write_slot). Used by PaceSlot() for drift correction in the
-// authoritative-pacer path. This is the CORRECT base point for slot
-// pacing: each slot write should happen exactly (1000/NESHz) ms after
-// the PREVIOUS slot write, not after OnFrameEnd (which fires later in
-// the frame, after CPU+GL_DrawFrame work). Using g_LastFrameEndQPC
-// (as the original P51 did via PaceFrame) made each frame's gap grow
-// by the CPU+GL work after APU::Run, producing the 22-26ms "game runs
-// slow" regression reported after P51.
-static LARGE_INTEGER  g_LastSlotWriteQPC = {0, 0};
+// Absolute monitor-clock phase used by PaceSlot().  Unlike P51b's
+// previous "last actual write" anchor, this schedule is tied to a fixed
+// QPC epoch, so timer wake-up jitter does not random-walk the emulation
+// phase relative to the display vblank.
+static LARGE_INTEGER  g_PaceEpochQPC = {0, 0};
+static ULONGLONG      g_PaceFrameIndex = 0;
 
 // ------------------------------------------------------------------
 // Deferred vsync interval (written by Enable/UI thread, applied by
@@ -377,17 +363,6 @@ static volatile LONG  g_PendingVSyncInterval = -1;
 
 // DWM-sync mode: interval=0 but g_VSyncActive stays true.
 static volatile LONG  g_DwmSyncMode = 0;
-
-// P51: track whether SwapBuffers provides real backpressure.
-// Updated every frame from GL_DrawFrame via NotifySwapDuration().
-// If swap < 1.0ms for BACKPRESSURE_CONFIRM_FRAMES consecutive frames,
-// we conclude that neither GL vsync nor DwmFlush is blocking, and
-// PaceFrame must be the authoritative pacer (APU::Run stops gating
-// its write-slot on GetCurrentPosition, which is quantized to ~10ms
-// by audiodg and produces 3:2 pulldown judder).
-static volatile LONG g_SwapBackpressureFrames = 0;
-static volatile LONG g_PacingAuthoritative    = 0;
-#define BACKPRESSURE_CONFIRM_FRAMES 60   // ~1 sec of evidence at 60fps
 
 // ------------------------------------------------------------------
 // Waitable timer for PaceFrame.
@@ -401,19 +376,106 @@ static const DWORD CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG = 0x00000002;
 // Helpers
 // ------------------------------------------------------------------
 
+typedef HRESULT (WINAPI *PFN_DwmGetCompositionTimingInfo)(HWND, DWM_TIMING_INFO*);
+
+static double QueryDwmMonitorHz()
+{
+    HMODULE hDwm = GetModuleHandleW(L"dwmapi.dll");
+    if (!hDwm)
+        hDwm = LoadLibraryW(L"dwmapi.dll");
+    if (!hDwm)
+        return 0.0;
+
+    PFN_DwmGetCompositionTimingInfo pfn =
+        (PFN_DwmGetCompositionTimingInfo)GetProcAddress(hDwm, "DwmGetCompositionTimingInfo");
+    if (!pfn)
+        return 0.0;
+
+    DWM_TIMING_INFO ti;
+    ZeroMemory(&ti, sizeof(ti));
+    ti.cbSize = sizeof(ti);
+
+    // Windows 8.1+ requires hwnd == NULL.  Windows 7 accepts a window
+    // handle, so try the actual emulator window first and fall back to NULL
+    // for newer systems that reject a non-NULL HWND.
+    HRESULT hr = pfn(g_hWnd, &ti);
+    if (FAILED(hr) && g_hWnd != NULL)
+    {
+        ZeroMemory(&ti, sizeof(ti));
+        ti.cbSize = sizeof(ti);
+        hr = pfn(NULL, &ti);
+    }
+
+    if (FAILED(hr))
+        return 0.0;
+
+    if (ti.rateRefresh.uiDenominator != 0 && ti.rateRefresh.uiNumerator != 0)
+    {
+        double hz = (double)ti.rateRefresh.uiNumerator /
+                    (double)ti.rateRefresh.uiDenominator;
+        if (hz >= 30.0 && hz <= 1000.0)
+            return hz;
+    }
+
+    // rateRefresh is authoritative, but qpcRefreshPeriod is a useful
+    // fallback on drivers where the rational is temporarily unavailable.
+    if (ti.qpcRefreshPeriod > 0 && g_QPCFreq.QuadPart > 0)
+    {
+        double hz = (double)g_QPCFreq.QuadPart /
+                    (double)ti.qpcRefreshPeriod;
+        if (hz >= 30.0 && hz <= 1000.0)
+            return hz;
+    }
+
+    return 0.0;
+}
+
 static DWORD GetDisplayFrequencyFromEnum()
 {
+    // Use the monitor that actually contains the emulator window.  The old
+    // EnumDisplaySettings(NULL, ...) queried the primary display even when
+    // the window was moved to another monitor.
+    TCHAR deviceName[CCHDEVICENAME];
+    deviceName[0] = 0;
+    if (g_hWnd)
+    {
+        HMONITOR hMon = MonitorFromWindow(g_hWnd, MONITOR_DEFAULTTONEAREST);
+        if (hMon)
+        {
+            MONITORINFOEX mi;
+            ZeroMemory(&mi, sizeof(mi));
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfo(hMon, &mi))
+                _tcsncpy_s(deviceName, _countof(deviceName), mi.szDevice, _TRUNCATE);
+        }
+    }
+
     DEVMODE dm;
     ZeroMemory(&dm, sizeof(dm));
     dm.dmSize = sizeof(dm);
     dm.dmDriverExtra = 0;
-    if (EnumDisplaySettings(NULL, ENUM_CURRENT_SETTINGS, &dm))
+    LPCWSTR device = (deviceName[0] != 0) ? deviceName : NULL;
+    if (EnumDisplaySettingsEx(device, ENUM_CURRENT_SETTINGS, &dm, 0))
     {
         DWORD hz = dm.dmDisplayFrequency;
         if (hz >= 30 && hz <= 1000)
             return hz;
     }
     return 0;
+}
+
+static double QueryMonitorHz()
+{
+    // In the composited modes DWM exposes the actual fractional monitor rate.
+    // This is the value we need to eliminate the classic 60.0988 vs 59.94/60.00
+    // cadence mismatch.  For exclusive fullscreen, or if DWM cannot answer,
+    // fall back to the current display mode.
+    double dwmHz = QueryDwmMonitorHz();
+    if (dwmHz >= 30.0 && dwmHz <= 1000.0)
+        return dwmHz;
+
+    DWORD enumHz = GetDisplayFrequencyFromEnum();
+    return (enumHz >= 30 && enumHz <= 1000) ? (double)enumHz : 60.0;
 }
 
 static void LoadWGLSwapControl()
@@ -468,8 +530,8 @@ void Init(HWND hwnd)
     g_hWnd = hwnd;
     QueryPerformanceFrequency(&g_QPCFreq);
 
-    DWORD hz = GetDisplayFrequencyFromEnum();
-    g_MonitorHz = (hz > 0) ? (double)hz : 60.0;
+    double hz = QueryMonitorHz();
+    InterlockedExchange(&g_MonitorHzMilli, (LONG)(hz * 1000.0 + 0.5));
 
     g_Initialized = true;
 }
@@ -478,18 +540,9 @@ void OnDisplayChange()
 {
     if (!g_Initialized) return;
 
-    DWORD hz = GetDisplayFrequencyFromEnum();
-    if (hz > 0)
-    {
-        if (fabs((double)hz - g_MonitorHz) > 0.05)
-            g_MonitorHz = (double)hz;
-    }
-
-    g_CalibCount = 0;
-    g_CalibStartQPC.QuadPart = 0;
-    g_CalibRejectCount = 0;
-    g_CalibRejectRefHz = 0.0;
-    g_CalibActive = IsEnabled();
+    double hz = QueryMonitorHz();
+    if (hz >= 30.0 && hz <= 1000.0)
+        InterlockedExchange(&g_MonitorHzMilli, (LONG)(hz * 1000.0 + 0.5));
 }
 
 void Enable(BOOL on)
@@ -538,10 +591,8 @@ void Enable(BOOL on)
     {
         InterlockedExchange(&g_PendingVSyncInterval, 1L);
         g_VSyncActive = false;
-        g_CalibActive = false;
-        // P51: reset the authoritative-pacer tracker when MMR is disabled.
-        InterlockedExchange(&g_SwapBackpressureFrames, 0);
-        InterlockedExchange(&g_PacingAuthoritative, 0);
+        g_PaceEpochQPC.QuadPart = 0;
+        g_PaceFrameIndex = 0;
         StopVBlankThread();
         APU::ResetDRC();
         // Stop the P30 worker after ResetDRC() has posted its frequency-
@@ -584,7 +635,7 @@ bool IsVSyncActive()
 
 double GetMonitorHz()
 {
-    return g_MonitorHz;
+    return (double)InterlockedExchangeAdd(&g_MonitorHzMilli, 0L) / 1000.0;
 }
 
 double GetNESHz()
@@ -597,55 +648,58 @@ int GetDwmSyncMode()
     return (int)InterlockedExchangeAdd(&g_DwmSyncMode, 0);
 }
 
-bool IsPacingAuthoritative()
+double GetTargetHz()
 {
-    return InterlockedExchangeAdd(&g_PacingAuthoritative, 0) != 0;
+    double monitorHz = GetMonitorHz();
+    double frameHz = g_FrameHz;
+    if (monitorHz < 30.0 || monitorHz > 1000.0 || frameHz <= 0.0)
+        return frameHz;
+
+    // Match Monitor Rate is intended to remove the small clock mismatch
+    // between the emulator's nominal 60/50 Hz frame cadence and the physical
+    // display (for example 59.940 Hz or 60.000 Hz).  Do not accelerate a
+    // 60-Hz game to a 75/120/144-Hz desktop refresh: those modes require frame
+    // duplication rather than changing emulation speed.
+    double relative = fabs(monitorHz - frameHz) / frameHz;
+    if (relative <= 0.05)
+        return monitorHz;
+    return frameHz;
 }
 
-// P51: called from GL_DrawFrame after SwapBuffers, with the measured
-// swap duration in milliseconds. Updates the backpressure tracker.
-// If swap < 1.0ms for BACKPRESSURE_CONFIRM_FRAMES consecutive frames,
-// we conclude that neither GL vsync nor DwmFlush is blocking, and
-// PaceFrame becomes the authoritative pacer (APU::Run stops polling
-// GetCurrentPosition). If swap >= 1.0ms (real backpressure detected),
-// reset the tracker and clear the authoritative flag.
-void NotifySwapDuration(double swapMs)
+double GetFrameHz()
 {
-    if (swapMs < 1.0)
-    {
-        LONG n = InterlockedIncrement(&g_SwapBackpressureFrames);
-        if (n >= BACKPRESSURE_CONFIRM_FRAMES)
-            InterlockedExchange(&g_PacingAuthoritative, 1);
-    }
-    else
-    {
-        InterlockedExchange(&g_SwapBackpressureFrames, 0);
-        InterlockedExchange(&g_PacingAuthoritative, 0);
-    }
+    return g_FrameHz;
 }
 
 void SetNESRegion(int region)
 {
     switch (region)
     {
-        case 1: g_NESHz = 60.0988; break;  // NTSC
-        case 2: g_NESHz = 50.0069; break;  // PAL
-        case 3: g_NESHz = 50.0039; break;  // Dendy
-        default: g_NESHz = 60.0988; break;
+        case 1:
+            g_NESHz = 60.0988;
+            g_FrameHz = 60.0;
+            break;
+        case 2:
+            g_NESHz = 50.0069;
+            g_FrameHz = 50.0;
+            break;
+        case 3:
+            g_NESHz = 50.0039;
+            g_FrameHz = 50.0;
+            break;
+        default:
+            g_NESHz = 60.0988;
+            g_FrameHz = 60.0;
+            break;
     }
 }
 
 void ResetState()
 {
-    g_CalibCount = 0;
-    g_CalibStartQPC.QuadPart = 0;
-    g_CalibRejectCount = 0;
-    g_CalibRejectRefHz = 0.0;
-    g_CalibActive = true;
-    g_LastFrameEndQPC.QuadPart = 0;
-    // P51b: reset the slot-write base point too, so the first PaceSlot
-    // after a reset waits the full slot period (no drift correction).
-    g_LastSlotWriteQPC.QuadPart = 0;
+    // Reset the absolute monitor-clock phase. The next MMR frame establishes
+    // a fresh QPC epoch so a newly loaded ROM never inherits an old cadence.
+    g_PaceEpochQPC.QuadPart = 0;
+    g_PaceFrameIndex = 0;
 }
 
 void SetDwmSyncMode(bool useDwm)
@@ -668,256 +722,101 @@ void SetDwmSyncMode(bool useDwm)
 
 void OnFrameEnd()
 {
-    if (!g_Initialized || !IsEnabled())
-        return;
+    // Kept as a lightweight timing hook for the existing diagnostic path.
+    // IMPORTANT: monitor-rate calibration must NOT use emulation frame timing
+    // here. Once MMR is active the emulator itself is paced to the monitor, so
+    // feeding that timing back into g_MonitorHz would make the measurement
+    // circular and could slowly chase its own clock. The display rate is now
+    // obtained independently from DWM/display-mode timing in OnDisplayChange.
+}
 
-    if (g_QPCFreq.QuadPart > 0)
-        QueryPerformanceCounter(&g_LastFrameEndQPC);
+static HANDLE CreatePaceTimer()
+{
+    PFN_CreateWaitableTimerExW pfnEx =
+        (PFN_CreateWaitableTimerExW)GetProcAddress(
+            GetModuleHandleW(L"kernel32.dll"), "CreateWaitableTimerExW");
+    HANDLE ht = NULL;
+    if (pfnEx)
+        ht = pfnEx(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG, TIMER_ALL_ACCESS);
+    if (!ht)
+        ht = CreateWaitableTimer(NULL, FALSE, NULL);
+    return ht;
+}
 
-    if (g_CalibActive && g_QPCFreq.QuadPart > 0)
+void PaceSlot()
+{
+    // Absolute QPC schedule.  The first call establishes the phase and writes
+    // immediately; every later call targets epoch + N * monitor_period.
+    // Because the target is absolute rather than "previous actual write +
+    // period", a late timer wake-up does NOT become permanent phase drift.
+    if (g_PaceTimer == NULL)
     {
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-
-        if (g_CalibStartQPC.QuadPart == 0)
-        {
-            g_CalibStartQPC = now;
-            g_CalibCount = 0;
-        }
-        else
-        {
-            g_CalibCount++;
-            if (g_CalibCount >= CALIB_FRAMES)
-            {
-                double elapsedSec =
-                    (double)(now.QuadPart - g_CalibStartQPC.QuadPart) /
-                    (double)g_QPCFreq.QuadPart;
-                if (elapsedSec > 0.0)
-                {
-                    double measuredHz = (double)g_CalibCount / elapsedSec;
-                    if (measuredHz >= 30.0 && measuredHz <= 1000.0)
-                    {
-                        if (fabs(measuredHz - g_MonitorHz) > 2.0)
-                        {
-                            // P41 (session 18): this branch used to just
-                            // discard the sample and restart the window,
-                            // forever, with no way to ever leave. That
-                            // was fine for its original purpose -- ignore
-                            // ONE noisy window (a hiccup, a dropped frame)
-                            // -- but it could not tell a one-off outlier
-                            // apart from every single window consistently
-                            // reporting a DIFFERENT real rate, which is
-                            // exactly what happens when the seed value
-                            // (from GetDisplayFrequencyFromEnum() in
-                            // Init()) is simply wrong for the monitor the
-                            // game window is actually on -- confirmed by
-                            // the session-17 log: real frame pacing at
-                            // ~13.2ms/frame (~75Hz) while g_MonitorHz sat
-                            // at exactly 60.0000 forever, because 75-60=15
-                            // is always >2Hz away and got rejected every
-                            // single window. DRC/MMR then has no chance:
-                            // it's compensating for the wrong gap.
-                            //
-                            // Fix: track consecutive rejected windows. If
-                            // several IN A ROW cluster near each other
-                            // (i.e. this isn't random noise, it's the same
-                            // "wrong" number showing up again and again),
-                            // treat it as the real rate and snap to it
-                            // directly instead of slow-blending -- the
-                            // seed was wrong, not the display.
-                            if (g_CalibRejectCount == 0 ||
-                                fabs(measuredHz - g_CalibRejectRefHz) <= 1.0)
-                            {
-                                g_CalibRejectRefHz = (g_CalibRejectCount == 0)
-                                        ? measuredHz
-                                        : 0.5 * g_CalibRejectRefHz + 0.5 * measuredHz;
-                                g_CalibRejectCount++;
-
-                                if (g_CalibRejectCount >= CALIB_REJECT_SNAP_AFTER)
-                                {
-                                    g_MonitorHz = g_CalibRejectRefHz;
-                                    g_CalibRejectCount = 0;
-                                    g_CalibRejectRefHz = 0.0;
-                                }
-                            }
-                            else
-                            {
-                                // This rejection doesn't agree with the
-                                // previous one(s) either -- genuine noise,
-                                // not a sustained rate change. Start a
-                                // fresh streak from this sample.
-                                g_CalibRejectCount = 1;
-                                g_CalibRejectRefHz = measuredHz;
-                            }
-                            g_CalibCount = 0;
-                            g_CalibStartQPC = now;
-                            return;
-                        }
-                        // Measurement agrees with the current estimate --
-                        // normal fine-tuning, and any pending reject
-                        // streak was clearly noise, not a real trend.
-                        g_CalibRejectCount = 0;
-                        // 90/10 low-pass filter
-                        g_MonitorHz = 0.9 * g_MonitorHz + 0.1 * measuredHz;
-                    }
-                }
-                g_CalibCount = 0;
-                g_CalibStartQPC = now;
-            }
-        }
+        HANDLE ht = CreatePaceTimer();
+        g_PaceTimer = ht ? ht : INVALID_HANDLE_VALUE;
     }
+
+    if (g_QPCFreq.QuadPart <= 0)
+    {
+        SwitchToThread();
+        return;
+    }
+
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+
+    if (g_PaceEpochQPC.QuadPart == 0)
+    {
+        g_PaceEpochQPC = now;
+        g_PaceFrameIndex = 1;
+        return;
+    }
+
+    double targetHz = GetTargetHz();
+    if (targetHz <= 0.0)
+        targetHz = 60.0;
+
+    double periodTicks = (double)g_QPCFreq.QuadPart / targetHz;
+    if (periodTicks < 1.0)
+        periodTicks = 1.0;
+
+    // Find the next absolute frame boundary. If the emulator is already
+    // behind because of a CPU/GPU/OS stall, skip missed boundaries rather
+    // than waiting an additional frame. This preserves real-time cadence.
+    double targetOffset = (double)g_PaceFrameIndex * periodTicks;
+    LONGLONG targetQPC = g_PaceEpochQPC.QuadPart +
+                         (LONGLONG)(targetOffset + 0.5);
+
+    while (targetQPC <= now.QuadPart)
+    {
+        ++g_PaceFrameIndex;
+        targetOffset = (double)g_PaceFrameIndex * periodTicks;
+        targetQPC = g_PaceEpochQPC.QuadPart +
+                    (LONGLONG)(targetOffset + 0.5);
+    }
+
+    double remainMs = (double)(targetQPC - now.QuadPart) *
+                      1000.0 / (double)g_QPCFreq.QuadPart;
+
+    if (remainMs >= 1.0 && g_PaceTimer != INVALID_HANDLE_VALUE)
+    {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)(remainMs * 10000.0);
+        SetWaitableTimer(g_PaceTimer, &due, 0, NULL, NULL, FALSE);
+        WaitForSingleObject(g_PaceTimer, 20);
+    }
+    else if (remainMs > 0.0)
+    {
+        SwitchToThread();
+    }
+
+    ++g_PaceFrameIndex;
 }
 
 void PaceFrame()
 {
-    // P48: removed the `if (!g_VSyncActive) { Sleep(0); return; }` gate.
-    //
-    // Previously, when g_VSyncActive was false — which happens whenever
-    // wglSwapIntervalEXT is not verified by the driver (see
-    // ApplyPendingVSync: "verified by driver: NO" in the log header) OR
-    // DwmFlush has not yet armed (first 180 warmup frames, or DwmFlush
-    // failed to load) — PaceFrame did `Sleep(0)` and returned, providing
-    // NO pacing at all. The only remaining throttle was the DirectSound
-    // buffer-fill busy-wait in APU::Run, which is quantized to audiodg's
-    // ~10ms service tick and produces a strict 20/20/10ms (3:2 pulldown)
-    // judder pattern — exactly the "scrolling goes in jerks in windowed
-    // mode" symptom reported after P47.
-    //
-    // Now: always use the QPC-drift-corrected waitable timer. If a real
-    // backpressure (vsync or DwmFlush) is ALSO active on this system, the
-    // QPC drift correction (slotMs -= elapsedMs since the last
-    // OnFrameEnd, which runs right after SwapBuffers) makes the timer
-    // wait ~0ms — so there is no double-pacing: the timer self-regulates
-    // to fill only the gap that the real backpressure left unfilled. If
-    // NO backpressure is active (the current reported case: swap=0.03ms
-    // on every frame), the timer provides the full ~16.67ms pacing
-    // itself, giving a steady frame cadence instead of the 3:2 pulldown.
-    //
-    // Safety: the waitable timer path below was already the code path used
-    // when g_VSyncActive was true (i.e. on systems where vsync DID work),
-    // so this change only extends that same path to the g_VSyncActive=
-    // false case — it does not change behaviour on systems where vsync
-    // already works. See MATCH_MONITOR_RATE.md section 10.
-    if (g_PaceTimer == NULL)
-    {
-        PFN_CreateWaitableTimerExW pfnEx =
-            (PFN_CreateWaitableTimerExW)GetProcAddress(
-                GetModuleHandleW(L"kernel32.dll"), "CreateWaitableTimerExW");
-        HANDLE ht = NULL;
-        if (pfnEx)
-            ht = pfnEx(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG, TIMER_ALL_ACCESS);
-        if (!ht)
-            ht = CreateWaitableTimer(NULL, FALSE, NULL);
-        g_PaceTimer = ht ? ht : INVALID_HANDLE_VALUE;
-    }
-
-    if (g_PaceTimer != INVALID_HANDLE_VALUE)
-    {
-        double slotMs = (g_NESHz > 0.0) ? (1000.0 / g_NESHz) - 0.5 : 16.167;
-        if (slotMs < 1.0) slotMs = 1.0;
-
-        if (g_QPCFreq.QuadPart > 0 && g_LastFrameEndQPC.QuadPart != 0)
-        {
-            LARGE_INTEGER now;
-            QueryPerformanceCounter(&now);
-            double elapsedMs = (double)(now.QuadPart - g_LastFrameEndQPC.QuadPart)
-                * 1000.0 / (double)g_QPCFreq.QuadPart;
-            slotMs -= elapsedMs;
-            if (slotMs < 1.0) slotMs = 1.0;
-        }
-
-        LARGE_INTEGER due;
-        due.QuadPart = -(LONGLONG)(slotMs * 10000.0);
-        SetWaitableTimer(g_PaceTimer, &due, 0, NULL, NULL, FALSE);
-        WaitForSingleObject(g_PaceTimer, 20);
-    }
-    else
-    {
-        SwitchToThread();
-    }
-}
-
-// P51b: authoritative slot pacer. Used by APU::Run when
-// IsPacingAuthoritative() is true (neither vsync nor DwmFlush provides
-// backpressure). Unlike PaceFrame (which drift-corrects from
-// g_LastFrameEndQPC = OnFrameEnd), PaceSlot drift-corrects from
-// g_LastSlotWriteQPC = the previous slot write. This is the CORRECT
-// base point: each slot write should happen exactly (1000/NESHz) ms
-// after the PREVIOUS slot write, forming a self-synchronising cycle
-// (just like the original GetCurrentPosition wait-loop, but without
-// audiodg's 10ms quantization).
-//
-// Why PaceFrame was wrong here (the P51 regression): APU::Run runs
-// mid-frame, BEFORE GL_DrawFrame/SwapBuffers/OnFrameEnd. Using
-// g_LastFrameEndQPC as the base made PaceFrame wait "16ms from
-// OnFrameEnd", but the remaining CPU+GL_DrawFrame work after APU::Run
-// added another ~5-10ms, so gap grew to 22-26ms = "game runs slow".
-// PaceSlot fixes this by anchoring to the slot write itself, which is
-// exactly what the original wait-loop did (it waited until audiodg had
-// played one slot = 16.67ms since the previous write).
-void PaceSlot()
-{
-    // Reuse the same waitable timer as PaceFrame (created lazily here
-    // if PaceFrame never ran — e.g. if g_VSyncActive was true and the
-    // original path took PaceFrame before the authoritative path kicked
-    // in). Safe: both functions are only called from the NES thread.
-    if (g_PaceTimer == NULL)
-    {
-        PFN_CreateWaitableTimerExW pfnEx =
-            (PFN_CreateWaitableTimerExW)GetProcAddress(
-                GetModuleHandleW(L"kernel32.dll"), "CreateWaitableTimerExW");
-        HANDLE ht = NULL;
-        if (pfnEx)
-            ht = pfnEx(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG, TIMER_ALL_ACCESS);
-        if (!ht)
-            ht = CreateWaitableTimer(NULL, FALSE, NULL);
-        g_PaceTimer = ht ? ht : INVALID_HANDLE_VALUE;
-    }
-
-    if (g_PaceTimer != INVALID_HANDLE_VALUE)
-    {
-        // Full slot period (no -0.5 here: we want each write to land
-        // exactly one slot after the previous, so audiodg never
-        // underflows or overflows. The -0.5 in PaceFrame was a tuning
-        // for the vsync-backed path; PaceSlot is the sole pacer and
-        // must be exact).
-        double slotMs = (g_NESHz > 0.0) ? (1000.0 / g_NESHz) : 16.667;
-        if (slotMs < 1.0) slotMs = 1.0;
-
-        if (g_QPCFreq.QuadPart > 0 && g_LastSlotWriteQPC.QuadPart != 0)
-        {
-            LARGE_INTEGER now;
-            QueryPerformanceCounter(&now);
-            double elapsedMs = (double)(now.QuadPart - g_LastSlotWriteQPC.QuadPart)
-                * 1000.0 / (double)g_QPCFreq.QuadPart;
-            slotMs -= elapsedMs;
-            if (slotMs < 1.0) slotMs = 1.0;
-        }
-
-        LARGE_INTEGER due;
-        due.QuadPart = -(LONGLONG)(slotMs * 10000.0);
-        SetWaitableTimer(g_PaceTimer, &due, 0, NULL, NULL, FALSE);
-        WaitForSingleObject(g_PaceTimer, 20);
-    }
-    else
-    {
-        SwitchToThread();
-    }
-}
-
-// P51b: called from APU::Run immediately AFTER the slot write
-// (Lock/memcpy/Unlock). Records the QPC timestamp so the next PaceSlot
-// can drift-correct from this point. Must be called on every slot write
-// while the authoritative path is active; harmless if called when it's
-// not (g_LastSlotWriteQPC is just unused in that case).
-void NotifySlotWritten()
-{
-    if (g_QPCFreq.QuadPart > 0)
-    {
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-        g_LastSlotWriteQPC = now;
-    }
+    // Compatibility wrapper for legacy callers. MMR's only real cadence
+    // source is the monitor-rate PaceSlot schedule.
+    PaceSlot();
 }
 
 void ApplyPendingVSync()
@@ -1119,7 +1018,7 @@ const TCHAR* GetDXGIFailReason()
 void WaitForDXGIVBlank()
 {
     if (!g_VBlankEvent || !g_VBlankThread) return;
-    double frameMs    = (g_NESHz > 0.0) ? 1000.0 / g_NESHz : 16.7;
+    double frameMs    = (GetTargetHz() > 0.0) ? 1000.0 / GetTargetHz() : 16.7;
     DWORD  deadlineMs = (DWORD)(frameMs * 1.5);
     if (deadlineMs < 20) deadlineMs = 20;
     if (deadlineMs > 50) deadlineMs = 50;

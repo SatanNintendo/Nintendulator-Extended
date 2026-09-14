@@ -1273,7 +1273,7 @@ void    SetRegion (void)
 #endif  /* !NSFPLAYER */
 
         // Keep MonitorSync aware of the active NES region so its
-        // GetNESHz() returns the correct value for DRC calculations.
+        // GetNESHz()/GetFrameHz() return the correct region timing for DRC.
 #ifndef NSFPLAYER
         NotifyMonitorSyncRegion();
 #endif  /* !NSFPLAYER */
@@ -1921,19 +1921,18 @@ void    UpdateDRC (void)
         unsigned long wpos = (unsigned long)(LONG)InterlockedExchangeAdd(&g_DSCacheWposBytes, 0L);
 
         // ----- Layer 1: monitor-rate-aware base target -----
-        // Only apply the (monitorHz / nesHz) base target when OpenGL vsync
-        // is actually active. Vsync is what throttles the emulator from
-        // NES rate (60.0988 Hz) down to monitor rate (e.g. 60.000 Hz); if
-        // vsync is not active the emulator still runs at the NES rate, so
-        // applying the base target would create a constant buffer drift
-        // and make the audio stutter.
+        // MMR now paces the emulator/audio-slot cadence directly to the same
+        // target clock used by the render path. Therefore the base audio rate
+        // must NOT depend on whether GL vsync happened to report itself as
+        // active: DwmFlush, a software timer, or a driver with non-standard
+        // swap-control behaviour are all valid ways to reach the same target.
         double baseFreq = (double)FREQ;
-        if (MonitorSync::IsEnabled() && MonitorSync::IsVSyncActive())
+        if (MonitorSync::IsEnabled())
         {
-                double monitorHz = MonitorSync::GetMonitorHz();
-                double nesHz     = MonitorSync::GetNESHz();
-                if (nesHz > 0.0 && monitorHz > 0.0)
-                        baseFreq = (double)FREQ * (monitorHz / nesHz);
+                double targetHz = MonitorSync::GetTargetHz();
+                double frameHz  = MonitorSync::GetFrameHz();
+                if (frameHz > 0.0 && targetHz > 0.0)
+                        baseFreq = (double)FREQ * (targetHz / frameHz);
         }
 
         // ----- Layer 2: buffer-fill fine correction -----
@@ -2030,104 +2029,58 @@ void    Run (void)
                         AVI::AddAudio();
 
                 // ============================================================
-                // P51 (session 25): AUTHORITATIVE PACER PATH
+                // MMR PACING PATH
                 //
-                // When neither GL vsync nor DwmFlush provides real backpressure
-                // (swap < 1ms for 60 consecutive frames — confirmed on this
-                // system via MonitorSync::NotifySwapDuration), the ONLY pacing
-                // mechanism is PaceFrame's QPC-drift-corrected waitable timer
-                // (~16.67ms). In this mode we must NOT gate the write-slot on
-                // GetCurrentPosition, because audiodg updates the play cursor
-                // in ~10ms quanta, producing a strict 20/20/10ms (3:2 pulldown)
-                // judder pattern.
+                // The emulator thread is the producer of game frames and
+                // DirectSound slots. When Match Monitor Rate is enabled, the
+                // slot cadence is paced directly from the measured monitor
+                // rate (within the supported near-rate window). This removes
+                // the old dependency on audiodg's ~10ms GetCurrentPosition
+                // quantization and, more importantly, removes the native
+                // 60.0988Hz-vs-monitor beat that forced the render queue to
+                // periodically drop/duplicate a frame.
                 //
-                // Instead: PaceFrame waits the precise frame time, then we write
-                // the slot unconditionally. The 6-slot buffer (100ms) with
-                // target_fill=0.42 has ±42ms of headroom — more than enough to
-                // absorb ±1ms timer jitter. DRC (Layer 2) compensates any slow
-                // drift over minutes.
-                //
-                // GetCurrentPosition is kept ONLY as a safety valve: if the
-                // buffer is critically overfull (e.g. after a pause or a long
-                // stall), we do a bounded wait to prevent overflow. This is
-                // rare in steady state.
+                // GetCurrentPosition remains a SAFETY VALVE only: if the
+                // audio buffer is critically overfull after a pause/stall,
+                // refreshes from the worker cache can detect it without using
+                // the IPC call as the normal pacing clock.
                 // ============================================================
-                if (isEnabled && Buffer && GFX::MatchMonitorRate
-                        && MonitorSync::IsPacingAuthoritative())
+                if (isEnabled && Buffer && GFX::MatchMonitorRate)
                 {
-                        // P51b: PaceSlot (NOT PaceFrame) waits the precise
-                        // remaining slot time, drift-corrected from the
-                        // PREVIOUS slot write (g_LastSlotWriteQPC). This is
-                        // the correct base point — each write lands exactly
-                        // (1000/NESHz) ms after the previous one, forming a
-                        // self-synchronising cycle like the original wait-loop
-                        // but without audiodg's 10ms quantization.
-                        //
-                        // P51 used PaceFrame here, which drift-corrects from
-                        // OnFrameEnd (g_LastFrameEndQPC). That was WRONG:
-                        // APU::Run runs mid-frame, BEFORE GL_DrawFrame/
-                        // SwapBuffers/OnFrameEnd, so using OnFrameEnd as the
-                        // base made each gap grow by the CPU+GL work after
-                        // APU::Run (~5-10ms), producing the 22-26ms "game
-                        // runs slow" regression.
                         MonitorSync::PaceSlot();
 
-                        // Safety valve: check if buffer is critically overfull.
-                        // This should almost never trigger in steady state;
-                        // it exists to handle pauses, DRC overshoot, or long
-                        // tex stalls that could otherwise overflow the ring.
                         LONG cacheAge = InterlockedExchangeAdd(&g_DSCacheAge, 1L);
                         if (cacheAge <= 2)
                         {
                                 unsigned long sr = (unsigned long)InterlockedExchangeAdd(&g_DSCacheRpos, 0L);
                                 unsigned long sw = (unsigned long)InterlockedExchangeAdd(&g_DSCacheWpos, 0L);
                                 if (sw < sr) sw += FRAMEBUF;
-                                // If the slot is STILL occupied (buffer overfull),
-                                // do a bounded wait — but use PaceSlot, not
-                                // GetCurrentPosition polling, to avoid
-                                // re-introducing the 10ms quantization.
+
+                                // If the target slot is critically overfull,
+                                // allow at most two additional paced intervals
+                                // for the playback cursor to advance. This is
+                                // deliberately bounded: a temporary audio
+                                // hiccup must never freeze the whole emulator.
                                 int safetyLoops = 0;
-                                while ((sr <= next_pos) && (next_pos <= sw) && safetyLoops < 3)
+                                while ((sr <= next_pos) && (next_pos <= sw) && safetyLoops < 2)
                                 {
                                         MonitorSync::PaceSlot();
-                                        // Re-read cache (the audio-control worker
-                                        // refreshes it every ~8ms, so after one
-                                        // PaceSlot (~16ms) it should be fresh).
                                         sr = (unsigned long)InterlockedExchangeAdd(&g_DSCacheRpos, 0L);
                                         sw = (unsigned long)InterlockedExchangeAdd(&g_DSCacheWpos, 0L);
                                         if (sw < sr) sw += FRAMEBUF;
-                                        safetyLoops++;
+                                        ++safetyLoops;
                                 }
-                                // After 3 safety loops (~50ms), write anyway
-                                // rather than stalling forever — a single
-                                // overwritten slot is a brief glitch, an
-                                // infinite stall is a freeze.
                         }
-                        // else: cache stale — write unconditionally (the buffer
-                        // has 100ms of headroom; one blind write is safe).
 
                         goto write_slot;
                 }
 
                 // ============================================================
-                // ORIGINAL PATH: vsync/DwmFlush provides real backpressure,
-                // or MMR is off. Use the cached pre-check + wait-loop with
-                // GetCurrentPosition polling (quantized to ~10ms, but that's
-                // acceptable when a real backpressure is also pacing the frame).
+                // ORIGINAL PATH (MMR disabled)
                 // ============================================================
                 if (isEnabled && Buffer)
                 {
                         LONG cacheAge = InterlockedExchangeAdd(&g_DSCacheAge, 1L);
-                        // Use cache only when it's fresh (age == 0 before increment
-                        // means the P30 audio-control thread refreshed it within
-                        // the last ~8ms). cacheAge <= 2 is roughly two NES-frame
-                        // periods (~33ms) of tolerance -- still safe to use;
-                        // position only moves forward. Falling through to the
-                        // live-IPC branch below should now only happen very
-                        // rarely: right after MMR is enabled (worker thread
-                        // hasn't ticked yet) or if the worker thread itself is
-                        // stalled -- in steady state the worker keeps this well
-                        // under the threshold.
                         if (cacheAge <= 2)
                         {
                                 unsigned long sr = (unsigned long)InterlockedExchangeAdd(&g_DSCacheRpos, 0L);
@@ -2138,14 +2091,6 @@ void    Run (void)
                         }
                         else
                         {
-                                // Cache is stale (the P30 worker hasn't ticked yet).
-                                // Fall back to live IPC — same as pre-P27 behavior.
-                                // This is the one place left where the NES thread
-                                // can still stall on audiodg.exe; if diagnostics
-                                // (nintendulator_timing.log) ever show stalls
-                                // correlating with this branch being taken, the
-                                // fix is to widen FRAMEBUF/increase the worker's
-                                // tick rate rather than touching this fallback.
                                 unsigned long pr, pw;
                                 if (SUCCEEDED(Buffer->GetCurrentPosition(&pr, &pw)))
                                 {
@@ -2162,16 +2107,7 @@ void    Run (void)
                 {
                         if (!isEnabled)
                                 break;
-                        // When Match Monitor Rate is active, use SwitchToThread()
-                        // instead of Sleep(1). Sleep(1) can sleep 1-2ms and push
-                        // us past the next vblank; SwitchToThread() yields only
-                        // for the remainder of the current scheduler time-slice
-                        // (typically 0.1-0.5ms) and returns immediately when
-                        // the CPU is free, letting us re-check DS much sooner.
-                        if (GFX::MatchMonitorRate)
-                                MonitorSync::PaceFrame();
-                        else
-                                Sleep(1);
+                        Sleep(1);
                         Try(Buffer->GetCurrentPosition(&rpos, &wpos), Lang::GetString(LANG_ERR_APU_BUFFER));
                         rpos /= LockSize;
                         wpos /= LockSize;
@@ -2185,13 +2121,6 @@ void    Run (void)
                         memcpy(bufPtr, buffer, bufBytes);
                         Try(Buffer->Unlock(bufPtr, bufBytes, NULL, 0), Lang::GetString(LANG_ERR_APU_BUFFER));
                         next_pos = (next_pos + 1) % FRAMEBUF;
-
-                        // P51b: record the QPC timestamp of this slot write
-                        // so the next PaceSlot (authoritative-pacer path)
-                        // can drift-correct from here. Harmless when the
-                        // authoritative path is not active — g_LastSlotWriteQPC
-                        // is simply unused in that case.
-                        MonitorSync::NotifySlotWritten();
 
                         // NOTE: SetFrequency is NO LONGER called from here.
                         // It was moved to UpdateDRC() (called from GFX::DrawScreen
