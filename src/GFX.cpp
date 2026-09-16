@@ -967,6 +967,21 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
 
         SwapBuffers(hGLDC);
 
+        // P66: when DwmFlush is not used (verified GL-vsync path), the
+        // return from SwapBuffers is the only presentation-side timing
+        // checkpoint available to this logger. Record it in t2 so the
+        // diagnostic "swap" column measures the actual GL wait instead of
+        // remaining zero. This is diagnostic-only: it does NOT feed the
+        // presentation clock and does not alter pacing behavior.
+        LARGE_INTEGER swapDoneQpc;
+        QueryPerformanceCounter(&swapDoneQpc);
+        int diagSwapIdx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+        bool diagDwmFlushCandidate =
+                (MatchMonitorRate && !(Fullscreen && ExclusiveFullscreen) &&
+                 !MonitorSync::IsVSyncActive());
+        if (!diagDwmFlushCandidate)
+                s_diagBuf[diagSwapIdx].t2 = swapDoneQpc.QuadPart;
+
 #if USE_DWMFLUSH
         // P65: when the OpenGL driver has verified swap interval=1, let
         // SwapBuffers provide the presentation synchronization. DwmFlush is
