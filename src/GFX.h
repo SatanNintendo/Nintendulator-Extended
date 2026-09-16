@@ -71,7 +71,7 @@ void    ReleaseGLContext (void);
 // MATCH_MONITOR_RATE.md section 9.
 void    ResetDwmWarmup (void);
 // P73: passive MMR producer trace; diagnostics only, never affects pacing.
-void    SetMMRProducerTrace (LONGLONG, LONGLONG, LONGLONG, LONGLONG, LONGLONG, LONGLONG, LONG, LONG);
+void    SetMMRProducerTrace (LONGLONG, LONGLONG, LONGLONG, LONGLONG, ULONGLONG, LONGLONG, LONGLONG, LONG, LONG);
 BOOL    UseOpenGL (void);
 
 // P54 (Stage 2, two-threaded): when MMR is active and the render thread is

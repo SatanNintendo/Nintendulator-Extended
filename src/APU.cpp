@@ -2054,9 +2054,11 @@ void    Run (void)
                 {
                         LARGE_INTEGER p73PaceEnter = {0}, p73PaceWake = {0};
                         LARGE_INTEGER p73SafetyBegin = {0}, p73SafetyEnd = {0};
+                        ULONGLONG p80PaceWakeCycles = 0;
                         QueryPerformanceCounter(&p73PaceEnter);
                         MonitorSync::PaceSlot();
                         QueryPerformanceCounter(&p73PaceWake);
+                        QueryThreadCycleTime(GetCurrentThread(), &p80PaceWakeCycles);
                         LONG p73SafetyLoops = 0;
 
                         LONG cacheAge = InterlockedExchangeAdd(&g_DSCacheAge, 1L);
@@ -2097,7 +2099,7 @@ void    Run (void)
                                 }
                                 GFX::SetMMRProducerTrace(
                                         p73RunEnter.QuadPart, p73PaceEnter.QuadPart, p73PaceWake.QuadPart,
-                                        cpuWake100, p73SafetyBegin.QuadPart, p73SafetyEnd.QuadPart,
+                                        cpuWake100, p80PaceWakeCycles, p73SafetyBegin.QuadPart, p73SafetyEnd.QuadPart,
                                         p73SafetyLoops, 0);
                         }
 
