@@ -943,9 +943,31 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 glColor4f(1, 1, 1, 1);
         }
 
-        // DwmFlush path (same as GL_DrawFrame — P53 fixed condition).
+        // P61: submit the frame first, then wait for DWM to finish
+        // compositing that submitted frame.
+        //
+        // The P60 implementation measured QPC immediately after
+        // SwapBuffers(). In the DWM interval=0 path that timestamp is NOT a
+        // presentation boundary: SwapBuffers only queues the back buffer for
+        // composition and may return immediately. Feeding that timestamp back
+        // into PaceSlot() created the observed 23ms/9ms phase alternation.
+        //
+        // The correct ordering for this path is:
+        //     SwapBuffers(interval=0) -> DwmFlush() -> next frame
+        //
+        // DwmFlush() is documented as waiting until the calling process has
+        // completed its outstanding DWM work for the current composition
+        // cycle. Its return is therefore the best available observed
+        // composition boundary on this Windows 7-compatible path.
 #if USE_DWMFLUSH
         InterlockedIncrement(&s_DwmFlushPathReached);
+#endif
+        if (MatchMonitorRate)
+                MonitorSync::WaitForDXGIVBlank();
+
+        SwapBuffers(hGLDC);
+
+#if USE_DWMFLUSH
         if (MatchMonitorRate && !(Fullscreen && ExclusiveFullscreen))
         {
                 if (s_pfnDwmFlush == reinterpret_cast<PFN_DwmFlush>(1))
@@ -966,24 +988,33 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                                         MonitorSync::SetDwmSyncMode(true);
                                         s_DwmModeArmed = true;
                                 }
-                                s_pfnDwmFlush();
+                                LARGE_INTEGER flushQpc;
+                                HRESULT hr = s_pfnDwmFlush();
+                                QueryPerformanceCounter(&flushQpc);
+                                (void)hr;
+                                if (MatchMonitorRate)
+                                {
+                                        int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+                                        s_diagBuf[idx].t2 = flushQpc.QuadPart;
+                                        MonitorSync::NotifyFramePresented(flushQpc.QuadPart);
+                                }
                         }
                 }
         }
 #endif
         if (MatchMonitorRate)
-                MonitorSync::WaitForDXGIVBlank();
-
-        SwapBuffers(hGLDC);
-
-        if (MatchMonitorRate)
         {
-                LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
-                int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
-                s_diagBuf[idx].t2 = qpc.QuadPart;
-                MonitorSync::NotifyFramePresented(qpc.QuadPart);
+                LARGE_INTEGER qpc2; QueryPerformanceCounter(&qpc2);
+                int idx2 = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+                s_diagBuf[idx2].t2b = qpc2.QuadPart;
+
+                // P54: complete the diag entry from the render thread.
+                // t3/t4 are the same as t2b here (no OnFrameEnd/UpdateDRC
+                // on the render thread — those run on the emulation thread).
+                s_diagBuf[idx2].t3 = qpc2.QuadPart;
+                s_diagBuf[idx2].t4 = qpc2.QuadPart;
+                DiagCompleteFrame(qpc2.QuadPart, qpc2.QuadPart);
         }
-        if (MatchMonitorRate)
         {
                 LARGE_INTEGER qpc2; QueryPerformanceCounter(&qpc2);
                 int idx2 = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
@@ -1736,58 +1767,64 @@ static void GL_DrawFrame(void)
         // mode, while true exclusive fullscreen (the only mode where GL
         // vsync alone should already be correct) is left untouched.
 #if USE_DWMFLUSH
-        // P52: increment the diagnostic counter (file-scope static, read
-        // by DiagWriteLogFile). This runs on EVERY GL_DrawFrame call
-        // where USE_DWMFLUSH compiled in — before the MatchMonitorRate
-        // check. If the log shows reached=0, the #if block isn't
-        // compiling. If reached>0 but warmup=180, LoadLibrary failed.
+        // P61: DwmFlush must run AFTER SwapBuffers in the interval=0 path.
+        // Calling it before the swap synchronizes the previous composition
+        // cycle, while the newly rendered frame is then submitted too late;
+        // the resulting post-SwapBuffers timestamps were the source of P60's
+        // 23ms/9ms phase alternation.
         InterlockedIncrement(&s_DwmFlushPathReached);
+#endif
 
-        // P53: the old condition `!ExclusiveFullscreen` was wrong.
-        // ExclusiveFullscreen is a menu toggle that can be TRUE even
-        // when Fullscreen is FALSE (the user toggled it in windowed
-        // mode — see ID_PPU_EXCLUSIVEFS in Nintendulator.cpp, which
-        // only restarts GFX if Fullscreen is already on). That left
-        // ExclusiveFullscreen=1 in windowed mode, which made
-        // `!ExclusiveFullscreen` = FALSE, blocking the entire DwmFlush
-        // path. The P52 log confirmed exactly this:
-        //   ExclusiveFullscreen=1, Window mode: windowed
-        // The CORRECT test for "true exclusive fullscreen" (the only
-        // mode where DwmFlush is pointless because DWM is bypassed)
-        // is `Fullscreen && ExclusiveFullscreen`. In windowed mode
-        // (Fullscreen=0) DwmFlush must always run regardless of the
-        // ExclusiveFullscreen toggle state.
+        if (MatchMonitorRate)
+                MonitorSync::WaitForDXGIVBlank();
+
+        SwapBuffers(hGLDC);
+
+        // Diagnostic timestamp is overwritten with the post-DwmFlush
+        // composition boundary below when that path is active.
+        if (MatchMonitorRate)
+        {
+                LARGE_INTEGER qpc;
+                QueryPerformanceCounter(&qpc);
+                int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+                s_diagBuf[idx].t2 = qpc.QuadPart;
+        }
+
+#if USE_DWMFLUSH
         if (MatchMonitorRate && !(Fullscreen && ExclusiveFullscreen))
         {
-                // Lazy-load dwmapi.dll once.
                 if (s_pfnDwmFlush == reinterpret_cast<PFN_DwmFlush>(1))
                 {
                         HMODULE hDwm = LoadLibrary(_T("dwmapi.dll"));
                         s_pfnDwmFlush = hDwm
                                 ? (PFN_DwmFlush)GetProcAddress(hDwm, "DwmFlush")
                                 : NULL;
-                        // DWM unavailable (XP/2003) — stay on GL-vsync forever.
                 }
 
                 if (s_pfnDwmFlush)
                 {
                         if (s_DwmWarmupFrames > 0)
                         {
-                                // Warm-up: DWM pipeline not yet stable after mode switch.
-                                // Use GL-vsync (interval=1) — SetDwmSyncMode(false) in
-                                // Stop() already set this. Count down the warmup window.
                                 --s_DwmWarmupFrames;
                         }
                         else
                         {
-                                // Warm-up complete. Switch to DwmFlush+interval=0 once,
-                                // then call DwmFlush every frame.
                                 if (!s_DwmModeArmed)
                                 {
                                         MonitorSync::SetDwmSyncMode(true);
                                         s_DwmModeArmed = true;
                                 }
+
                                 s_pfnDwmFlush();
+
+                                if (MatchMonitorRate)
+                                {
+                                        LARGE_INTEGER qpc;
+                                        QueryPerformanceCounter(&qpc);
+                                        int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+                                        s_diagBuf[idx].t2 = qpc.QuadPart;
+                                        MonitorSync::NotifyFramePresented(qpc.QuadPart);
+                                }
                         }
                 }
         }
