@@ -29,6 +29,10 @@
 #include "NES.h"
 #include "APU.h"
 #include <dwmapi.h>
+// P60: floor() is used by the presentation-anchored phase control in
+// PaceSlot(). fabs() was already used by GetTargetHz(); make the math
+// dependency explicit instead of relying on a transitive include.
+#include <math.h>
 
 // ------------------------------------------------------------------
 // WGL swap-control extension (present in every Windows OpenGL ICD
@@ -355,26 +359,24 @@ static bool           g_VSyncActive = false;
 static LARGE_INTEGER  g_PaceEpochQPC = {0, 0};
 static ULONGLONG      g_PaceFrameIndex = 0;
 
-// P60: display-presentation feedback clock.
+// ------------------------------------------------------------------
+// P60: presentation feedback clock -- published state.
 //
-// PaceSlot() used to run entirely from an independent QPC schedule. That gave
-// the correct average cadence, but the schedule could slowly land on slightly
-// different phases relative to the actual presentation boundary, producing
-// pairs such as 17.9/15.8ms even though the mean stayed at ~16.67ms.
-//
-// The render thread now reports the QPC timestamp immediately after the
-// present call. We use that timestamp as a bounded phase anchor for the NEXT
-// frame. A long DWM maintenance stall is deliberately NOT promoted into the
-// pacing clock: intervals far outside the normal refresh period temporarily
-// unlock the presentation clock, so emulation continues on the independent
-// QPC fallback instead of inheriting a 33/50ms stall.
-//
-// All shared 64-bit values are accessed through Interlocked* operations.
-static volatile LONGLONG g_LastPresentationQPC        = 0;
-static volatile LONGLONG g_PresentationPeriodQPC      = 0;
-static volatile LONG     g_PresentationClockLocked   = FALSE;
-static volatile LONG     g_PresentationHzMilli       = 0;
-static volatile LONG     g_PresentationIntervalErrUs = 0;
+// Written by whichever thread presents (OnPresentationFeedback), read by
+// the emulation thread (PaceSlot) and the diagnostic log writer. Declared
+// here, before every user, so ResetState() can safely reset them. All
+// 64-bit atomics are __declspec(align(8)) so the Win32 (x86) build is
+// safe as well. See the full P60 block comment further down (above
+// OnPresentationFeedback) for the design.
+// ------------------------------------------------------------------
+#define PRESENT_STALE_MS   250.0
+#define PRESENT_MEAN_WINDOW 128
+
+static __declspec(align(8)) volatile LONGLONG g_PresentLastQPC = 0; // last feedback timestamp (QPC ticks)
+static volatile LONG  g_PresentCount    = 0;  // feedbacks since the last ResetState
+static volatile LONG  g_PresentPeriodUs = 0;  // filtered presentation period (microseconds)
+static volatile LONG  g_PresentMeanUs   = 0;  // mean presentation interval over the window (microseconds)
+static volatile LONG  g_PresentErrUs    = 0;  // last interval error vs MMR target (microseconds, signed)
 
 // ------------------------------------------------------------------
 // Deferred vsync interval (written by Enable/UI thread, applied by
@@ -564,14 +566,6 @@ void OnDisplayChange()
     double hz = QueryMonitorHz();
     if (hz >= 30.0 && hz <= 1000.0)
         InterlockedExchange(&g_MonitorHzMilli, (LONG)(hz * 1000.0 + 0.5));
-
-    // P60: a display change can move the window to another timing domain.
-    // Do not carry the old presentation phase into the new monitor.
-    InterlockedExchange64(&g_LastPresentationQPC, 0);
-    InterlockedExchange64(&g_PresentationPeriodQPC, 0);
-    InterlockedExchange(&g_PresentationClockLocked, FALSE);
-    InterlockedExchange(&g_PresentationHzMilli, 0);
-    InterlockedExchange(&g_PresentationIntervalErrUs, 0);
 }
 
 void Enable(BOOL on)
@@ -618,14 +612,7 @@ void Enable(BOOL on)
     }
     else
     {
-        // MMR OFF must return to the emulator's normal presentation mode.
-        // Do not force OpenGL to wait for the monitor here: that would make
-        // the supposedly independent 60.0988/50.0 Hz emulator cadence follow
-        // the display refresh and can create the exact periodic judder MMR is
-        // intended to eliminate.  interval=0 is the standard unsynchronised
-        // OpenGL path; the emulator/audio timing remains responsible for its
-        // own cadence.
-        InterlockedExchange(&g_PendingVSyncInterval, 0L);
+        InterlockedExchange(&g_PendingVSyncInterval, 1L);
         g_VSyncActive = false;
         g_PaceEpochQPC.QuadPart = 0;
         g_PaceFrameIndex = 0;
@@ -736,14 +723,18 @@ void ResetState()
     // a fresh QPC epoch so a newly loaded ROM never inherits an old cadence.
     g_PaceEpochQPC.QuadPart = 0;
     g_PaceFrameIndex = 0;
-
-    // P60: discard the presentation-derived phase anchor as well. A window /
-    // monitor / fullscreen transition can invalidate the old display phase.
-    InterlockedExchange64(&g_LastPresentationQPC, 0);
-    InterlockedExchange64(&g_PresentationPeriodQPC, 0);
-    InterlockedExchange(&g_PresentationClockLocked, FALSE);
-    InterlockedExchange(&g_PresentationHzMilli, 0);
-    InterlockedExchange(&g_PresentationIntervalErrUs, 0);
+    // P60: drop the presentation feedback clock back to its un-locked state
+    // as well, so a fresh session re-establishes the presentation phase from
+    // NEW feedback instead of anchoring to a stale pre-pause timestamp. The
+    // next two presentations re-lock the clock (~2 frames); until then
+    // PaceSlot uses the absolute QPC fallback cadence, which is always safe.
+    // The writer-private filter state (previous timestamp, filtered period)
+    // is deliberately NOT reset from here -- it belongs to whichever thread
+    // presents, and resetting it cross-thread could tear an in-flight
+    // interval computation. A stale filtered period self-heals through the
+    // outlier rejection + clamp on the next accepted samples.
+    InterlockedExchange(&g_PresentCount, 0L);
+    InterlockedExchange64(&g_PresentLastQPC, 0LL);
 }
 
 void SetDwmSyncMode(bool useDwm)
@@ -787,79 +778,270 @@ static HANDLE CreatePaceTimer()
     return ht;
 }
 
+// ------------------------------------------------------------------
+// P60: Presentation feedback clock.
+//
+// The render thread (or, in the fallback single-thread mode, the emulation
+// thread) reports one timestamp per presented frame, taken AFTER the P61
+// presentation boundary (SwapBuffers -> DwmFlush, see GFX.cpp). From that
+// stream we derive:
+//
+//   - the filtered presentation period (90/10 EWMA with outlier rejection
+//     and a clustered reject-snap -- the same filter discipline the old
+//     P4/P41 monitor-Hz calibration used, applied to the presentation
+//     interval instead, because the frame-timing calibration path itself
+//     was removed when monitor-rate measurement became DWM-direct);
+//   - a LOCKED / QPC FALLBACK state: LOCKED requires >= 2 feedbacks, a
+//     published filtered period, and a feedback age under 250 ms (15
+//     frames at 60 Hz -- a 2-3 vblank DwmFlush maintenance stall must NOT
+//     unlock the clock, but a dead render thread must, quickly enough
+//     that the emulation thread never blocks on a frozen anchor);
+//   - the mean presentation rate over the last 128 accepted intervals and
+//     the last interval error versus the MMR target (log header values).
+//
+// While LOCKED, PaceSlot() anchors every emulation slot to the next
+// predicted presentation boundary minus a BOUNDED phase lead. This is what
+// removes the residual producer-vs-presentation drift: e.g. a monitor that
+// reports 60.000 Hz through DWM but actually composites at ~59.7 Hz would,
+// under the pre-P60 absolute-QPC pacer, fill the frame queue at 60 Hz and
+// force periodic latest-wins drops; anchored to the measured presentation
+// cadence, the producer tracks the real compositor rate instead.
+//
+// The published atomics live with the other state at the top of this
+// namespace (see g_PresentLastQPC); the doubles below are writer-thread-
+// private.
+// ------------------------------------------------------------------
+
+// Writer-thread-private state (single writer: the presenting thread).
+static LONGLONG g_PresentPrevQPC     = 0;   // previous feedback timestamp
+static double   g_PresentPeriodTicks = 0.0; // filtered period in QPC ticks
+static LONG     g_PresentRejects     = 0;   // consecutive outlier rejections
+static double   g_PresentMeanSumMs   = 0.0; // running sum of the mean window
+static double   g_PresentMeanHist[PRESENT_MEAN_WINDOW] = {0.0};
+static int      g_PresentMeanPos     = 0;
+static int      g_PresentMeanFill    = 0;
+
+void OnPresentationFeedback(LONGLONG qpcPresent)
+{
+    if (g_QPCFreq.QuadPart <= 0 || qpcPresent <= 0)
+        return;
+
+    InterlockedIncrement(&g_PresentCount);
+    LONGLONG prev = g_PresentPrevQPC;
+    g_PresentPrevQPC = qpcPresent;
+    InterlockedExchange64(&g_PresentLastQPC, qpcPresent);
+
+    if (prev == 0)
+        return; // first feedback after (re)start -- no interval yet
+
+    double freq        = (double)g_QPCFreq.QuadPart;
+    double intervalTicks = (double)(qpcPresent - prev);
+
+    double targetHz = GetTargetHz();
+    if (targetHz <= 0.0)
+        targetHz = 60.0;
+    double targetTicks = freq / targetHz;
+
+    // Outlier rejection: a healthy presentation interval lies within
+    // [0.25, 4.0] target periods. A 2-vblank DwmFlush stall (~2x), a
+    // dropped-then-caught-up frame (~0.5x), or a glitch is rejected so
+    // the filter tracks only the steady cadence (rejections still count
+    // toward g_PresentCount -- the clock itself stays fed).
+    bool accepted = (intervalTicks > 0.0 &&
+                     intervalTicks >= targetTicks * 0.25 &&
+                     intervalTicks <= targetTicks * 4.0);
+
+    if (!accepted)
+    {
+        if (++g_PresentRejects >= 3)
+        {
+            // P41-style clustered reject-snap: three consecutive rejections
+            // means the cadence genuinely moved (display mode switch,
+            // monitor change) -- snap the filter instead of grinding
+            // against the clamp, and re-seed the mean window.
+            double snapped = intervalTicks;
+            if (snapped < targetTicks * 0.5) snapped = targetTicks * 0.5;
+            if (snapped > targetTicks * 2.0) snapped = targetTicks * 2.0;
+            g_PresentPeriodTicks = snapped;
+            g_PresentRejects     = 0;
+            g_PresentMeanFill    = 0;
+            g_PresentMeanPos     = 0;
+            g_PresentMeanSumMs   = 0.0;
+        }
+        return;
+    }
+
+    g_PresentRejects = 0;
+    if (g_PresentPeriodTicks <= 0.0)
+        g_PresentPeriodTicks = intervalTicks;                                // seed
+    else
+        g_PresentPeriodTicks = g_PresentPeriodTicks * 0.9 + intervalTicks * 0.1; // 90/10 LP
+
+    // Keep the filtered period within +-10% of the DWM-derived target so a
+    // polluted filter can never pace the emulator far from the monitor.
+    if (g_PresentPeriodTicks > targetTicks * 1.10) g_PresentPeriodTicks = targetTicks * 1.10;
+    if (g_PresentPeriodTicks < targetTicks * 0.90) g_PresentPeriodTicks = targetTicks * 0.90;
+
+    // Last interval error vs the MMR target (log header "Last interval
+    // error" value) and running mean over the accepted-interval window
+    // (log header "Presentation Hz" value).
+    double errMs     = (intervalTicks - targetTicks) * 1000.0 / freq;
+    double intervalMs = intervalTicks * 1000.0 / freq;
+
+    if (g_PresentMeanFill == PRESENT_MEAN_WINDOW)
+        g_PresentMeanSumMs -= g_PresentMeanHist[g_PresentMeanPos];
+    else
+        g_PresentMeanFill++;
+    g_PresentMeanHist[g_PresentMeanPos] = intervalMs;
+    g_PresentMeanSumMs += intervalMs;
+    g_PresentMeanPos = (g_PresentMeanPos + 1) % PRESENT_MEAN_WINDOW;
+
+    // Publish the derived values for cross-thread readers (PaceSlot on the
+    // emulation thread, the diagnostic log writer on the thread pool).
+    InterlockedExchange(&g_PresentPeriodUs,
+            (LONG)(g_PresentPeriodTicks * 1000000.0 / freq + 0.5));
+    if (g_PresentMeanFill > 0)
+        InterlockedExchange(&g_PresentMeanUs,
+                (LONG)(g_PresentMeanSumMs * 1000.0 / (double)g_PresentMeanFill + 0.5));
+    InterlockedExchange(&g_PresentErrUs,
+            (LONG)(errMs * 1000.0 + (errMs >= 0.0 ? 0.5 : -0.5)));
+}
+
+bool IsPresentationClockLocked()
+{
+    if (InterlockedExchangeAdd(&g_PresentCount, 0) < 2)
+        return false;
+    if (InterlockedExchangeAdd(&g_PresentPeriodUs, 0) <= 0)
+        return false;
+
+    LONGLONG last = InterlockedExchangeAdd64(&g_PresentLastQPC, 0);
+    if (last == 0 || g_QPCFreq.QuadPart <= 0)
+        return false;
+
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double ageMs = (double)(now.QuadPart - last) * 1000.0 / (double)g_QPCFreq.QuadPart;
+    // A slightly negative age (feedback published after this thread read
+    // `now`, a few microseconds apart) is trivially fresh.
+    if (ageMs < 0.0)
+        ageMs = 0.0;
+    return ageMs < PRESENT_STALE_MS;
+}
+
+double GetPresentationHz()
+{
+    LONG meanUs = InterlockedExchangeAdd(&g_PresentMeanUs, 0);
+    if (meanUs <= 0)
+        return 0.0;
+    return 1000000.0 / (double)meanUs;
+}
+
+double GetLastPresentErrMs()
+{
+    return (double)InterlockedExchangeAdd(&g_PresentErrUs, 0) / 1000.0;
+}
+
 void PaceSlot()
 {
+    // Absolute QPC schedule.  The first call establishes the phase and writes
+    // immediately; every later call targets epoch + N * monitor_period.
+    // Because the target is absolute rather than "previous actual write +
+    // period", a late timer wake-up does NOT become permanent phase drift.
+    if (g_PaceTimer == NULL)
+    {
+        HANDLE ht = CreatePaceTimer();
+        g_PaceTimer = ht ? ht : INVALID_HANDLE_VALUE;
+    }
+
     if (g_QPCFreq.QuadPart <= 0)
     {
         SwitchToThread();
         return;
     }
 
-    const double targetHz = (GetTargetHz() > 0.0) ? GetTargetHz() : 60.0;
-    const double nominalPeriodTicks = (double)g_QPCFreq.QuadPart / targetHz;
-    const LONGLONG nominalPeriod = (LONGLONG)(nominalPeriodTicks + 0.5);
-
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
 
-    // ---------------------------------------------------------------
-    // P60: presentation-anchored cadence.
+    // ----------------------------------------------------------------
+    // P60: presentation-anchored phase control.
     //
-    // Once the render thread has observed a sane presentation interval,
-    // use the most recent presentation as the phase anchor for the next
-    // emulation slot. A small lead keeps the frame generation on the safe side
-    // of the target display boundary without adding a full-frame of latency.
+    // When the presentation feedback clock is LOCKED (see
+    // OnPresentationFeedback above), every emulation slot is anchored to
+    // the next PREDICTED presentation boundary derived from the last real
+    // DWM-composited frame -- not to a free-running QPC epoch. Each slot
+    // must finish a bounded lead time BEFORE the boundary it targets, so
+    // the produced frame is already waiting in the frame queue when the
+    // render thread reaches that boundary, but never so early that the
+    // queue backs up and forces latest-wins drops.
     //
-    // IMPORTANT: this is NOT a wait on the render thread and does not wait for
-    // DwmFlush. A DWM maintenance stall simply unlocks this path temporarily;
-    // the QPC fallback below keeps emulation/audio moving.
-    // ---------------------------------------------------------------
-    if (InterlockedExchangeAdd(&g_PresentationClockLocked, 0) != FALSE)
+    // This path is deliberately stateless across calls (it always
+    // recomputes from the latest feedback), so a late producer or a
+    // stalled presenter cannot accumulate permanent phase error: the
+    // deadline simply advances to the first boundary that is still
+    // reachable. If feedback goes stale (>250 ms) or was never established,
+    // we fall through to the absolute QPC cadence below -- the emulation
+    // thread is NEVER blocked indefinitely on a frozen anchor.
+    // ----------------------------------------------------------------
     {
-        LONGLONG lastPresent =
-                InterlockedExchangeAdd64(&g_LastPresentationQPC, 0);
-        LONGLONG period =
-                InterlockedExchangeAdd64(&g_PresentationPeriodQPC, 0);
+        LONGLONG presentQPC     = InterlockedExchangeAdd64(&g_PresentLastQPC, 0);
+        LONG     presentCount   = InterlockedExchangeAdd(&g_PresentCount, 0);
+        LONG     presentPeriodUs = InterlockedExchangeAdd(&g_PresentPeriodUs, 0);
 
-        if (lastPresent > 0 && period > 0)
+        if (presentCount >= 2 && presentPeriodUs > 0 && presentQPC != 0)
         {
-            // Keep the lead deliberately small. 0.75 ms is large enough to
-            // cover ordinary scheduler wake-up jitter on Windows without
-            // making the emulator visibly "early".
-            const LONGLONG leadTicks =
-                    (LONGLONG)((double)g_QPCFreq.QuadPart * 0.00075 + 0.5);
+            double freq     = (double)g_QPCFreq.QuadPart;
+            double ageTicks = (double)(now.QuadPart - presentQPC);
+            // Slightly negative age = feedback published microseconds
+            // after our `now` read; treat as fresh (see
+            // IsPresentationClockLocked).
+            double staleTicks = PRESENT_STALE_MS * 0.001 * freq;
 
-            LONGLONG targetQPC = lastPresent + period - leadTicks;
+            if (ageTicks < 0.0)
+                ageTicks = 0.0;
 
-            // A presentation stall can leave the anchor behind the current
-            // time. In that case do NOT stack waits; fall through to the
-            // absolute-QPC recovery path below.
-            if (targetQPC > now.QuadPart)
+            if (ageTicks < staleTicks)
             {
-                double remainMs = (double)(targetQPC - now.QuadPart) *
-                                  1000.0 / (double)g_QPCFreq.QuadPart;
+                double periodTicks = (double)presentPeriodUs * 1e-6 * freq;
 
-                if (remainMs >= 1.0)
+                // Bounded phase lead: finish each slot this far before the
+                // presentation boundary it targets. 35% of the period
+                // (~5.8 ms at 60 Hz) leaves room for the PPU tail work and
+                // the palette conversion that happen between PaceSlot (in
+                // APU::Run) and the actual queue produce, while the clamp
+                // to [20%, 45%] guarantees the lead can never collapse to
+                // zero (frame always ready in time) nor approach a full
+                // period (queue backing up) even if the filtered period
+                // is momentarily off.
+                double leadTicks = periodTicks * 0.35;
+                if (leadTicks < periodTicks * 0.20) leadTicks = periodTicks * 0.20;
+                if (leadTicks > periodTicks * 0.45) leadTicks = periodTicks * 0.45;
+
+                // Earliest presentation boundary whose (boundary - lead)
+                // is still in the future: that is this slot's deadline.
+                double elapsed = (double)(now.QuadPart - presentQPC);
+                if (elapsed < 0.0)
+                    elapsed = 0.0;
+                double m = floor((elapsed + leadTicks) / periodTicks) + 1.0;
+                LONGLONG targetQPC = presentQPC +
+                        (LONGLONG)(m * periodTicks - leadTicks + 0.5);
+                while (targetQPC <= now.QuadPart)
                 {
-                    if (g_PaceTimer == NULL)
-                    {
-                        HANDLE ht = CreatePaceTimer();
-                        g_PaceTimer = ht ? ht : INVALID_HANDLE_VALUE;
-                    }
-
-                    if (g_PaceTimer != INVALID_HANDLE_VALUE)
-                    {
-                        LARGE_INTEGER due;
-                        due.QuadPart = -(LONGLONG)(remainMs * 10000.0);
-                        SetWaitableTimer(g_PaceTimer, &due, 0, NULL, NULL, FALSE);
-                        WaitForSingleObject(g_PaceTimer, 20);
-                    }
-                    else
-                    {
-                        SwitchToThread();
-                    }
+                    m += 1.0;
+                    targetQPC = presentQPC +
+                            (LONGLONG)(m * periodTicks - leadTicks + 0.5);
                 }
-                else
+
+                double remainMs = (double)(targetQPC - now.QuadPart) * 1000.0 / freq;
+                DWORD  capMs    = (DWORD)(periodTicks * 1000.0 / freq) + 5;
+
+                if (remainMs >= 1.0 && g_PaceTimer != INVALID_HANDLE_VALUE)
+                {
+                    LARGE_INTEGER due;
+                    due.QuadPart = -(LONGLONG)(remainMs * 10000.0);
+                    SetWaitableTimer(g_PaceTimer, &due, 0, NULL, NULL, FALSE);
+                    WaitForSingleObject(g_PaceTimer, capMs);
+                }
+                else if (remainMs > 0.0)
                 {
                     SwitchToThread();
                 }
@@ -868,13 +1050,10 @@ void PaceSlot()
         }
     }
 
-    // ---------------------------------------------------------------
-    // P60 fallback: absolute QPC schedule.
-    //
-    // This remains the safety net for startup, display transitions and long
-    // presentation stalls. It never inherits "previous actual wake-up +
-    // period" drift.
-    // ---------------------------------------------------------------
+    // ----------------------------------------------------------------
+    // QPC FALLBACK: absolute epoch schedule (pre-P60 behaviour, kept
+    // verbatim as the required fallback path).
+    // ----------------------------------------------------------------
     if (g_PaceEpochQPC.QuadPart == 0)
     {
         g_PaceEpochQPC = now;
@@ -882,40 +1061,38 @@ void PaceSlot()
         return;
     }
 
+    double targetHz = GetTargetHz();
+    if (targetHz <= 0.0)
+        targetHz = 60.0;
+
+    double periodTicks = (double)g_QPCFreq.QuadPart / targetHz;
+    if (periodTicks < 1.0)
+        periodTicks = 1.0;
+
+    // Find the next absolute frame boundary. If the emulator is already
+    // behind because of a CPU/GPU/OS stall, skip missed boundaries rather
+    // than waiting an additional frame. This preserves real-time cadence.
+    double targetOffset = (double)g_PaceFrameIndex * periodTicks;
     LONGLONG targetQPC = g_PaceEpochQPC.QuadPart +
-                         (LONGLONG)((double)g_PaceFrameIndex *
-                                   (double)nominalPeriod + 0.5);
+                         (LONGLONG)(targetOffset + 0.5);
 
     while (targetQPC <= now.QuadPart)
     {
         ++g_PaceFrameIndex;
+        targetOffset = (double)g_PaceFrameIndex * periodTicks;
         targetQPC = g_PaceEpochQPC.QuadPart +
-                    (LONGLONG)((double)g_PaceFrameIndex *
-                              (double)nominalPeriod + 0.5);
+                    (LONGLONG)(targetOffset + 0.5);
     }
 
     double remainMs = (double)(targetQPC - now.QuadPart) *
                       1000.0 / (double)g_QPCFreq.QuadPart;
 
-    if (remainMs >= 1.0)
+    if (remainMs >= 1.0 && g_PaceTimer != INVALID_HANDLE_VALUE)
     {
-        if (g_PaceTimer == NULL)
-        {
-            HANDLE ht = CreatePaceTimer();
-            g_PaceTimer = ht ? ht : INVALID_HANDLE_VALUE;
-        }
-
-        if (g_PaceTimer != INVALID_HANDLE_VALUE)
-        {
-            LARGE_INTEGER due;
-            due.QuadPart = -(LONGLONG)(remainMs * 10000.0);
-            SetWaitableTimer(g_PaceTimer, &due, 0, NULL, NULL, FALSE);
-            WaitForSingleObject(g_PaceTimer, 20);
-        }
-        else
-        {
-            SwitchToThread();
-        }
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)(remainMs * 10000.0);
+        SetWaitableTimer(g_PaceTimer, &due, 0, NULL, NULL, FALSE);
+        WaitForSingleObject(g_PaceTimer, 20);
     }
     else if (remainMs > 0.0)
     {
@@ -923,83 +1100,6 @@ void PaceSlot()
     }
 
     ++g_PaceFrameIndex;
-}
-
-void NotifyFramePresented(LONGLONG qpcPresented)
-{
-    if (qpcPresented <= 0 || g_QPCFreq.QuadPart <= 0)
-        return;
-
-    LONGLONG previous =
-            InterlockedExchange64(&g_LastPresentationQPC, qpcPresented);
-
-    if (previous <= 0 || qpcPresented <= previous)
-    {
-        InterlockedExchange(&g_PresentationClockLocked, FALSE);
-        return;
-    }
-
-    LONGLONG delta = qpcPresented - previous;
-    const double targetHz = (GetTargetHz() > 0.0) ? GetTargetHz() : 60.0;
-    const LONGLONG nominal =
-            (LONGLONG)((double)g_QPCFreq.QuadPart / targetHz + 0.5);
-
-    if (nominal <= 0)
-        return;
-
-    // Accept only intervals reasonably close to one refresh. This deliberately
-    // rejects half-refresh / double-refresh samples as potential queue or DWM
-    // anomalies rather than allowing them to corrupt the presentation period.
-    if (delta >= (nominal * 3) / 4 && delta <= (nominal * 5) / 4)
-    {
-        LONGLONG oldPeriod =
-                InterlockedExchangeAdd64(&g_PresentationPeriodQPC, 0);
-        if (oldPeriod <= 0)
-            oldPeriod = delta;
-
-        // Slow 1/8th-order filter: follow genuine refresh-rate changes while
-        // preventing one noisy interval from moving the phase by a whole ms.
-        LONGLONG filtered = oldPeriod + (delta - oldPeriod) / 8;
-        if (filtered <= 0)
-            filtered = delta;
-        InterlockedExchange64(&g_PresentationPeriodQPC, filtered);
-
-        LONG errUs = (LONG)(((delta - nominal) * 1000000LL) /
-                            g_QPCFreq.QuadPart);
-        InterlockedExchange(&g_PresentationIntervalErrUs, errUs);
-
-        LONG hzMilli = (LONG)(((double)g_QPCFreq.QuadPart /
-                               (double)filtered) * 1000.0 + 0.5);
-        InterlockedExchange(&g_PresentationHzMilli, hzMilli);
-
-        // One sane interval after a stall is enough to relock. This keeps the
-        // display as the phase master while the fallback protects us from
-        // transient 2-3-vblank DWM maintenance stalls.
-        InterlockedExchange(&g_PresentationClockLocked, TRUE);
-    }
-    else
-    {
-        // Do not let a maintenance stall become the new frame period.
-        InterlockedExchange(&g_PresentationClockLocked, FALSE);
-        InterlockedExchange(&g_PresentationIntervalErrUs,
-                            (LONG)(((delta - nominal) * 1000000LL) /
-                                   g_QPCFreq.QuadPart));
-    }
-}
-
-bool HasPresentationClock()
-{
-    return InterlockedExchangeAdd(&g_PresentationClockLocked, 0) != FALSE;
-}
-
-double GetPresentationHz()
-{
-    return (double)InterlockedExchangeAdd(&g_PresentationHzMilli, 0) / 1000.0;
-}
-
-double GetPresentationIntervalErrorMs()
-{
-    return (double)InterlockedExchangeAdd(&g_PresentationIntervalErrUs, 0) / 1000.0;
 }
 
 void PaceFrame()

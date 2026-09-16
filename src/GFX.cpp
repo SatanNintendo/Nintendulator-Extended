@@ -68,7 +68,7 @@ static PFN_DwmFlush s_pfnDwmFlush = reinterpret_cast<PFN_DwmFlush>(1); // 1 = no
 // GL_DrawFrame already anticipated and built a fix for. Re-enabling it is
 // scoped to windowed mode only (see the `if (MatchMonitorRate &&
 // !Fullscreen)` guard at its use site) -- fullscreen is untouched.
-#define USE_DWMFLUSH 0
+#define USE_DWMFLUSH 1
 
 // After a fullscreen<->windowed transition, DWM restarts its composition
 // pipeline. The first DwmFlush() calls during this warm-up period can block
@@ -586,19 +586,35 @@ static void ApplyPendingResize()
 // ============================================================
 // Per-frame timing diagnostics (active when MatchMonitorRate is on).
 //
-// Each frame we record QPC timestamps at 5 checkpoints:
-//   t0 = entry to GL_DrawFrame (after palette conversion)
-//   t1 = after glTexSubImage2D
-//   t2 = after SwapBuffers (= vblank wakeup)
-//   t3 = after MonitorSync::OnFrameEnd
-//   t4 = after APU::UpdateDRC
+// P60/P61 checkpoint set (render-thread timeline in the two-thread
+// mode; the single-thread fallback records the same checkpoints on
+// the emulation thread):
+//   t0 = entry to GL_DrawFrameFromBuffer / GL_DrawFrame
+//   t1 = after glTexSubImage2D (texture upload)
+//   t2 = after SwapBuffers (P61: the submit, not the sync point)
+//   t2b = after DwmFlush = the P61 presentation boundary, i.e. the
+//         presentation feedback timestamp handed to
+//         MonitorSync::OnPresentationFeedback
+//
+// P60 queue timing metadata travels WITH each frame through the
+// FrameQueue (see FQSlotMeta below):
+//   tProd    = when the emulation thread produced this frame
+//   emuFrame = producer frame serial
+//   tConsume = when the render thread consumed it
+//   fqSkip/fqDepth = latest-wins queue behaviour at consume time
+//
+// The emulation-thread stage durations ofe (OnFrameEnd) and drc
+// (UpdateDRC) are measured in DrawScreen and carried into the render
+// thread's diag entry via the g_EmuOfeTicks/g_EmuDrcTicks sidecar
+// atomics (two-thread mode) or passed directly (single-thread mode).
 //
 // The buffer holds the last DIAG_FRAMES frames (~5 seconds at 60fps).
-// When any inter-checkpoint delta exceeds DIAG_STALL_MS milliseconds,
-// the buffer is flushed to %TEMP%\nintendulator_timing.log so you can
-// inspect which call caused the stall.
+// When any stage delta exceeds DIAG_STALL_MS milliseconds, or the
+// presentation interval (t2b[n] - t2b[n-1]) does, the buffer is
+// flushed to %TEMP%\nintendulator_timing.log so you can inspect which
+// call caused the stall.
 //
-// Overhead: ~3 QPC reads (150ns total) per frame — negligible.
+// Overhead: a handful of QPC reads (~100ns each) per frame — negligible.
 //
 // P31 (session 10 full-project audit): the dump itself used to be
 // synchronous fopen/fwrite/fclose of a ~360-line file, called directly
@@ -625,17 +641,18 @@ static void ApplyPendingResize()
 #define DIAG_STALL_MS  20.0        // stall threshold: 20ms (>1 vblank)
 
 struct FrameTimingEntry {
-        LONGLONG t0;        // render-thread draw entry / queue consume
-        LONGLONG t1;        // after texture upload
-        LONGLONG t2;        // after SwapBuffers
-        LONGLONG t2b;       // immediately after t2, no GL call between them
-        LONGLONG t3;        // after OnFrameEnd (single-threaded path)
-        LONGLONG t4;        // after UpdateDRC  (single-threaded path)
-        LONGLONG tProd;     // emulation-thread frame publication QPC
-        ULONGLONG emuFrame; // emulation-frame sequence number
-        LONG     fqSkipped; // queued frames skipped before this frame
-        LONG     fqDepth;   // queue depth observed at consume time
-        DWORD    frameNum;  // render/diagnostic sequence
+        LONGLONG t0;        // entry to GL_DrawFrame[FromBuffer]
+        LONGLONG t1;        // after glTexSubImage2D
+        LONGLONG t2;        // after SwapBuffers (P61: submit point)
+        LONGLONG t2b;       // after DwmFlush = P61 presentation feedback point
+        LONGLONG tProd;     // emulation thread: frame production time (queue metadata; ==t0 on the single-thread path)
+        LONGLONG tConsume;  // render thread: FQ_Consume return time (==t0 on the single-thread path)
+        LONGLONG ofeTicks;  // emulation thread: OnFrameEnd duration (P60 sidecar)
+        LONGLONG drcTicks;  // emulation thread: UpdateDRC duration (P60 sidecar)
+        DWORD    frameNum;  // render-thread diagnostic frame serial
+        DWORD    emuFrame;  // producer frame serial (queue metadata)
+        LONG     fqSkip;    // frames dropped by latest-wins when consuming this frame
+        LONG     fqDepth;   // queue depth at consume time (before the consume)
 };
 static FrameTimingEntry s_diagBuf[DIAG_FRAMES];
 static int  s_diagHead      = 0;
@@ -663,48 +680,62 @@ static DWORD s_diagFrameNum = 0;
 
 #define FQ_SLOTS 3
 #define FQ_FRAME_SIZE (256 * 240 * 4)
-
-struct FQ_Packet {
-        unsigned char pixels[FQ_FRAME_SIZE];
-        ULONGLONG     emuFrame;
-        LONGLONG      producedQPC;
-        LONG          fqSkipped;
-        LONG          fqDepth;
-};
-
-static FQ_Packet s_FQ_Buf[FQ_SLOTS];
+static unsigned char s_FQ_Buf[FQ_SLOTS][FQ_FRAME_SIZE];
 static CRITICAL_SECTION s_FQ_CS;
 static bool s_FQ_CS_Init = false;
 static int  s_FQ_Head = 0, s_FQ_Tail = 0, s_FQ_Count = 0;
 
-// Consumer-side scratch packet: FQ_Consume copies the complete metadata and
-// pixels so the returned pointer remains stable even after the producer
-// overwrites the ring slot.
-static FQ_Packet s_FQ_ConsumeCopy;
-static volatile LONG s_FQOverflowDrops = 0;
-static volatile LONG s_FQSkippedFrames = 0;
-static ULONGLONG s_FQEmuFrameCounter = 0;
+// P60: per-slot timing metadata. Written by the producer inside the
+// queue critical section (before the slot becomes consumable), read by
+// the consumer inside the same critical section -- so no extra
+// synchronization is needed on top of the existing CS.
+struct FQSlotMeta {
+        LONGLONG tProd;     // QPC when the producer wrote this slot
+        DWORD    emuFrame;  // producer frame serial
+};
+static FQSlotMeta s_FQ_Meta[FQ_SLOTS];
+static DWORD s_FQ_ProducerSerial = 0;  // producer-thread only (inside CS)
+
+// P60: latest-wins diagnostic counters (doc section 1: "diagnostic
+// depth/skip counters"). Both are cumulative for the whole emulation
+// session (reset in FQ_Init, i.e. on every GFX::Start with MMR on):
+//   - overflow_drop:   frames dropped by the PRODUCER overwriting the
+//                      oldest slot when the queue is full (render thread
+//                      stalled >3 frames; healthy sessions read 0);
+//   - latest_wins_skip: frames dropped by the CONSUMER skipping to the
+//                      newest queued frame (render thread missed one or
+//                      more vblanks; a small non-zero total is normal).
+static volatile LONG s_FQ_OverflowDrop   = 0;
+static volatile LONG s_FQ_LatestWinsSkip = 0;
+
+// Consumer-side scratch buffer: FQ_Consume copies into this so the
+// returned pointer stays valid even after the producer overwrites the
+// ring slot.
+static unsigned char s_FQ_ConsumeCopy[FQ_FRAME_SIZE];
 
 static volatile LONG s_RenderThreadActive = 0;
 static HANDLE        s_RenderThread = NULL;
 static volatile LONG s_RenderThreadStop = 0;
 
+// P60: emulation-thread stage durations, published per frame by DrawScreen
+// (around MonitorSync::OnFrameEnd and APU::UpdateDRC) and consumed by the
+// render thread when it completes the matching diag entry. In steady state
+// the render thread reads frame k's values after presenting frame k --
+// they were written right after the produce, well before the boundary --
+// so the values logged belong to the presented frame (worst case, during
+// a transient backlog, they are off by one frame; harmless for
+// diagnostics). Single-writer per mode, Interlocked-published.
+static __declspec(align(8)) volatile LONGLONG g_EmuOfeTicks = 0;
+static __declspec(align(8)) volatile LONGLONG g_EmuDrcTicks = 0;
+
 static void FQ_Init(void)
 {
-        if (!s_FQ_CS_Init)
-        {
-                InitializeCriticalSection(&s_FQ_CS);
-                s_FQ_CS_Init = true;
-        }
-
-        EnterCriticalSection(&s_FQ_CS);
         s_FQ_Head = s_FQ_Tail = s_FQ_Count = 0;
-        InterlockedExchange(&s_FQOverflowDrops, 0);
-        InterlockedExchange(&s_FQSkippedFrames, 0);
-        s_FQEmuFrameCounter = 0;
-        ZeroMemory(&s_FQ_ConsumeCopy, sizeof(s_FQ_ConsumeCopy));
-        LeaveCriticalSection(&s_FQ_CS);
-
+        ZeroMemory(s_FQ_Meta, sizeof(s_FQ_Meta));
+        s_FQ_ProducerSerial = 0;
+        InterlockedExchange(&s_FQ_OverflowDrop,   0L);
+        InterlockedExchange(&s_FQ_LatestWinsSkip, 0L);
+        if (!s_FQ_CS_Init) { InitializeCriticalSection(&s_FQ_CS); s_FQ_CS_Init = true; }
         if (!s_FrameEvent) s_FrameEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
 }
 
@@ -714,46 +745,48 @@ static void FQ_Destroy(void)
         s_FQ_Head = s_FQ_Tail = s_FQ_Count = 0;
 }
 
-// Producer (emulation thread): write a frame, timestamp it, then signal the
-// render thread. The queue remains latest-wins, but the dropped/skipped count
-// is now observable in the timing log so a future session can distinguish
-// genuine presentation jitter from queue pressure.
+// Producer (emulation thread): write a frame, signal the render thread.
+// Latest-wins: if the queue is full (3 frames backed up — render thread
+// is stalled), drop the oldest by advancing the tail.
 static void FQ_Produce(const unsigned char *src)
 {
+        EnterCriticalSection(&s_FQ_CS);
+        int slot = s_FQ_Head;
+        memcpy(s_FQ_Buf[slot], src, FQ_FRAME_SIZE);
+        // P60: stamp the slot with producer timing metadata (read back by
+        // FQ_Consume on the render thread -> prod->consume column).
         LARGE_INTEGER qpc;
         QueryPerformanceCounter(&qpc);
-        ULONGLONG frameSeq = ++s_FQEmuFrameCounter;
-
-        EnterCriticalSection(&s_FQ_CS);
-        memcpy(s_FQ_Buf[s_FQ_Head].pixels, src, FQ_FRAME_SIZE);
-        s_FQ_Buf[s_FQ_Head].producedQPC = qpc.QuadPart;
-        s_FQ_Buf[s_FQ_Head].emuFrame = frameSeq;
-        s_FQ_Buf[s_FQ_Head].fqSkipped = 0;
-        s_FQ_Buf[s_FQ_Head].fqDepth = 0;
+        s_FQ_Meta[slot].tProd    = qpc.QuadPart;
+        s_FQ_Meta[slot].emuFrame = ++s_FQ_ProducerSerial;
         s_FQ_Head = (s_FQ_Head + 1) % FQ_SLOTS;
-
         if (s_FQ_Count >= FQ_SLOTS)
         {
-                // Overwrite oldest.
+                // Overwrite oldest
                 s_FQ_Tail = (s_FQ_Tail + 1) % FQ_SLOTS;
-                InterlockedIncrement(&s_FQOverflowDrops);
+                InterlockedIncrement(&s_FQ_OverflowDrop);
         }
         else
         {
                 s_FQ_Count++;
         }
         LeaveCriticalSection(&s_FQ_CS);
-
         if (s_FrameEvent) SetEvent(s_FrameEvent);
 }
 
-// Consumer (render thread): get the newest available frame. If several frames
-// are queued, discard older ones, but retain exact metadata for the frame that
-// is actually presented.
-static const FQ_Packet *FQ_Consume(LONG *skipped, LONG *depth)
+// Consumer (render thread): get the latest available frame. If multiple
+// frames are queued, skip to the newest (drop intermediates) so the
+// render thread always shows the freshest frame. Returns NULL if empty.
+// The returned pointer is into s_FQ_ConsumeCopy (stable until next call).
+// P60: also reports the consumed slot's timing metadata and this
+// consume's latest-wins behaviour (dropped frames / queue depth).
+static const unsigned char *FQ_Consume(LONGLONG *outTProd, DWORD *outEmuFrame,
+                                        LONG *outSkip, LONG *outDepth)
 {
-        if (skipped) *skipped = 0;
-        if (depth) *depth = 0;
+        if (outTProd)    *outTProd = 0;
+        if (outEmuFrame) *outEmuFrame = 0;
+        if (outSkip)     *outSkip = 0;
+        if (outDepth)    *outDepth = 0;
 
         EnterCriticalSection(&s_FQ_CS);
         if (s_FQ_Count <= 0)
@@ -761,29 +794,29 @@ static const FQ_Packet *FQ_Consume(LONG *skipped, LONG *depth)
                 LeaveCriticalSection(&s_FQ_CS);
                 return NULL;
         }
-
-        int queued = s_FQ_Count;
-        if (depth) *depth = queued;
-        if (skipped) *skipped = queued - 1;
-
-        if (queued > 1)
-                InterlockedExchangeAdd(&s_FQSkippedFrames, queued - 1);
-
-        // Skip to the newest queued frame.
+        LONG depth   = (LONG)s_FQ_Count;
+        LONG dropped = (LONG)s_FQ_Count - 1;
+        // Skip to the latest queued frame (drop intermediates).
         while (s_FQ_Count > 1)
         {
                 s_FQ_Tail = (s_FQ_Tail + 1) % FQ_SLOTS;
                 s_FQ_Count--;
         }
-
-        memcpy(&s_FQ_ConsumeCopy, &s_FQ_Buf[s_FQ_Tail],
-               sizeof(s_FQ_ConsumeCopy));
-        s_FQ_ConsumeCopy.fqSkipped = queued - 1;
-        s_FQ_ConsumeCopy.fqDepth = queued;
+        if (dropped > 0)
+                InterlockedExchangeAdd(&s_FQ_LatestWinsSkip, dropped);
+        int slot = s_FQ_Tail;
+        LONGLONG tProd    = s_FQ_Meta[slot].tProd;
+        DWORD    emuFrame = s_FQ_Meta[slot].emuFrame;
+        memcpy(s_FQ_ConsumeCopy, s_FQ_Buf[slot], FQ_FRAME_SIZE);
         s_FQ_Tail = (s_FQ_Tail + 1) % FQ_SLOTS;
         s_FQ_Count--;
         LeaveCriticalSection(&s_FQ_CS);
-        return &s_FQ_ConsumeCopy;
+
+        if (outTProd)    *outTProd = tProd;
+        if (outEmuFrame) *outEmuFrame = emuFrame;
+        if (outSkip)     *outSkip = dropped;
+        if (outDepth)    *outDepth = depth;
+        return s_FQ_ConsumeCopy;
 }
 
 bool IsRenderThreadActive(void)
@@ -800,8 +833,12 @@ void ProduceFrameToQueue(const unsigned char *rgba)
 // P54: forward declarations — GL_DrawFrameFromBuffer (below) uses these
 // static helpers which are defined later in the file. Forward-declaring
 // them here keeps the two-threaded code grouped together for readability.
+// P60: DiagCompleteFrame now takes the emulation-thread stage DURATIONS
+// (OnFrameEnd / UpdateDRC), measured by DrawScreen — either directly
+// (single-thread mode) or through the g_EmuOfeTicks/g_EmuDrcTicks
+// sidecar (two-thread mode).
 static double DiagQPCFreq(void);
-static void DiagCompleteFrame(LONGLONG t3, LONGLONG t4);
+static void DiagCompleteFrame(LONGLONG ofeTicks, LONGLONG drcTicks);
 static void ApplyPendingResize(void);
 
 // P54: GL_DrawFrameFromBuffer — renders a frame from a pre-filled RGBA
@@ -810,7 +847,14 @@ static void ApplyPendingResize(void);
 // current. This is GL_DrawFrame with the palette-conversion step
 // removed (the buffer is already converted) and the diagnostic timing
 // kept (gap/tex/swap still measured here).
-static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
+// P60: tConsume/tProd/emuFrame/fqSkip/fqDepth carry the FrameQueue
+// timing metadata of the frame being rendered into the diag entry.
+// P61: the presentation order is SwapBuffers FIRST, then DwmFlush;
+// the presentation feedback timestamp (t2b) is taken AFTER the DWM
+// boundary and fed to MonitorSync::OnPresentationFeedback.
+static void GL_DrawFrameFromBuffer(const unsigned char *rgba,
+                                   LONGLONG tConsume, LONGLONG tProd,
+                                   DWORD emuFrame, LONG fqSkip, LONG fqDepth)
 {
         LONGLONG diagT0 = 0, diagT1 = 0;
         if (MatchMonitorRate)
@@ -822,13 +866,14 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 s_diagBuf[idx].t1       = 0;
                 s_diagBuf[idx].t2       = 0;
                 s_diagBuf[idx].t2b      = 0;
-                s_diagBuf[idx].t3       = 0;
-                s_diagBuf[idx].t4       = 0;
-                s_diagBuf[idx].tProd    = packet ? packet->producedQPC : 0;
-                s_diagBuf[idx].emuFrame = packet ? packet->emuFrame : 0;
-                s_diagBuf[idx].fqSkipped = packet ? packet->fqSkipped : 0;
-                s_diagBuf[idx].fqDepth = packet ? packet->fqDepth : 0;
+                s_diagBuf[idx].tProd    = tProd;
+                s_diagBuf[idx].tConsume = tConsume;
+                s_diagBuf[idx].ofeTicks = 0;
+                s_diagBuf[idx].drcTicks = 0;
                 s_diagBuf[idx].frameNum = s_diagFrameNum;
+                s_diagBuf[idx].emuFrame = emuFrame;
+                s_diagBuf[idx].fqSkip   = fqSkip;
+                s_diagBuf[idx].fqDepth  = fqDepth;
                 s_diagHead = (s_diagHead + 1) % DIAG_FRAMES;
         }
 
@@ -852,7 +897,7 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 void* pboMem = pfn_glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY);
                 if (pboMem)
                 {
-                        memcpy(pboMem, packet->pixels, FQ_FRAME_SIZE);
+                        memcpy(pboMem, rgba, FQ_FRAME_SIZE);
                         pfn_glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
                         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 240,
                                 GL_BGRA_EXT, GL_UNSIGNED_BYTE, NULL);
@@ -861,7 +906,7 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 {
                         pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
                         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 240,
-                                GL_BGRA_EXT, GL_UNSIGNED_BYTE, packet->pixels);
+                                GL_BGRA_EXT, GL_UNSIGNED_BYTE, rgba);
                 }
                 pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
                 s_PBOIndex ^= 1;
@@ -869,7 +914,7 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
         else
         {
                 glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 240,
-                        GL_BGRA_EXT, GL_UNSIGNED_BYTE, packet->pixels);
+                        GL_BGRA_EXT, GL_UNSIGNED_BYTE, rgba);
         }
 
         if (MatchMonitorRate)
@@ -943,31 +988,47 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 glColor4f(1, 1, 1, 1);
         }
 
-        // P61: submit the frame first, then wait for DWM to finish
-        // compositing that submitted frame.
+        // -----------------------------------------------------------
+        // P61: presentation order — SwapBuffers FIRST, then DwmFlush.
         //
-        // The P60 implementation measured QPC immediately after
-        // SwapBuffers(). In the DWM interval=0 path that timestamp is NOT a
-        // presentation boundary: SwapBuffers only queues the back buffer for
-        // composition and may return immediately. Feeding that timestamp back
-        // into PaceSlot() created the observed 23ms/9ms phase alternation.
+        // Up to and including P60 the order was DwmFlush -> SwapBuffers:
+        // wait for a DWM composition boundary, then submit into it. The
+        // timing boundary that resulted (the moment SwapBuffers returned)
+        // still did not fully match the actual DWM-composited presentation
+        // point, and the P60 feedback clock was therefore anchored to a
+        // boundary that was systematically early relative to when the
+        // frame really became composited (a repeating ~23 -> ~9 -> ~17 ms
+        // phase cycle in the timing log).
         //
-        // The correct ordering for this path is:
-        //     SwapBuffers(interval=0) -> DwmFlush() -> next frame
+        // P61 submits first (SwapBuffers), then waits on DwmFlush, and
+        // takes the presentation feedback timestamp AFTER that boundary:
+        // t2b below is the closest available proxy for "DWM just
+        // composited our frame". The measured P61 log no longer shows the
+        // phase cycle (see MATCH_MONITOR_RATE_2026-09-14.md sections 0
+        // and 6). Do NOT reorder these calls back.
         //
-        // DwmFlush() is documented as waiting until the calling process has
-        // completed its outstanding DWM work for the current composition
-        // cycle. Its return is therefore the best available observed
-        // composition boundary on this Windows 7-compatible path.
-#if USE_DWMFLUSH
-        InterlockedIncrement(&s_DwmFlushPathReached);
-#endif
+        // The DXGI vblank wait (no-op while the P39 kill switch is
+        // active) stays immediately before the submit — a vblank wait
+        // only ever makes sense before presenting, never after.
+        // -----------------------------------------------------------
         if (MatchMonitorRate)
                 MonitorSync::WaitForDXGIVBlank();
 
         SwapBuffers(hGLDC);
 
+        if (MatchMonitorRate)
+        {
+                LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
+                int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+                s_diagBuf[idx].t2 = qpc.QuadPart;
+        }
+
+        // DwmFlush path (same as GL_DrawFrame — P53 fixed condition).
+        // P61: this block now runs AFTER SwapBuffers (see the ordering
+        // comment above). During the DWM warmup window DwmFlush is
+        // intentionally not called and this span reads ~0.00ms.
 #if USE_DWMFLUSH
+        InterlockedIncrement(&s_DwmFlushPathReached);
         if (MatchMonitorRate && !(Fullscreen && ExclusiveFullscreen))
         {
                 if (s_pfnDwmFlush == reinterpret_cast<PFN_DwmFlush>(1))
@@ -988,44 +1049,32 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                                         MonitorSync::SetDwmSyncMode(true);
                                         s_DwmModeArmed = true;
                                 }
-                                LARGE_INTEGER flushQpc;
-                                HRESULT hr = s_pfnDwmFlush();
-                                QueryPerformanceCounter(&flushQpc);
-                                (void)hr;
-                                if (MatchMonitorRate)
-                                {
-                                        int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
-                                        s_diagBuf[idx].t2 = flushQpc.QuadPart;
-                                        MonitorSync::NotifyFramePresented(flushQpc.QuadPart);
-                                }
+                                s_pfnDwmFlush();
                         }
                 }
         }
 #endif
+
         if (MatchMonitorRate)
         {
                 LARGE_INTEGER qpc2; QueryPerformanceCounter(&qpc2);
                 int idx2 = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
                 s_diagBuf[idx2].t2b = qpc2.QuadPart;
 
-                // P54: complete the diag entry from the render thread.
-                // t3/t4 are the same as t2b here (no OnFrameEnd/UpdateDRC
-                // on the render thread — those run on the emulation thread).
-                s_diagBuf[idx2].t3 = qpc2.QuadPart;
-                s_diagBuf[idx2].t4 = qpc2.QuadPart;
-                DiagCompleteFrame(qpc2.QuadPart, qpc2.QuadPart);
-        }
-        {
-                LARGE_INTEGER qpc2; QueryPerformanceCounter(&qpc2);
-                int idx2 = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
-                s_diagBuf[idx2].t2b = qpc2.QuadPart;
+                // P60/P61: presentation feedback is published AFTER the
+                // DWM boundary. This feeds the presentation feedback clock
+                // in MonitorSync (LOCKED / QPC FALLBACK) which, in turn,
+                // paces the emulation slots in PaceSlot with a bounded
+                // phase lead. During the DWM warmup window (GL vsync, no
+                // DwmFlush) the timestamp right after SwapBuffers is an
+                // equally valid vblank-anchored feedback.
+                MonitorSync::OnPresentationFeedback(qpc2.QuadPart);
 
-                // P54: complete the diag entry from the render thread.
-                // t3/t4 are the same as t2b here (no OnFrameEnd/UpdateDRC
-                // on the render thread — those run on the emulation thread).
-                s_diagBuf[idx2].t3 = qpc2.QuadPart;
-                s_diagBuf[idx2].t4 = qpc2.QuadPart;
-                DiagCompleteFrame(qpc2.QuadPart, qpc2.QuadPart);
+                // P60: complete the diag entry with the emulation
+                // thread's published OnFrameEnd/UpdateDRC durations.
+                DiagCompleteFrame(
+                        InterlockedExchangeAdd64(&g_EmuOfeTicks, 0),
+                        InterlockedExchangeAdd64(&g_EmuDrcTicks, 0));
         }
 }
 
@@ -1054,10 +1103,20 @@ static DWORD WINAPI RenderThreadProc(void *)
                 if (InterlockedExchangeAdd(&s_RenderThreadStop, 0))
                         break;
 
-                const FQ_Packet *packet = FQ_Consume(NULL, NULL);
-                if (packet)
+                const unsigned char *pixels;
+                LONGLONG tProd = 0, tConsume = 0;
+                DWORD    emuFrame = 0;
+                LONG     fqSkip = 0, fqDepth = 0;
+                pixels = FQ_Consume(&tProd, &emuFrame, &fqSkip, &fqDepth);
+                if (pixels)
                 {
-                        GL_DrawFrameFromBuffer(packet);
+                        // P60: consume timestamp — the consume->present
+                        // column is measured from here to the presentation
+                        // boundary (t2b) inside GL_DrawFrameFromBuffer.
+                        LARGE_INTEGER qpc;
+                        QueryPerformanceCounter(&qpc);
+                        tConsume = qpc.QuadPart;
+                        GL_DrawFrameFromBuffer(pixels, tConsume, tProd, emuFrame, fqSkip, fqDepth);
                 }
                 else
                 {
@@ -1208,97 +1267,123 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         // never ran or never moved, so DRC is not correcting anything).
         _ftprintf(f, _T("Monitor refresh Hz: %.6f | MMR target Hz: %.6f | Frame cadence Hz: %.6f | NES native Hz: %.6f\n"),
                 MonitorSync::GetMonitorHz(), MonitorSync::GetTargetHz(), MonitorSync::GetFrameHz(), MonitorSync::GetNESHz());
-        _ftprintf(f, _T("Presentation clock: %s | Presentation Hz: %.6f | Last interval error: %.3f ms\n"),
-                MonitorSync::HasPresentationClock() ? _T("LOCKED") : _T("QPC FALLBACK"),
-                MonitorSync::GetPresentationHz(), MonitorSync::GetPresentationIntervalErrorMs());
-        _ftprintf(f, _T("FrameQueue counters: overflow_drop=%ld, latest_wins_skip=%ld\n"),
-                (long)InterlockedExchangeAdd(&s_FQOverflowDrops, 0),
-                (long)InterlockedExchangeAdd(&s_FQSkippedFrames, 0));
-        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | renderGap | consume->present | presentInterval | presentErr | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
+        // P60 (doc section 5): presentation-clock header record. LOCKED
+        // means PaceSlot is anchoring emulation slots to measured
+        // presentation boundaries; QPC FALLBACK means the feedback stream
+        // is missing/stale and the absolute QPC cadence is pacing instead
+        // (a fallback that appears mid-run is itself a red flag).
+        // Presentation Hz is the mean over the last 128 accepted
+        // intervals -- NOT the DWM-reported monitor rate above; a monitor
+        // reporting 60.000 Hz through DWM but compositing at ~59.7 Hz
+        // shows the difference here. Last interval error is the most
+        // recent interval's deviation from the MMR target.
+        _ftprintf(f, _T("Presentation clock: %s | Presentation Hz: %.6f | Last interval error: %+.3f ms\n"),
+                MonitorSync::IsPresentationClockLocked() ? _T("LOCKED") : _T("QPC FALLBACK"),
+                MonitorSync::GetPresentationHz(),
+                MonitorSync::GetLastPresentErrMs());
+        // P60 (doc section 5): cumulative latest-wins queue counters for
+        // the whole emulation session (reset in FQ_Init, i.e. on every
+        // GFX::Start with MMR on). overflow_drop counts frames the
+        // PRODUCER overwrote when the queue was full (render thread
+        // stalled >3 frames; healthy sessions read 0); latest_wins_skip
+        // counts frames the CONSUMER skipped past (render thread missed
+        // one or more vblanks; a small non-zero total is normal).
+        _ftprintf(f, _T("Queue: overflow_drop=%ld, latest_wins_skip=%ld (cumulative since FQ_Init)\n"),
+                (long)InterlockedExchangeAdd(&s_FQ_OverflowDrop, 0L),
+                (long)InterlockedExchangeAdd(&s_FQ_LatestWinsSkip, 0L));
+        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume (queue wait) | renderGap (t0[n]->t0[n-1], TRUE render frame-to-frame period -- P43) | consume->present | presentInterval (t2b[n]->t2b[n-1] -- P60) | presentErr (vs MMR target) | fqSkip/fqDepth (latest-wins queue) | tex (upload) | swap (SwapBuffers submit -- P61) | t2->t2b (DwmFlush span, P61 order) | ofe (OnFrameEnd duration) | drc (UpdateDRC duration) | total (t0->t2b render-stage work)\n"));
+        _ftprintf(f, _T("Red flags: present >= 20ms (esp. 30/50ms), repeated abs(presentErr) >= 2ms, fqDepth > 1 or rapidly increasing skip count during visible stutter, QPC FALLBACK mid-run, recurring 9/23/33/50ms patterns.\n"));
+        _ftprintf(f, _T("Single-thread fallback path: queue columns degenerate deliberately (emuFrame==frame, fq=0/0, prod->consume=0.00, consume->present==total).\n\n"));
 
-        // P43 (session 20): t0->t4 only spans GL_DrawFrame+OnFrameEnd+
-        // UpdateDRC -- the video-draw slice of a frame. It does NOT cover
-        // CPU::ExecOp/PPU rendering/APU::Run/PaceFrame, which all run on
-        // the same NES thread BEFORE GL_DrawFrame is even called for the
-        // next frame. Session 19's log showed "tot" consistently well
-        // under one real vblank period (~9.7-12ms vs. an expected ~16.67ms
-        // at this monitor's confirmed 59.9986Hz) -- that is NOT a bug by
-        // itself: if CPU/PPU/APU work already consumed several ms of the
-        // vblank budget before GL_DrawFrame was reached, SwapBuffers only
-        // needs to wait out the REMAINDER, so "tot" reading under 16.67ms
-        // is expected and fine on its own. What "tot" can never show is
-        // the one thing that actually matters for a visible stutter: the
-        // TRUE frame-to-frame period, including that unmeasured CPU/PPU/
-        // APU time. This new "gap" column is exactly that -- the distance
+        // P43 (session 20): "tot" only spans the render-stage slice of a
+        // frame (entry -> presentation boundary). It does NOT cover
+        // CPU::ExecOp/PPU rendering/APU::Run/PaceSlot, which all run on
+        // the emulation thread BEFORE the frame is produced. "tot"
+        // reading under one vblank period is therefore expected and fine
+        // on its own. What it can never show is the one thing that
+        // actually matters for a visible stutter: the TRUE frame-to-frame
+        // period. The renderGap column is exactly that -- the distance
         // between this frame's t0 and the PREVIOUS logged frame's t0 --
         // and is where a real dropped/duplicated video frame (the kind
-        // that would actually look like a scroll stutter) will show up:
-        // a gap far from ~16.67ms, regardless of how the t0->t4 slice
-        // inside it happens to be split.
-        LONGLONG prevT0 = 0;
-        LONGLONG prevT2 = 0;
+        // that would actually look like a scroll stutter) will show up.
+        // P60 adds presentInterval (t2b[n]->t2b[n-1]): the interval
+        // between presentation feedback timestamps, which is what the
+        // doc's red flags are defined against -- renderGap can jitter
+        // with render-thread scheduling while presentation cadence stays
+        // clean, and vice versa.
+        double centerMs = (MonitorSync::GetTargetHz() > 1.0) ? 1000.0 / MonitorSync::GetTargetHz() : 16.667;
+        LONGLONG prevT0 = 0, prevT2b = 0;
         bool     havePrevT0 = false;
-        bool     havePrevT2 = false;
 
         // Walk the circular buffer from oldest to newest
         for (int i = 0; i < DIAG_FRAMES; i++)
         {
                 int idx = (head + i) % DIAG_FRAMES;
                 const FrameTimingEntry &e = buf[idx];
-                if (e.frameNum == 0 || e.t4 == 0) continue;
+                if (e.frameNum == 0 || e.t2b == 0) continue;
 
-                double d01 = (e.t1  - e.t0)  * 1000.0 / freq;
-                double d12 = (e.t2  - e.t1)  * 1000.0 / freq;
-                double d2b = (e.t2b - e.t2)  * 1000.0 / freq;
-                double d23 = (e.t3  - e.t2b) * 1000.0 / freq;
-                double d34 = (e.t4  - e.t3)  * 1000.0 / freq;
-                double dtot= (e.t4  - e.t0)  * 1000.0 / freq;
-                double dprod = (e.tProd > 0 && e.t0 >= e.tProd) ?
-                               (e.t0 - e.tProd) * 1000.0 / freq : 0.0;
-                double dpresent = (havePrevT2 && e.t2 > prevT2) ?
-                                  (e.t2 - prevT2) * 1000.0 / freq : 0.0;
+                double dpc = (e.tConsume - e.tProd) * 1000.0 / freq;  // queue wait ms
+                double d01 = (e.t1  - e.t0)  * 1000.0 / freq;  // texUpload ms
+                double d12 = (e.t2  - e.t1)  * 1000.0 / freq;  // SwapBuffers submit ms (P61)
+                double d2b = (e.t2b - e.t2)  * 1000.0 / freq;  // DwmFlush span ms (P61 order)
+                double dc2p = (e.t2b - e.tConsume) * 1000.0 / freq; // consume->present ms
+                double dofe = (double)e.ofeTicks * 1000.0 / freq;    // OnFrameEnd duration ms
+                double ddrc = (double)e.drcTicks * 1000.0 / freq;    // UpdateDRC duration ms
+                double dtot= (e.t2b - e.t0)  * 1000.0 / freq;  // total ms (render-stage work)
 
-                bool   haveGap = havePrevT0;
-                double dgap = haveGap ? (e.t0 - prevT0) * 1000.0 / freq : 0.0;
+                bool   havePrev = havePrevT0;
+                double dgap  = havePrev ? (e.t0  - prevT0)  * 1000.0 / freq : 0.0;
+                double dpint = havePrev ? (e.t2b - prevT2b) * 1000.0 / freq : 0.0;
+                double dperr = havePrev ? (dpint - centerMs) : 0.0;
                 prevT0 = e.t0;
-                prevT2 = e.t2;
+                prevT2b = e.t2b;
                 havePrevT0 = true;
-                havePrevT2 = (e.t2 > 0);
-                double centerMs = (MonitorSync::GetTargetHz() > 1.0) ?
-                                  1000.0 / MonitorSync::GetTargetHz() : 16.667;
-                double presentErr = havePrevT2 && dpresent > 0.0 ?
-                                    (dpresent - centerMs) : 0.0;
 
-                // A real dropped/duplicated frame shows up as a gap far
-                // from one vblank period (~16.67ms at 60Hz) in EITHER
+                // A real dropped/duplicated frame shows up as a renderGap
+                // far from one vblank period (~16.67ms at 60Hz) in EITHER
                 // direction -- flag anything more than 8ms off center,
                 // not just "too slow": a too-SHORT gap means two video
                 // frames got drawn within one real vblank (one of them
                 // presumably invisible), which is just as much a visible
                 // stutter as a dropped one.
-                // Mark stalled stages with '*'. renderGap remains useful for
-                // spotting queue/presentation skips, while presentInterval and
-                // presentErr expose the phase variation that motivated P60.
-                bool gapStalled = haveGap && (fabs(dgap - centerMs) > 8.0);
-                bool presentStalled = (dpresent > 0.0 && fabs(presentErr) > 2.0);
+                bool   gapStalled  = havePrev && (fabs(dgap - centerMs) > 8.0);
+                // P60 red flags (doc section 5): presentInterval >= 20ms,
+                // especially 30/50ms; repeated abs(presentErr) >= 2ms.
+                bool   pintStalled = havePrev && (dpint > DIAG_STALL_MS);
+                bool   perrStalled = havePrev && (fabs(dperr) >= 2.0);
 
-                _ftprintf(f,
-                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
-                        e.frameNum,
-                        (unsigned __int64)e.emuFrame,
-                        dprod,
-                        dgap, (gapStalled ? _T("*") : _T(" ")),
-                        (e.t0 > 0 && e.t2 >= e.t0) ? (e.t2 - e.t0) * 1000.0 / freq : 0.0,
-                        dpresent, (presentStalled ? _T("*") : _T(" ")),
-                        presentErr,
-                        (int)e.fqSkipped, (int)e.fqDepth,
-                        d01, (d01 > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                        d12, (d12 > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                        d2b, (d2b > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                        d23, (d23 > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                        d34, (d34 > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                        dtot, (dtot > DIAG_STALL_MS * 1.5 ? _T("*") : _T(" "))
-                );
+                // Mark stalled stages with '*'
+                if (havePrev)
+                        _ftprintf(f,
+                                _T("F%06u e%06u  pc=%7.2f  rgap=%7.2f%s  c2p=%7.2f  pint=%7.2f%s  perr=%+8.3f%s  fq=%ld/%ld  tex=%6.2f%s  swap=%7.2f%s  dwm=%7.2f%s  ofe=%6.2f%s  drc=%6.2f%s  tot=%7.2f%s\n"),
+                                e.frameNum, e.emuFrame,
+                                dpc,
+                                dgap, (gapStalled ? _T("*") : _T(" ")),
+                                dc2p,
+                                dpint,(pintStalled ? _T("*") : _T(" ")),
+                                dperr,(perrStalled ? _T("*") : _T(" ")),
+                                e.fqSkip, e.fqDepth,
+                                d01, (d01 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                d12, (d12 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                d2b, (d2b > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                dofe,(dofe > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                ddrc,(ddrc > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                dtot,(dtot > DIAG_STALL_MS * 1.5 ? _T("*") : _T(" "))
+                        );
+                else
+                        _ftprintf(f,
+                                _T("F%06u e%06u  pc=%7.2f  rgap=    n/a   c2p=%7.2f  pint=    n/a   perr=     n/a   fq=%ld/%ld  tex=%6.2f%s  swap=%7.2f%s  dwm=%7.2f%s  ofe=%6.2f%s  drc=%6.2f%s  tot=%7.2f%s\n"),
+                                e.frameNum, e.emuFrame,
+                                dpc,
+                                dc2p,
+                                e.fqSkip, e.fqDepth,
+                                d01, (d01 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                d12, (d12 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                d2b, (d2b > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                dofe,(dofe > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                ddrc,(ddrc > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                                dtot,(dtot > DIAG_STALL_MS * 1.5 ? _T("*") : _T(" "))
+                        );
         }
         fclose(f);
 }
@@ -1376,26 +1461,54 @@ static void DiagDumpLogAsync()
         }
 }
 
-// Called from DrawScreen to complete the timing entry for this frame.
-// t3 and t4 are filled here (after SwapBuffers returns) and a stall check
-// is performed.
-static void DiagCompleteFrame(LONGLONG t3, LONGLONG t4)
+// P60: completes the timing entry for the frame that was just presented.
+// ofeTicks/drcTicks are the emulation-thread DURATIONS of
+// MonitorSync::OnFrameEnd and APU::UpdateDRC measured by DrawScreen for
+// this frame -- passed directly on the single-thread path, or read from
+// the g_EmuOfeTicks/g_EmuDrcTicks sidecar atomics on the two-thread path
+// (GL_DrawFrameFromBuffer). Also runs the stall triggers that decide
+// whether the ring buffer gets dumped to disk.
+static void DiagCompleteFrame(LONGLONG ofeTicks, LONGLONG drcTicks)
 {
         if (!MatchMonitorRate) return;
 
-        // Find the entry we opened in GL_DrawFrame for this frame number.
-        // It's always at (s_diagHead - 1 + DIAG_FRAMES) % DIAG_FRAMES.
+        // Find the entry we opened in GL_DrawFrame[FromBuffer] for this
+        // frame number. It's always at (s_diagHead - 1 + DIAG_FRAMES) % DIAG_FRAMES.
         int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
-        s_diagBuf[idx].t3 = t3;
-        s_diagBuf[idx].t4 = t4;
+        s_diagBuf[idx].ofeTicks = ofeTicks;
+        s_diagBuf[idx].drcTicks = drcTicks;
 
-        // Stall check: SwapBuffers duration > DIAG_STALL_MS
         double freq = DiagQPCFreq();
         double swapMs = (s_diagBuf[idx].t2  - s_diagBuf[idx].t1)  * 1000.0 / freq;
         double texMs  = (s_diagBuf[idx].t1  - s_diagBuf[idx].t0)  * 1000.0 / freq;
         double mcrMs  = (s_diagBuf[idx].t2b - s_diagBuf[idx].t2)  * 1000.0 / freq;
-        double ofeMs  = (s_diagBuf[idx].t3  - s_diagBuf[idx].t2b) * 1000.0 / freq;
-        double drcMs  = (s_diagBuf[idx].t4  - s_diagBuf[idx].t3)  * 1000.0 / freq;
+        double ofeMs  = (double)ofeTicks * 1000.0 / freq;
+        double drcMs  = (double)drcTicks * 1000.0 / freq;
+
+        // P60: presentation interval between consecutive COMPLETED frames
+        // -- the presentInterval column and the primary red flag (doc
+        // section 5: present >= 20 ms, especially 30/50 ms). Tracked
+        // across calls rather than read back from the ring so the trigger
+        // sees exactly the presentation sequence, in both the two-thread
+        // and the single-thread mode. A delta that is not in (0, 1 s)
+        // means a fresh session / pause / mode switch -- re-seed the
+        // tracker without flagging anything.
+        static LONGLONG s_diagLastPresentQPC = 0;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        double presentMs = 0.0;
+        bool   havePresent = false;
+        if (s_diagLastPresentQPC != 0)
+        {
+                double delta = (double)(s_diagBuf[idx].t2b - s_diagLastPresentQPC)
+                                * 1000.0 / freq;
+                if (delta > 0.0 && delta < 1000.0)
+                {
+                        presentMs = delta;
+                        havePresent = true;
+                }
+        }
+        s_diagLastPresentQPC = s_diagBuf[idx].t2b;
 
         // P35: ofeMs (OnFrameEnd duration) was computed for display in the
         // log columns but never included in the trigger condition below.
@@ -1440,14 +1553,15 @@ static void DiagCompleteFrame(LONGLONG t3, LONGLONG t4)
         // monitor Hz" header line current -- DiagDumpLogAsync's existing
         // 3-second cooldown keeps this cheap.
         static LONGLONG s_diagLastPeriodicQPC = 0;
-        LONGLONG nowQPC = s_diagBuf[idx].t4;
         bool periodicDue = (s_diagLastPeriodicQPC == 0) ||
-                ((double)(nowQPC - s_diagLastPeriodicQPC) / freq >= 10.0);
+                ((double)(now.QuadPart - s_diagLastPeriodicQPC) / freq >= 10.0);
 
-        if (swapMs > DIAG_STALL_MS || texMs > DIAG_STALL_MS || mcrMs > DIAG_STALL_MS || ofeMs > DIAG_STALL_MS || drcMs > DIAG_STALL_MS || periodicDue)
+        if (swapMs > DIAG_STALL_MS || texMs > DIAG_STALL_MS || mcrMs > DIAG_STALL_MS ||
+            ofeMs > DIAG_STALL_MS || drcMs > DIAG_STALL_MS ||
+            (havePresent && presentMs > DIAG_STALL_MS) || periodicDue)
         {
                 if (periodicDue)
-                        s_diagLastPeriodicQPC = nowQPC;
+                        s_diagLastPeriodicQPC = now.QuadPart;
                 DiagDumpLogAsync();
         }
 }
@@ -1467,9 +1581,18 @@ static void GL_DrawFrame(void)
                 s_diagBuf[idx].t1       = 0;
                 s_diagBuf[idx].t2       = 0;
                 s_diagBuf[idx].t2b      = 0;
-                s_diagBuf[idx].t3       = 0;
-                s_diagBuf[idx].t4       = 0;
+                // P60: single-thread fallback path -- no FrameQueue, so the
+                // queue-derived columns degenerate deliberately (see the
+                // log header): tProd/tConsume == t0, emuFrame == frameNum,
+                // fqSkip/fqDepth = 0/0.
+                s_diagBuf[idx].tProd    = diagT0;
+                s_diagBuf[idx].tConsume = diagT0;
+                s_diagBuf[idx].ofeTicks = 0;
+                s_diagBuf[idx].drcTicks = 0;
                 s_diagBuf[idx].frameNum = s_diagFrameNum;
+                s_diagBuf[idx].emuFrame = s_diagFrameNum;
+                s_diagBuf[idx].fqSkip   = 0;
+                s_diagBuf[idx].fqDepth  = 0;
                 s_diagHead = (s_diagHead + 1) % DIAG_FRAMES;
         }
 
@@ -1675,7 +1798,81 @@ static void GL_DrawFrame(void)
                 glColor4f(1, 1, 1, 1);
         }
 
-        // Synchronise with DWM before presenting (windowed + MMR only).
+        // -----------------------------------------------------------
+        // P61: presentation order — SwapBuffers FIRST, then DwmFlush
+        // (single-thread fallback path; see GL_DrawFrameFromBuffer above
+        // for the full rationale and the measured result). Do NOT
+        // reorder these calls back.
+        // -----------------------------------------------------------
+        //
+        // P28: DXGI vblank bypass.
+        //
+        // When WaitForDXGIVBlank() is available and MMR is active, we wait
+        // for the raw GPU vblank interrupt here (bypassing DWM), then call
+        // SwapBuffers with interval=0 so the frame is submitted into that
+        // vblank slot without going through DWM's composition timing path.
+        //
+        // Without this, SwapBuffers(interval=1) routes through DWM's
+        // "composition ready" signal which is subject to DWM's periodic
+        // maintenance stalls (~20-60s), producing the exact symptom: a
+        // simultaneous video + audio dropout roughly every 20-30 seconds.
+        //
+        // If DXGI is unavailable (shouldn't happen on Win7+ but possible
+        // with very old/broken GPU drivers), WaitForDXGIVBlank() is a no-op
+        // and we fall through to SwapBuffers which uses interval=1 (set
+        // during Enable() by the non-DXGI path) -- identical to pre-P28.
+        //
+        // P36 (session 13): this used to be gated on "&& !Fullscreen", on
+        // the theory that fullscreen already gets a real hardware vblank
+        // from GL's own driver vsync and doesn't need the DXGI bypass.
+        // That reasoning missed that g_DXGISwapInterval is a single,
+        // mode-independent flag: as soon as InitDXGI() succeeds once (the
+        // session-12 log confirms "DXGI init detail: OK" on this machine),
+        // Enable()/ReinitVSync()/SetDwmSyncMode() all post interval=0 for
+        // every future frame -- in fullscreen exactly as much as windowed.
+        // Nothing puts the interval back to 1 specifically for fullscreen.
+        // With the old "!Fullscreen" guard, that left fullscreen with
+        // interval=0 (driver vsync off) AND no WaitForDXGIVBlank() call:
+        // literally nothing on the video side paced the frame. SwapBuffers
+        // returned immediately every time, the NES thread ran unthrottled,
+        // and the only remaining brake was the DirectSound buffer-fill
+        // wait loop in APU.cpp (MonitorSync::PaceFrame), which paces per
+        // audio-lock-slot off the timestamp of the *previous fully-drawn
+        // video frame* -- it was never designed to be the sole/primary
+        // throttle, and does not scale correctly when asked to be one.
+        // The attached timing log (MatchMonitorRate on, DXGI active) shows
+        // swap+ofe totalling ~85-100ms/frame -- 5-6x a real ~16.6ms vblank
+        // period, i.e. almost exactly the reported "8fps instead of 60fps
+        // in fullscreen". Removing the Fullscreen restriction here makes
+        // fullscreen use the same real-hardware-vblank wait as windowed,
+        // restoring a proper ~16.6ms/frame pace in both modes.
+        //
+        // P61 note: the wait stays immediately before the submit -- a
+        // vblank wait only ever makes sense before presenting, never
+        // after.
+        if (MatchMonitorRate)
+                MonitorSync::WaitForDXGIVBlank();
+
+        SwapBuffers(hGLDC);
+
+        // Diagnostic: record time after SwapBuffers.
+        // P61: this is now the SUBMIT point, not the sync point -- the
+        // presentation feedback timestamp (t2b, taken after the DwmFlush
+        // boundary below) is what the P60 presentation clock anchors to.
+        if (MatchMonitorRate)
+        {
+                LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
+                int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+                s_diagBuf[idx].t2 = qpc.QuadPart;
+
+        }
+
+        // DwmFlush path — P61: this block now runs AFTER SwapBuffers (see
+        // the ordering comment above). During the DWM warmup window
+        // DwmFlush is intentionally not called and the t2->t2b span
+        // reads ~0.00ms.
+        //
+        // Synchronise with DWM after the submit (windowed + MMR only).
         //
         // *** DWMFLUSH DISABLED BY DEFAULT — see USE_DWMFLUSH below ***
         //
@@ -1767,73 +1964,93 @@ static void GL_DrawFrame(void)
         // mode, while true exclusive fullscreen (the only mode where GL
         // vsync alone should already be correct) is left untouched.
 #if USE_DWMFLUSH
-        // P61: DwmFlush must run AFTER SwapBuffers in the interval=0 path.
-        // Calling it before the swap synchronizes the previous composition
-        // cycle, while the newly rendered frame is then submitted too late;
-        // the resulting post-SwapBuffers timestamps were the source of P60's
-        // 23ms/9ms phase alternation.
+        // P52: increment the diagnostic counter (file-scope static, read
+        // by DiagWriteLogFile). This runs on EVERY GL_DrawFrame call
+        // where USE_DWMFLUSH compiled in — before the MatchMonitorRate
+        // check. If the log shows reached=0, the #if block isn't
+        // compiling. If reached>0 but warmup=180, LoadLibrary failed.
         InterlockedIncrement(&s_DwmFlushPathReached);
-#endif
 
-        if (MatchMonitorRate)
-                MonitorSync::WaitForDXGIVBlank();
-
-        SwapBuffers(hGLDC);
-
-        // Diagnostic timestamp is overwritten with the post-DwmFlush
-        // composition boundary below when that path is active.
-        if (MatchMonitorRate)
-        {
-                LARGE_INTEGER qpc;
-                QueryPerformanceCounter(&qpc);
-                int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
-                s_diagBuf[idx].t2 = qpc.QuadPart;
-        }
-
-#if USE_DWMFLUSH
+        // P53: the old condition `!ExclusiveFullscreen` was wrong.
+        // ExclusiveFullscreen is a menu toggle that can be TRUE even
+        // when Fullscreen is FALSE (the user toggled it in windowed
+        // mode — see ID_PPU_EXCLUSIVEFS in Nintendulator.cpp, which
+        // only restarts GFX if Fullscreen is already on). That left
+        // ExclusiveFullscreen=1 in windowed mode, which made
+        // `!ExclusiveFullscreen` = FALSE, blocking the entire DwmFlush
+        // path. The P52 log confirmed exactly this:
+        //   ExclusiveFullscreen=1, Window mode: windowed
+        // The CORRECT test for "true exclusive fullscreen" (the only
+        // mode where DwmFlush is pointless because DWM is bypassed)
+        // is `Fullscreen && ExclusiveFullscreen`. In windowed mode
+        // (Fullscreen=0) DwmFlush must always run regardless of the
+        // ExclusiveFullscreen toggle state.
         if (MatchMonitorRate && !(Fullscreen && ExclusiveFullscreen))
         {
+                // Lazy-load dwmapi.dll once.
                 if (s_pfnDwmFlush == reinterpret_cast<PFN_DwmFlush>(1))
                 {
                         HMODULE hDwm = LoadLibrary(_T("dwmapi.dll"));
                         s_pfnDwmFlush = hDwm
                                 ? (PFN_DwmFlush)GetProcAddress(hDwm, "DwmFlush")
                                 : NULL;
+                        // DWM unavailable (XP/2003) — stay on GL-vsync forever.
                 }
 
                 if (s_pfnDwmFlush)
                 {
                         if (s_DwmWarmupFrames > 0)
                         {
+                                // Warm-up: DWM pipeline not yet stable after mode switch.
+                                // Use GL-vsync (interval=1) — SetDwmSyncMode(false) in
+                                // Stop() already set this. Count down the warmup window.
                                 --s_DwmWarmupFrames;
                         }
                         else
                         {
+                                // Warm-up complete. Switch to DwmFlush+interval=0 once,
+                                // then call DwmFlush every frame.
                                 if (!s_DwmModeArmed)
                                 {
                                         MonitorSync::SetDwmSyncMode(true);
                                         s_DwmModeArmed = true;
                                 }
-
                                 s_pfnDwmFlush();
-
-                                if (MatchMonitorRate)
-                                {
-                                        LARGE_INTEGER qpc;
-                                        QueryPerformanceCounter(&qpc);
-                                        int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
-                                        s_diagBuf[idx].t2 = qpc.QuadPart;
-                                        MonitorSync::NotifyFramePresented(qpc.QuadPart);
-                                }
                         }
                 }
         }
 #endif // USE_DWMFLUSH
 
-        // Submit exactly one frame per draw call. MMR presentation pacing is
-        // provided by MonitorSync/GL swap interval; MMR OFF leaves OpenGL
-        // presentation unsynchronised (normal emulator behaviour).
+        // P44 (session 21): no per-frame wglMakeCurrent(NULL, NULL) here
+        // anymore. This WAS the call the P38 diagnostic isolated as the
+        // actual stall point (some GL drivers defer the vblank-wait from
+        // SwapBuffers to the next call touching the context) -- session 21's
+        // "gap" log confirmed it: ofe stayed at 0.00ms on every one of 360
+        // frames while mcr swung up to sustained ~13ms blocks. Context now
+        // stays current for the whole NES-thread session (ReleaseGLContext()
+        // runs once, at thread exit -- see NES::Thread()), so there is no
+        // "next context touch" left in the hot path for the driver to defer
+        // its wait onto. t2b is kept as a pure QPC checkpoint (no GL call
+        // between the DwmFlush boundary and t2b anymore) specifically so
+        // the next log makes this verifiable: the t2->t2b span should read
+        // ~0.00ms on every frame during the DWM warmup window (and hold
+        // only the DwmFlush wait itself after warmup).
+        if (MatchMonitorRate)
+        {
+                LARGE_INTEGER qpc2; QueryPerformanceCounter(&qpc2);
+                int idx2 = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+                s_diagBuf[idx2].t2b = qpc2.QuadPart;
 
+                // P60/P61: presentation feedback is published AFTER the
+                // DWM boundary. On this single-thread fallback path the
+                // emulation thread IS the presenting thread; the
+                // two-thread path publishes the same feedback from
+                // GL_DrawFrameFromBuffer on the render thread (never both
+                // at once -- see MonitorSync.h). During the DWM warmup
+                // window (GL vsync, no DwmFlush) the timestamp right after
+                // SwapBuffers is an equally valid vblank-anchored feedback.
+                MonitorSync::OnPresentationFeedback(qpc2.QuadPart);
+        }
 }
 
 #define Try(action,errormsg) do {\
@@ -2008,7 +2225,6 @@ void    Start (void)
         // Reset diagnostic timing buffer on every session start.
         s_diagHead      = 0;
         s_diagFrameNum  = 0;
-        s_FQEmuFrameCounter = 0;
         ZeroMemory(s_diagBuf, sizeof(s_diagBuf));
 
         if (UseOpenGL())
@@ -2711,23 +2927,34 @@ void    DrawScreen (void)
                 // of emulator frame timing.
                 if (MatchMonitorRate)
                 {
-                        MonitorSync::OnFrameEnd();
-
-                        // Diagnostic t3: after OnFrameEnd.
-                        LONGLONG diagT3 = 0, diagT4 = 0;
-                        if (MatchMonitorRate && !IsRenderThreadActive())
+                        // P60: measure the emulation-thread stage durations
+                        // (OnFrameEnd / UpdateDRC) around the calls. On the
+                        // two-thread path they are published via the
+                        // g_EmuOfeTicks/g_EmuDrcTicks sidecar atomics for the
+                        // render thread's DiagCompleteFrame call (values are
+                        // read after presenting the matching frame; worst
+                        // case, during a transient backlog, off by one frame
+                        // -- harmless for diagnostics). On the single-thread
+                        // path they are passed to DiagCompleteFrame directly.
+                        LONGLONG ofeDur, drcDur;
                         {
-                                LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
-                                diagT3 = qpc.QuadPart;
+                                LARGE_INTEGER qa, qb, qc;
+                                QueryPerformanceCounter(&qa);
+                                MonitorSync::OnFrameEnd();
+                                QueryPerformanceCounter(&qb);
+                                APU::UpdateDRC();
+                                QueryPerformanceCounter(&qc);
+                                ofeDur = qb.QuadPart - qa.QuadPart;
+                                drcDur = qc.QuadPart - qb.QuadPart;
                         }
-
-                        APU::UpdateDRC();
-
-                        if (MatchMonitorRate && !IsRenderThreadActive())
+                        if (IsRenderThreadActive())
                         {
-                                LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
-                                diagT4 = qpc.QuadPart;
-                                DiagCompleteFrame(diagT3, diagT4);
+                                InterlockedExchange64(&g_EmuOfeTicks, ofeDur);
+                                InterlockedExchange64(&g_EmuDrcTicks, drcDur);
+                        }
+                        else
+                        {
+                                DiagCompleteFrame(ofeDur, drcDur);
                         }
                 }
         }

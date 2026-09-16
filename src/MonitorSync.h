@@ -178,23 +178,45 @@ namespace MonitorSync
         int     GetDwmSyncMode ();
 
 
-        // Authoritative emulator-frame/audio-slot pacer. Normally the next slot
-        // is anchored to the most recent presentation tick reported by the
-        // render thread. This makes the display the long-term timing master
-        // without blocking the emulation thread on DwmFlush/SwapBuffers.
-        // If the presentation clock is not yet locked (startup/display change/
-        // DWM maintenance stall), PaceSlot() falls back to its absolute QPC
-        // schedule so emulation continues instead of freezing.
+        // Authoritative emulator-frame/audio-slot pacer. Each slot is paced
+        // from the PREVIOUS slot write using GetTargetHz(), so the emulator
+        // cadence itself matches the monitor clock (for supported near-rate
+        // combinations) instead of relying on frame-dropping in the renderer.
         void    PaceSlot ();
 
-        // Called by the render thread after SwapBuffers returns. The timestamp
-        // represents the completed presentation boundary as observed by the
-        // display path. The next emulation slot uses this as a phase anchor.
-        void    NotifyFramePresented (LONGLONG qpcPresented);
-
-        // Presentation-clock diagnostics used by the MMR timing log.
-        bool    HasPresentationClock ();
+        // ------------------------------------------------------------------
+        // P60/P61: presentation feedback clock.
+        //
+        // The render thread calls OnPresentationFeedback() once per frame,
+        // with the QPC timestamp taken AFTER the P61 presentation boundary
+        // (SwapBuffers FIRST, then DwmFlush -- see GFX.cpp). That timestamp
+        // is the closest available proxy for "the DWM just composited our
+        // frame", and it is the anchor the whole MMR cadence is phased
+        // against:
+        //
+        //   presentation boundary -> feedback -> PaceSlot phase control ->
+        //   FrameQueue -> render thread -> SwapBuffers + DwmFlush -> ...
+        //
+        // IsPresentationClockLocked() reports whether the feedback stream is
+        // currently trusted (>= 2 samples, a filtered period, and feedback
+        // no older than ~250 ms). While locked, PaceSlot anchors each
+        // emulation slot to the next predicted presentation boundary with a
+        // BOUNDED phase lead, using the filtered (EWMA) presentation
+        // period; when the clock is NOT locked, PaceSlot falls back to the
+        // absolute QPC cadence so a missing/stalled render thread can never
+        // block the emulation thread indefinitely.
+        //
+        // GetPresentationHz() and GetLastPresentErrMs() feed the timing-log
+        // header (presentation Hz / last interval error columns).
+        //
+        // Thread safety: the writer is whichever thread presents (render
+        // thread in the two-thread mode, emulation thread in the fallback
+        // single-thread mode -- never both at once). Readers (PaceSlot on
+        // the emulation thread, the diagnostic log writer) only touch the
+        // Interlocked-published values.
+        void    OnPresentationFeedback (LONGLONG qpcPresent);
+        bool    IsPresentationClockLocked ();
         double  GetPresentationHz ();
-        double  GetPresentationIntervalErrorMs ();
+        double  GetLastPresentErrMs ();
 
 }
