@@ -1815,13 +1815,12 @@ static bool DiagQueryDwmTiming(FrameTimingEntry &e)
         // not add a second wait, does not call DwmFlush, and does not alter the
         // FrameQueue or OpenGL presentation path.  The existing MonitorSync
         // validation rejects non-refresh-sized intervals before locking.
-        static ULONGLONG s_lastDwmFeedbackFrame = 0;
+        static LONGLONG s_lastDwmFeedbackQPC = 0;
         if (ti.qpcFrameDisplayed != 0 &&
-            ti.cFrameDisplayed != 0 &&
-            ti.cFrameDisplayed != s_lastDwmFeedbackFrame)
+            (LONGLONG)ti.qpcFrameDisplayed != s_lastDwmFeedbackQPC)
         {
-                s_lastDwmFeedbackFrame = ti.cFrameDisplayed;
-                MonitorSync::NotifyFramePresented((LONGLONG)ti.qpcFrameDisplayed);
+                s_lastDwmFeedbackQPC = (LONGLONG)ti.qpcFrameDisplayed;
+                MonitorSync::NotifyFramePresented(s_lastDwmFeedbackQPC);
         }
         return true;
 }
