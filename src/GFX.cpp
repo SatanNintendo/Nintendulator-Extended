@@ -14,6 +14,7 @@
 #include "PPU.h"
 #include "AVI.h"
 #include <commctrl.h>
+#include <dwmapi.h>
 #include "Lang.h"
 #include "APU.h"
 #include "Theme.h"
@@ -49,6 +50,8 @@
 // call is skipped entirely to avoid adding latency.
 typedef HRESULT (WINAPI *PFN_DwmFlush)(void);
 static PFN_DwmFlush s_pfnDwmFlush = reinterpret_cast<PFN_DwmFlush>(1); // 1 = not yet loaded
+typedef HRESULT (WINAPI *PFN_DwmGetCompositionTimingInfo)(HWND, DWM_TIMING_INFO *);
+static PFN_DwmGetCompositionTimingInfo s_pfnDwmGetCompositionTimingInfo = reinterpret_cast<PFN_DwmGetCompositionTimingInfo>(1);
 
 // P45 (session 22): moved up from its previous spot right above its use in
 // GL_DrawFrame so it's visible to the log-header diagnostic too (see
@@ -638,6 +641,11 @@ struct FrameTimingEntry {
         LONG     fqSkipped; // queued frames skipped before this frame
         LONG     fqDepth;   // queue depth observed at consume time
         LONG     paceSource;// P67: 1=presentation anchor, 0=QPC fallback
+        LONGLONG dwmDisplayed;
+        ULONGLONG dwmFrameDisplayed;
+        ULONGLONG dwmFramesMissed;
+        ULONGLONG dwmFramesDropped;
+        LONG     dwmValid;
         DWORD    frameNum;  // render/diagnostic sequence
 };
 static FrameTimingEntry s_diagBuf[DIAG_FRAMES];
@@ -1040,6 +1048,12 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
 #endif
         if (MatchMonitorRate)
         {
+                int idxDwm = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+                (void)DiagQueryDwmTiming(s_diagBuf[idxDwm]);
+        }
+
+        if (MatchMonitorRate)
+        {
                 LARGE_INTEGER qpc2; QueryPerformanceCounter(&qpc2);
                 int idx2 = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
                 s_diagBuf[idx2].t2b = qpc2.QuadPart;
@@ -1259,7 +1273,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         _ftprintf(f, _T("FrameQueue counters: overflow_drop=%ld, latest_wins_skip=%ld\n"),
                 (long)InterlockedExchangeAdd(&s_FQOverflowDrops, 0),
                 (long)InterlockedExchangeAdd(&s_FQSkippedFrames, 0));
-        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | pace->produce | prodGap | renderGap | consume->present | presentInterval | presentErr | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
+        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | pace->produce | prodGap | renderGap | consume->present | presentInterval | presentErr | dwmDispInt | dwmLate | dwmMiss | dwmDrop | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
 
         // P43 (session 20): t0->t4 only spans GL_DrawFrame+OnFrameEnd+
         // UpdateDRC -- the video-draw slice of a frame. It does NOT cover
@@ -1283,9 +1297,12 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         LONGLONG prevT0 = 0;
         LONGLONG prevT2 = 0;
         LONGLONG prevTProd = 0;
+        LONGLONG prevDwmDisplayed = 0;
+        ULONGLONG prevDwmFrameDisplayed = 0;
         bool     havePrevT0 = false;
         bool     havePrevT2 = false;
         bool     havePrevTProd = false;
+        bool     havePrevDwm = false;
 
         // Walk the circular buffer from oldest to newest
         for (int i = 0; i < DIAG_FRAMES; i++)
@@ -1312,11 +1329,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                                     (e.tProd - e.paceWake) * 1000.0 / freq : 0.0;
                 double dprodGap = (havePrevTProd && e.tProd > prevTProd) ?
                                   (e.tProd - prevTProd) * 1000.0 / freq : 0.0;
-                if (e.tProd > 0)
-                {
-                    prevTProd = e.tProd;
-                    havePrevTProd = true;
-                }
+                if (e.tProd > 0) { prevTProd = e.tProd; havePrevTProd = true; }
                 double dpresent = (havePrevT2 && e.t2 > prevT2) ?
                                   (e.t2 - prevT2) * 1000.0 / freq : 0.0;
 
@@ -1333,13 +1346,17 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 // P67: this isolates timer/scheduler wake-up error from the
                 // later render/presentation stages. Positive values mean the
                 // emulation pacing wake-up happened after its target.
-                //
-                // P68: pace->produce measures the host-side work/scheduling time
-                // between the pacing wake-up and the frame being published to
-                // FrameQueue. prodGap measures the interval between frame
-                // publications. Neither value feeds back into pacing.
                 double paceErr = (e.paceTarget > 0 && e.paceWake > 0) ?
                                  (e.paceWake - e.paceTarget) * 1000.0 / freq : 0.0;
+                double dwmDispInt = (e.dwmValid && havePrevDwm && e.dwmDisplayed > prevDwmDisplayed) ?
+                                    (e.dwmDisplayed - prevDwmDisplayed) * 1000.0 / freq : 0.0;
+                bool dwmLate = (e.dwmValid && havePrevDwm && e.dwmFrameDisplayed == prevDwmFrameDisplayed);
+                if (e.dwmValid)
+                {
+                        prevDwmDisplayed = e.dwmDisplayed;
+                        prevDwmFrameDisplayed = e.dwmFrameDisplayed;
+                        havePrevDwm = true;
+                }
 
                 // A real dropped/duplicated frame shows up as a gap far
                 // from one vblank period (~16.67ms at 60Hz) in EITHER
@@ -1355,7 +1372,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 bool presentStalled = (dpresent > 0.0 && fabs(presentErr) > 2.0);
 
                 _ftprintf(f,
-                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  pace->prod=%6.2f  prodGap=%7.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
+                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  pace->prod=%6.2f  prodGap=%7.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  dwmDisp=%7.2f  dwmLate=%d  dwmMiss=%I64u  dwmDrop=%I64u  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
                         e.frameNum,
                         (unsigned __int64)e.emuFrame,
                         dprod,
@@ -1367,6 +1384,10 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                         (e.t0 > 0 && e.t2 >= e.t0) ? (e.t2 - e.t0) * 1000.0 / freq : 0.0,
                         dpresent, (presentStalled ? _T("*") : _T(" ")),
                         presentErr,
+                        dwmDispInt,
+                        dwmLate ? 1 : 0,
+                        (unsigned __int64)(e.dwmValid ? e.dwmFramesMissed : 0),
+                        (unsigned __int64)(e.dwmValid ? e.dwmFramesDropped : 0),
                         (int)e.fqSkipped, (int)e.fqDepth,
                         d01, (d01 > DIAG_STALL_MS ? _T("*") : _T(" ")),
                         d12, (d12 > DIAG_STALL_MS ? _T("*") : _T(" ")),
@@ -1528,6 +1549,31 @@ static void DiagCompleteFrame(LONGLONG t3, LONGLONG t4)
         }
 }
 
+static bool DiagQueryDwmTiming(FrameTimingEntry &e)
+{
+        if (!MatchMonitorRate || !UsingOpenGL) return false;
+        if (s_pfnDwmGetCompositionTimingInfo == reinterpret_cast<PFN_DwmGetCompositionTimingInfo>(1))
+        {
+                HMODULE hDwm = LoadLibrary(_T("dwmapi.dll"));
+                s_pfnDwmGetCompositionTimingInfo = hDwm ? (PFN_DwmGetCompositionTimingInfo)GetProcAddress(hDwm, "DwmGetCompositionTimingInfo") : NULL;
+        }
+        if (!s_pfnDwmGetCompositionTimingInfo) return false;
+        DWM_TIMING_INFO ti; ZeroMemory(&ti, sizeof(ti)); ti.cbSize = sizeof(ti);
+        HRESULT hr = s_pfnDwmGetCompositionTimingInfo(NULL, &ti);
+        if (FAILED(hr) && hMainWnd)
+        {
+                ZeroMemory(&ti, sizeof(ti)); ti.cbSize = sizeof(ti);
+                hr = s_pfnDwmGetCompositionTimingInfo(hMainWnd, &ti);
+        }
+        if (FAILED(hr)) return false;
+        e.dwmDisplayed = (LONGLONG)ti.qpcFrameDisplayed;
+        e.dwmFrameDisplayed = (ULONGLONG)ti.cFrameDisplayed;
+        e.dwmFramesMissed = (ULONGLONG)ti.cFramesMissed;
+        e.dwmFramesDropped = (ULONGLONG)ti.cFramesDropped;
+        e.dwmValid = 1;
+        return true;
+}
+
 static void GL_DrawFrame(void)
 {
         static uint32_t frameBuf[256 * 240];
@@ -1548,6 +1594,11 @@ static void GL_DrawFrame(void)
                 s_diagBuf[idx].paceTarget = 0;
                 s_diagBuf[idx].paceWake   = 0;
                 s_diagBuf[idx].paceSource = 0;
+                s_diagBuf[idx].dwmDisplayed = 0;
+                s_diagBuf[idx].dwmFrameDisplayed = 0;
+                s_diagBuf[idx].dwmFramesMissed = 0;
+                s_diagBuf[idx].dwmFramesDropped = 0;
+                s_diagBuf[idx].dwmValid = 0;
                 s_diagBuf[idx].frameNum = s_diagFrameNum;
                 s_diagHead = (s_diagHead + 1) % DIAG_FRAMES;
         }
