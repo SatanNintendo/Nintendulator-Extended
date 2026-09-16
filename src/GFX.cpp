@@ -1808,6 +1808,21 @@ static bool DiagQueryDwmTiming(FrameTimingEntry &e)
         e.dwmFramesMissed = (ULONGLONG)ti.cFramesMissed;
         e.dwmFramesDropped = (ULONGLONG)ti.cFramesDropped;
         e.dwmValid = 1;
+
+        // P75: use the DWM compositor's actual displayed-frame timestamp as
+        // presentation-clock feedback when it advances.  This is intentionally
+        // fed back only from the already-existing diagnostic DWM query; it does
+        // not add a second wait, does not call DwmFlush, and does not alter the
+        // FrameQueue or OpenGL presentation path.  The existing MonitorSync
+        // validation rejects non-refresh-sized intervals before locking.
+        static ULONGLONG s_lastDwmFeedbackFrame = 0;
+        if (ti.qpcFrameDisplayed != 0 &&
+            ti.cFrameDisplayed != 0 &&
+            ti.cFrameDisplayed != s_lastDwmFeedbackFrame)
+        {
+                s_lastDwmFeedbackFrame = ti.cFrameDisplayed;
+                MonitorSync::NotifyFramePresented((LONGLONG)ti.qpcFrameDisplayed);
+        }
         return true;
 }
 

@@ -846,11 +846,13 @@ void PaceSlot()
 
         if (lastPresent > 0 && period > 0)
         {
-            // Keep the lead deliberately small. 0.75 ms is large enough to
-            // cover ordinary scheduler wake-up jitter on Windows without
-            // making the emulator visibly "early".
+            // Keep the lead deliberately small. 5.0 ms is deliberately bounded: the current diagnostics show that the
+            // emulation/frame-production work after PaceSlot() commonly consumes
+            // roughly 2-6 ms. Using a modest lead here lets that existing work
+            // happen before the next real display boundary without adding a
+            // second pacing mechanism or a full-frame delay.
             const LONGLONG leadTicks =
-                    (LONGLONG)((double)g_QPCFreq.QuadPart * 0.00075 + 0.5);
+                    (LONGLONG)((double)g_QPCFreq.QuadPart * 0.0050 + 0.5);
 
             LONGLONG targetQPC = lastPresent + period - leadTicks;
 
