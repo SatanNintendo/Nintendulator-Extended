@@ -1072,41 +1072,6 @@ static HANDLE CreateRenderPhaseTimer()
         return hTimer;
 }
 
-static bool WaitForPresentationPhase(HANDLE hTimer)
-{
-        if (!hTimer || MonitorSync::GetDwmSyncMode() == 0)
-                return false;
-
-        LONGLONG targetQPC = 0;
-        if (!MonitorSync::GetNextPresentationTargetQPC(&targetQPC))
-                return false;
-
-        LARGE_INTEGER freq;
-        LARGE_INTEGER now;
-        if (!QueryPerformanceFrequency(&freq) || freq.QuadPart <= 0)
-                return false;
-        QueryPerformanceCounter(&now);
-
-        LONGLONG remaining = targetQPC - now.QuadPart;
-        if (remaining <= 0)
-                return false;
-
-        double remainMs = (double)remaining * 1000.0 / (double)freq.QuadPart;
-        if (remainMs >= 1.0)
-        {
-                LARGE_INTEGER due;
-                due.QuadPart = -(LONGLONG)(remainMs * 10000.0);
-                if (!SetWaitableTimer(hTimer, &due, 0, NULL, NULL, FALSE))
-                        return false;
-                return WaitForSingleObject(hTimer, 20) == WAIT_OBJECT_0;
-        }
-        else
-        {
-                SwitchToThread();
-                return true;
-        }
-}
-
 // P62: phase-aware presentation gate. This is intentionally NOT an independent
 // frame timer: it is anchored to the last real DWM presentation timestamp and
 // the filtered presentation period maintained by MonitorSync. Its only job is
