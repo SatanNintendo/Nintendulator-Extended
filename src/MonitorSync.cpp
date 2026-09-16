@@ -380,7 +380,14 @@ static volatile LONG     g_PresentationIntervalErrUs = 0;
 // Deferred vsync interval (written by Enable/UI thread, applied by
 // NES thread in ApplyPendingVSync inside GL_DrawFrame).
 // ------------------------------------------------------------------
-static volatile LONG  g_PendingVSyncInterval = -1;
+// Default presentation mode when MMR is OFF: keep normal OpenGL
+double-buffer presentation synchronized to the display vblank. The
+// previous -1 initialization meant that a fresh session with MMR disabled
+// never issued wglSwapIntervalEXT(1) at all; on drivers whose default is
+// interval=0 this produced visible tearing, especially in fullscreen.
+// MMR::Enable(TRUE) still replaces this with its selected interval (0 or 1),
+// and Enable(FALSE) explicitly restores 1 as before.
+static volatile LONG  g_PendingVSyncInterval = 1;
 
 // DWM-sync mode: interval=0 but g_VSyncActive stays true.
 static volatile LONG  g_DwmSyncMode = 0;
