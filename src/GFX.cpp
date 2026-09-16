@@ -1454,7 +1454,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 long long dwmFrameStep = (e.dwmValid && havePrevDwm) ?
                                     (long long)e.dwmFrameDisplayed - (long long)prevDwmFrameDisplayed : 0;
                 long long dwmMissStep = (e.dwmValid && havePrevDwm) ?
-                                    (long long)e.dwmFramesMissed - (long long)prevDwmMissed : 0;
+                                    (long long)e.dwmFramesMissed - (long long)prevDwmMiss : 0;
                 long long dwmDropStep = (e.dwmValid && havePrevDwm) ?
                                     (long long)e.dwmFramesDropped - (long long)prevDwmDrop : 0;
                 long long dwmLateStep = (e.dwmValid && havePrevDwm) ?
