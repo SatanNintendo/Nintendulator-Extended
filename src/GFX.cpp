@@ -1304,12 +1304,18 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 const FrameTimingEntry &e = buf[idx];
                 if (e.frameNum == 0 || e.t4 == 0) continue;
 
-                double d01 = (e.t1  - e.t0)  * 1000.0 / freq;
-                double d12 = (e.t2  - e.t1)  * 1000.0 / freq;
-                double d2b = (e.t2b - e.t2)  * 1000.0 / freq;
-                double d23 = (e.t3  - e.t2b) * 1000.0 / freq;
-                double d34 = (e.t4  - e.t3)  * 1000.0 / freq;
-                double dtot= (e.t4  - e.t0)  * 1000.0 / freq;
+                double d01 = (e.t1 > e.t0 && e.t0 > 0) ?
+                             (e.t1  - e.t0)  * 1000.0 / freq : 0.0;
+                double d12 = (e.t2 > e.t1 && e.t1 > 0) ?
+                             (e.t2  - e.t1)  * 1000.0 / freq : 0.0;
+                double d2b = (e.t2b > e.t2 && e.t2 > 0) ?
+                             (e.t2b - e.t2)  * 1000.0 / freq : 0.0;
+                double d23 = (e.t3 > e.t2b && e.t2b > 0) ?
+                             (e.t3  - e.t2b) * 1000.0 / freq : 0.0;
+                double d34 = (e.t4 > e.t3 && e.t3 > 0) ?
+                             (e.t4  - e.t3)  * 1000.0 / freq : 0.0;
+                double dtot= (e.t4 > e.t0 && e.t0 > 0) ?
+                             (e.t4  - e.t0)  * 1000.0 / freq : 0.0;
                 double dprod = (e.tProd > 0 && e.t0 >= e.tProd) ?
                                (e.t0 - e.tProd) * 1000.0 / freq : 0.0;
                 double dpresent = (havePrevT2 && e.t2 > prevT2) ?

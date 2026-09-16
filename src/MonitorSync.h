@@ -180,8 +180,9 @@ namespace MonitorSync
         // P62: return the next predicted presentation boundary derived from
         // the real DWM presentation feedback clock. This is NOT an independent
         // render clock: it advances from the last observed presentation and
-        // the filtered presentation period. Returns false until a real
-        // presentation period has been observed.
+        // the filtered presentation period. After the first presentation, a
+        // temporary nominal target-rate period is used until a measured
+        // presentation period becomes available.
         bool    GetNextPresentationTargetQPC (LONGLONG *targetQPC);
 
         // Presentation feedback used by the phase-aware render gate.

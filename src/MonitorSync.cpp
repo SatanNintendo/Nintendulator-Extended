@@ -1002,11 +1002,23 @@ bool GetNextPresentationTargetQPC(LONGLONG *targetQPC)
     LONGLONG period =
             InterlockedExchangeAdd64(&g_PresentationPeriodQPC, 0);
 
-    // The gate is intentionally usable even while the presentation clock is
-    // temporarily unlocked after a missed refresh. The filtered period remains
-    // trustworthy; the lock flag is reserved for emulator-side phase control.
-    if (lastPresent <= 0 || period <= 0)
+    // After the first real DwmFlush there is a valid phase anchor, but there
+    // cannot yet be a measured presentation period because no second
+    // presentation has occurred. Bootstrap the gate from the configured
+    // target refresh period; once real feedback is available,
+    // g_PresentationPeriodQPC replaces this fallback. This does not claim a
+    // measured presentation lock and does not alter the reported Presentation Hz.
+    if (lastPresent <= 0)
         return false;
+    if (period <= 0)
+    {
+        const double targetHz = GetTargetHz();
+        if (targetHz <= 0.0)
+            return false;
+        period = (LONGLONG)((double)g_QPCFreq.QuadPart / targetHz + 0.5);
+        if (period <= 0)
+            return false;
+    }
 
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
