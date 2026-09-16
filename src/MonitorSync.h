@@ -178,10 +178,23 @@ namespace MonitorSync
         int     GetDwmSyncMode ();
 
 
-        // Authoritative emulator-frame/audio-slot pacer. Each slot is paced
-        // from the PREVIOUS slot write using GetTargetHz(), so the emulator
-        // cadence itself matches the monitor clock (for supported near-rate
-        // combinations) instead of relying on frame-dropping in the renderer.
+        // Authoritative emulator-frame/audio-slot pacer. Normally the next slot
+        // is anchored to the most recent presentation tick reported by the
+        // render thread. This makes the display the long-term timing master
+        // without blocking the emulation thread on DwmFlush/SwapBuffers.
+        // If the presentation clock is not yet locked (startup/display change/
+        // DWM maintenance stall), PaceSlot() falls back to its absolute QPC
+        // schedule so emulation continues instead of freezing.
         void    PaceSlot ();
+
+        // Called by the render thread after SwapBuffers returns. The timestamp
+        // represents the completed presentation boundary as observed by the
+        // display path. The next emulation slot uses this as a phase anchor.
+        void    NotifyFramePresented (LONGLONG qpcPresented);
+
+        // Presentation-clock diagnostics used by the MMR timing log.
+        bool    HasPresentationClock ();
+        double  GetPresentationHz ();
+        double  GetPresentationIntervalErrorMs ();
 
 }

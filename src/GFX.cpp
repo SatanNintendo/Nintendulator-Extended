@@ -625,13 +625,17 @@ static void ApplyPendingResize()
 #define DIAG_STALL_MS  20.0        // stall threshold: 20ms (>1 vblank)
 
 struct FrameTimingEntry {
-        LONGLONG t0;        // entry to GL_DrawFrame
-        LONGLONG t1;        // after glTexSubImage2D
+        LONGLONG t0;        // render-thread draw entry / queue consume
+        LONGLONG t1;        // after texture upload
         LONGLONG t2;        // after SwapBuffers
-        LONGLONG t2b;       // right after t2, no GL call between them as of P44 (session 21) -- see below
-        LONGLONG t3;        // after OnFrameEnd (filled in DrawScreen)
-        LONGLONG t4;        // after UpdateDRC  (filled in DrawScreen)
-        DWORD    frameNum;
+        LONGLONG t2b;       // immediately after t2, no GL call between them
+        LONGLONG t3;        // after OnFrameEnd (single-threaded path)
+        LONGLONG t4;        // after UpdateDRC  (single-threaded path)
+        LONGLONG tProd;     // emulation-thread frame publication QPC
+        ULONGLONG emuFrame; // emulation-frame sequence number
+        LONG     fqSkipped; // queued frames skipped before this frame
+        LONG     fqDepth;   // queue depth observed at consume time
+        DWORD    frameNum;  // render/diagnostic sequence
 };
 static FrameTimingEntry s_diagBuf[DIAG_FRAMES];
 static int  s_diagHead      = 0;
@@ -659,14 +663,27 @@ static DWORD s_diagFrameNum = 0;
 
 #define FQ_SLOTS 3
 #define FQ_FRAME_SIZE (256 * 240 * 4)
-static unsigned char s_FQ_Buf[FQ_SLOTS][FQ_FRAME_SIZE];
+
+struct FQ_Packet {
+        unsigned char pixels[FQ_FRAME_SIZE];
+        ULONGLONG     emuFrame;
+        LONGLONG      producedQPC;
+        LONG          fqSkipped;
+        LONG          fqDepth;
+};
+
+static FQ_Packet s_FQ_Buf[FQ_SLOTS];
 static CRITICAL_SECTION s_FQ_CS;
 static bool s_FQ_CS_Init = false;
 static int  s_FQ_Head = 0, s_FQ_Tail = 0, s_FQ_Count = 0;
-// Consumer-side scratch buffer: FQ_Consume copies into this so the
-// returned pointer stays valid even after the producer overwrites the
-// ring slot.
-static unsigned char s_FQ_ConsumeCopy[FQ_FRAME_SIZE];
+
+// Consumer-side scratch packet: FQ_Consume copies the complete metadata and
+// pixels so the returned pointer remains stable even after the producer
+// overwrites the ring slot.
+static FQ_Packet s_FQ_ConsumeCopy;
+static volatile LONG s_FQOverflowDrops = 0;
+static volatile LONG s_FQSkippedFrames = 0;
+static ULONGLONG s_FQEmuFrameCounter = 0;
 
 static volatile LONG s_RenderThreadActive = 0;
 static HANDLE        s_RenderThread = NULL;
@@ -674,8 +691,20 @@ static volatile LONG s_RenderThreadStop = 0;
 
 static void FQ_Init(void)
 {
+        if (!s_FQ_CS_Init)
+        {
+                InitializeCriticalSection(&s_FQ_CS);
+                s_FQ_CS_Init = true;
+        }
+
+        EnterCriticalSection(&s_FQ_CS);
         s_FQ_Head = s_FQ_Tail = s_FQ_Count = 0;
-        if (!s_FQ_CS_Init) { InitializeCriticalSection(&s_FQ_CS); s_FQ_CS_Init = true; }
+        InterlockedExchange(&s_FQOverflowDrops, 0);
+        InterlockedExchange(&s_FQSkippedFrames, 0);
+        s_FQEmuFrameCounter = 0;
+        ZeroMemory(&s_FQ_ConsumeCopy, sizeof(s_FQ_ConsumeCopy));
+        LeaveCriticalSection(&s_FQ_CS);
+
         if (!s_FrameEvent) s_FrameEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
 }
 
@@ -685,51 +714,76 @@ static void FQ_Destroy(void)
         s_FQ_Head = s_FQ_Tail = s_FQ_Count = 0;
 }
 
-// Producer (emulation thread): write a frame, signal the render thread.
-// Latest-wins: if the queue is full (3 frames backed up — render thread
-// is stalled), drop the oldest by advancing the tail.
+// Producer (emulation thread): write a frame, timestamp it, then signal the
+// render thread. The queue remains latest-wins, but the dropped/skipped count
+// is now observable in the timing log so a future session can distinguish
+// genuine presentation jitter from queue pressure.
 static void FQ_Produce(const unsigned char *src)
 {
+        LARGE_INTEGER qpc;
+        QueryPerformanceCounter(&qpc);
+        ULONGLONG frameSeq = ++s_FQEmuFrameCounter;
+
         EnterCriticalSection(&s_FQ_CS);
-        int slot = s_FQ_Head;
-        memcpy(s_FQ_Buf[slot], src, FQ_FRAME_SIZE);
+        memcpy(s_FQ_Buf[s_FQ_Head].pixels, src, FQ_FRAME_SIZE);
+        s_FQ_Buf[s_FQ_Head].producedQPC = qpc.QuadPart;
+        s_FQ_Buf[s_FQ_Head].emuFrame = frameSeq;
+        s_FQ_Buf[s_FQ_Head].fqSkipped = 0;
+        s_FQ_Buf[s_FQ_Head].fqDepth = 0;
         s_FQ_Head = (s_FQ_Head + 1) % FQ_SLOTS;
+
         if (s_FQ_Count >= FQ_SLOTS)
         {
-                // Overwrite oldest
+                // Overwrite oldest.
                 s_FQ_Tail = (s_FQ_Tail + 1) % FQ_SLOTS;
+                InterlockedIncrement(&s_FQOverflowDrops);
         }
         else
         {
                 s_FQ_Count++;
         }
         LeaveCriticalSection(&s_FQ_CS);
+
         if (s_FrameEvent) SetEvent(s_FrameEvent);
 }
 
-// Consumer (render thread): get the latest available frame. If multiple
-// frames are queued, skip to the newest (drop intermediates) so the
-// render thread always shows the freshest frame. Returns NULL if empty.
-// The returned pointer is into s_FQ_ConsumeCopy (stable until next call).
-static const unsigned char *FQ_Consume(void)
+// Consumer (render thread): get the newest available frame. If several frames
+// are queued, discard older ones, but retain exact metadata for the frame that
+// is actually presented.
+static const FQ_Packet *FQ_Consume(LONG *skipped, LONG *depth)
 {
+        if (skipped) *skipped = 0;
+        if (depth) *depth = 0;
+
         EnterCriticalSection(&s_FQ_CS);
         if (s_FQ_Count <= 0)
         {
                 LeaveCriticalSection(&s_FQ_CS);
                 return NULL;
         }
-        // Skip to the latest queued frame (drop intermediates).
+
+        int queued = s_FQ_Count;
+        if (depth) *depth = queued;
+        if (skipped) *skipped = queued - 1;
+
+        if (queued > 1)
+                InterlockedExchangeAdd(&s_FQSkippedFrames, queued - 1);
+
+        // Skip to the newest queued frame.
         while (s_FQ_Count > 1)
         {
                 s_FQ_Tail = (s_FQ_Tail + 1) % FQ_SLOTS;
                 s_FQ_Count--;
         }
-        memcpy(s_FQ_ConsumeCopy, s_FQ_Buf[s_FQ_Tail], FQ_FRAME_SIZE);
+
+        memcpy(&s_FQ_ConsumeCopy, &s_FQ_Buf[s_FQ_Tail],
+               sizeof(s_FQ_ConsumeCopy));
+        s_FQ_ConsumeCopy.fqSkipped = queued - 1;
+        s_FQ_ConsumeCopy.fqDepth = queued;
         s_FQ_Tail = (s_FQ_Tail + 1) % FQ_SLOTS;
         s_FQ_Count--;
         LeaveCriticalSection(&s_FQ_CS);
-        return s_FQ_ConsumeCopy;
+        return &s_FQ_ConsumeCopy;
 }
 
 bool IsRenderThreadActive(void)
@@ -756,7 +810,7 @@ static void ApplyPendingResize(void);
 // current. This is GL_DrawFrame with the palette-conversion step
 // removed (the buffer is already converted) and the diagnostic timing
 // kept (gap/tex/swap still measured here).
-static void GL_DrawFrameFromBuffer(const unsigned char *rgba)
+static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
 {
         LONGLONG diagT0 = 0, diagT1 = 0;
         if (MatchMonitorRate)
@@ -770,6 +824,10 @@ static void GL_DrawFrameFromBuffer(const unsigned char *rgba)
                 s_diagBuf[idx].t2b      = 0;
                 s_diagBuf[idx].t3       = 0;
                 s_diagBuf[idx].t4       = 0;
+                s_diagBuf[idx].tProd    = packet ? packet->producedQPC : 0;
+                s_diagBuf[idx].emuFrame = packet ? packet->emuFrame : 0;
+                s_diagBuf[idx].fqSkipped = packet ? packet->fqSkipped : 0;
+                s_diagBuf[idx].fqDepth = packet ? packet->fqDepth : 0;
                 s_diagBuf[idx].frameNum = s_diagFrameNum;
                 s_diagHead = (s_diagHead + 1) % DIAG_FRAMES;
         }
@@ -794,7 +852,7 @@ static void GL_DrawFrameFromBuffer(const unsigned char *rgba)
                 void* pboMem = pfn_glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY);
                 if (pboMem)
                 {
-                        memcpy(pboMem, rgba, FQ_FRAME_SIZE);
+                        memcpy(pboMem, packet->pixels, FQ_FRAME_SIZE);
                         pfn_glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
                         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 240,
                                 GL_BGRA_EXT, GL_UNSIGNED_BYTE, NULL);
@@ -803,7 +861,7 @@ static void GL_DrawFrameFromBuffer(const unsigned char *rgba)
                 {
                         pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
                         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 240,
-                                GL_BGRA_EXT, GL_UNSIGNED_BYTE, rgba);
+                                GL_BGRA_EXT, GL_UNSIGNED_BYTE, packet->pixels);
                 }
                 pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
                 s_PBOIndex ^= 1;
@@ -811,7 +869,7 @@ static void GL_DrawFrameFromBuffer(const unsigned char *rgba)
         else
         {
                 glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 240,
-                        GL_BGRA_EXT, GL_UNSIGNED_BYTE, rgba);
+                        GL_BGRA_EXT, GL_UNSIGNED_BYTE, packet->pixels);
         }
 
         if (MatchMonitorRate)
@@ -923,6 +981,7 @@ static void GL_DrawFrameFromBuffer(const unsigned char *rgba)
                 LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
                 int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
                 s_diagBuf[idx].t2 = qpc.QuadPart;
+                MonitorSync::NotifyFramePresented(qpc.QuadPart);
         }
         if (MatchMonitorRate)
         {
@@ -964,10 +1023,10 @@ static DWORD WINAPI RenderThreadProc(void *)
                 if (InterlockedExchangeAdd(&s_RenderThreadStop, 0))
                         break;
 
-                const unsigned char *pixels = FQ_Consume();
-                if (pixels)
+                const FQ_Packet *packet = FQ_Consume(NULL, NULL);
+                if (packet)
                 {
-                        GL_DrawFrameFromBuffer(pixels);
+                        GL_DrawFrameFromBuffer(packet);
                 }
                 else
                 {
@@ -1118,7 +1177,13 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         // never ran or never moved, so DRC is not correcting anything).
         _ftprintf(f, _T("Monitor refresh Hz: %.6f | MMR target Hz: %.6f | Frame cadence Hz: %.6f | NES native Hz: %.6f\n"),
                 MonitorSync::GetMonitorHz(), MonitorSync::GetTargetHz(), MonitorSync::GetFrameHz(), MonitorSync::GetNESHz());
-        _ftprintf(f, _T("Columns: frame | gap(t0[n]->t0[n-1], TRUE frame-to-frame period incl. unmeasured CPU/PPU/APU time -- P43) | t0->t1(texUpload) | t1->t2(SwapBuf) | t2->t2b(should be ~0 as of P44, context no longer released here) | t2b->t3(OnFrameEnd) | t3->t4(UpdateDRC) | total(t0->t4, video-draw slice only)\n\n"));
+        _ftprintf(f, _T("Presentation clock: %s | Presentation Hz: %.6f | Last interval error: %.3f ms\n"),
+                MonitorSync::HasPresentationClock() ? _T("LOCKED") : _T("QPC FALLBACK"),
+                MonitorSync::GetPresentationHz(), MonitorSync::GetPresentationIntervalErrorMs());
+        _ftprintf(f, _T("FrameQueue counters: overflow_drop=%ld, latest_wins_skip=%ld\n"),
+                (long)InterlockedExchangeAdd(&s_FQOverflowDrops, 0),
+                (long)InterlockedExchangeAdd(&s_FQSkippedFrames, 0));
+        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | renderGap | consume->present | presentInterval | presentErr | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
 
         // P43 (session 20): t0->t4 only spans GL_DrawFrame+OnFrameEnd+
         // UpdateDRC -- the video-draw slice of a frame. It does NOT cover
@@ -1140,7 +1205,9 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         // a gap far from ~16.67ms, regardless of how the t0->t4 slice
         // inside it happens to be split.
         LONGLONG prevT0 = 0;
+        LONGLONG prevT2 = 0;
         bool     havePrevT0 = false;
+        bool     havePrevT2 = false;
 
         // Walk the circular buffer from oldest to newest
         for (int i = 0; i < DIAG_FRAMES; i++)
@@ -1149,17 +1216,27 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 const FrameTimingEntry &e = buf[idx];
                 if (e.frameNum == 0 || e.t4 == 0) continue;
 
-                double d01 = (e.t1  - e.t0)  * 1000.0 / freq;  // texUpload ms
-                double d12 = (e.t2  - e.t1)  * 1000.0 / freq;  // SwapBuffers ms
-                double d2b = (e.t2b - e.t2)  * 1000.0 / freq;  // wglMakeCurrent(NULL) ms -- P38
-                double d23 = (e.t3  - e.t2b) * 1000.0 / freq;  // OnFrameEnd ms (isolated, P38)
-                double d34 = (e.t4  - e.t3)  * 1000.0 / freq;  // UpdateDRC ms
-                double dtot= (e.t4  - e.t0)  * 1000.0 / freq;  // total ms (video-draw slice only)
+                double d01 = (e.t1  - e.t0)  * 1000.0 / freq;
+                double d12 = (e.t2  - e.t1)  * 1000.0 / freq;
+                double d2b = (e.t2b - e.t2)  * 1000.0 / freq;
+                double d23 = (e.t3  - e.t2b) * 1000.0 / freq;
+                double d34 = (e.t4  - e.t3)  * 1000.0 / freq;
+                double dtot= (e.t4  - e.t0)  * 1000.0 / freq;
+                double dprod = (e.tProd > 0 && e.t0 >= e.tProd) ?
+                               (e.t0 - e.tProd) * 1000.0 / freq : 0.0;
+                double dpresent = (havePrevT2 && e.t2 > prevT2) ?
+                                  (e.t2 - prevT2) * 1000.0 / freq : 0.0;
 
                 bool   haveGap = havePrevT0;
                 double dgap = haveGap ? (e.t0 - prevT0) * 1000.0 / freq : 0.0;
                 prevT0 = e.t0;
+                prevT2 = e.t2;
                 havePrevT0 = true;
+                havePrevT2 = (e.t2 > 0);
+                double centerMs = (MonitorSync::GetTargetHz() > 1.0) ?
+                                  1000.0 / MonitorSync::GetTargetHz() : 16.667;
+                double presentErr = havePrevT2 && dpresent > 0.0 ?
+                                    (dpresent - centerMs) : 0.0;
 
                 // A real dropped/duplicated frame shows up as a gap far
                 // from one vblank period (~16.67ms at 60Hz) in EITHER
@@ -1168,33 +1245,29 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 // frames got drawn within one real vblank (one of them
                 // presumably invisible), which is just as much a visible
                 // stutter as a dropped one.
-                double centerMs   = (MonitorSync::GetTargetHz() > 1.0) ? 1000.0 / MonitorSync::GetTargetHz() : 16.667;
-                bool   gapStalled = haveGap && (fabs(dgap - centerMs) > 8.0);
+                // Mark stalled stages with '*'. renderGap remains useful for
+                // spotting queue/presentation skips, while presentInterval and
+                // presentErr expose the phase variation that motivated P60.
+                bool gapStalled = haveGap && (fabs(dgap - centerMs) > 8.0);
+                bool presentStalled = (dpresent > 0.0 && fabs(presentErr) > 2.0);
 
-                // Mark stalled stages with '*'
-                if (haveGap)
-                        _ftprintf(f,
-                                _T("F%06u  gap=%7.2f%s  tex=%6.2f%s  swap=%7.2f%s  mcr=%7.2f%s  ofe=%6.2f%s  drc=%6.2f%s  tot=%7.2f%s\n"),
-                                e.frameNum,
-                                dgap, (gapStalled ? _T("*") : _T(" ")),
-                                d01, (d01 > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                                d12, (d12 > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                                d2b, (d2b > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                                d23, (d23 > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                                d34, (d34 > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                                dtot,(dtot > DIAG_STALL_MS * 1.5 ? _T("*") : _T(" "))
-                        );
-                else
-                        _ftprintf(f,
-                                _T("F%06u  gap=    n/a   tex=%6.2f%s  swap=%7.2f%s  mcr=%7.2f%s  ofe=%6.2f%s  drc=%6.2f%s  tot=%7.2f%s\n"),
-                                e.frameNum,
-                                d01, (d01 > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                                d12, (d12 > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                                d2b, (d2b > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                                d23, (d23 > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                                d34, (d34 > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                                dtot,(dtot > DIAG_STALL_MS * 1.5 ? _T("*") : _T(" "))
-                        );
+                _ftprintf(f,
+                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
+                        e.frameNum,
+                        (unsigned __int64)e.emuFrame,
+                        dprod,
+                        dgap, (gapStalled ? _T("*") : _T(" ")),
+                        (e.t0 > 0 && e.t2 >= e.t0) ? (e.t2 - e.t0) * 1000.0 / freq : 0.0,
+                        dpresent, (presentStalled ? _T("*") : _T(" ")),
+                        presentErr,
+                        (int)e.fqSkipped, (int)e.fqDepth,
+                        d01, (d01 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                        d12, (d12 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                        d2b, (d2b > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                        d23, (d23 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                        d34, (d34 > DIAG_STALL_MS ? _T("*") : _T(" ")),
+                        dtot, (dtot > DIAG_STALL_MS * 1.5 ? _T("*") : _T(" "))
+                );
         }
         fclose(f);
 }
@@ -1968,6 +2041,7 @@ void    Start (void)
         // Reset diagnostic timing buffer on every session start.
         s_diagHead      = 0;
         s_diagFrameNum  = 0;
+        s_FQEmuFrameCounter = 0;
         ZeroMemory(s_diagBuf, sizeof(s_diagBuf));
 
         if (UseOpenGL())
