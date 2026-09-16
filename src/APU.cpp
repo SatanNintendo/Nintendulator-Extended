@@ -2017,6 +2017,11 @@ void    ResetDRC (void)
 void    Run (void)
 {
 #ifndef NSFPLAYER
+        LARGE_INTEGER p73RunEnter = {0};
+        QueryPerformanceCounter(&p73RunEnter);
+#endif
+
+#ifndef NSFPLAYER
         int NewBufPos = FREQ * ++Cycles / MHz;
         if (NewBufPos >= buflen)
         {
@@ -2047,7 +2052,12 @@ void    Run (void)
                 // ============================================================
                 if (isEnabled && Buffer && GFX::MatchMonitorRate)
                 {
+                        LARGE_INTEGER p73PaceEnter = {0}, p73PaceWake = {0};
+                        LARGE_INTEGER p73SafetyBegin = {0}, p73SafetyEnd = {0};
+                        QueryPerformanceCounter(&p73PaceEnter);
                         MonitorSync::PaceSlot();
+                        QueryPerformanceCounter(&p73PaceWake);
+                        LONG p73SafetyLoops = 0;
 
                         LONG cacheAge = InterlockedExchangeAdd(&g_DSCacheAge, 1L);
                         if (cacheAge <= 2)
@@ -2062,6 +2072,7 @@ void    Run (void)
                                 // deliberately bounded: a temporary audio
                                 // hiccup must never freeze the whole emulator.
                                 int safetyLoops = 0;
+                                QueryPerformanceCounter(&p73SafetyBegin);
                                 while ((sr <= next_pos) && (next_pos <= sw) && safetyLoops < 2)
                                 {
                                         MonitorSync::PaceSlot();
@@ -2070,6 +2081,24 @@ void    Run (void)
                                         if (sw < sr) sw += FRAMEBUF;
                                         ++safetyLoops;
                                 }
+                                p73SafetyLoops = safetyLoops;
+                                QueryPerformanceCounter(&p73SafetyEnd);
+                        }
+
+                        {
+                                FILETIME c={0},e={0},k={0},u={0};
+                                LONGLONG cpuWake100=0;
+                                if (GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u))
+                                {
+                                        ULARGE_INTEGER a,b;
+                                        a.LowPart=k.dwLowDateTime; a.HighPart=k.dwHighDateTime;
+                                        b.LowPart=u.dwLowDateTime; b.HighPart=u.dwHighDateTime;
+                                        cpuWake100=(LONGLONG)(a.QuadPart+b.QuadPart);
+                                }
+                                GFX::SetMMRProducerTrace(
+                                        p73RunEnter.QuadPart, p73PaceEnter.QuadPart, p73PaceWake.QuadPart,
+                                        cpuWake100, p73SafetyBegin.QuadPart, p73SafetyEnd.QuadPart,
+                                        p73SafetyLoops, 0);
                         }
 
                         goto write_slot;

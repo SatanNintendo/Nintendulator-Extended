@@ -668,6 +668,10 @@ struct FrameTimingEntry {
         LONGLONG fqConsumeCsEnterQPC;
         LONGLONG fqConsumeCsLeaveQPC;
         LONGLONG fqConsumeEndQPC;
+        LONGLONG mmrRunEnterQPC, mmrPaceEnterQPC, mmrPaceWakeQPC;
+        LONGLONG mmrPaceCpuWake100ns, mmrSafetyBeginQPC, mmrSafetyEndQPC;
+        LONG mmrSafetyLoops, mmrPaceTimerUsed;
+        LONGLONG mmrTraceSeq, prodCpuEnd100ns;
         DWORD    frameNum;  // render/diagnostic sequence
 };
 static FrameTimingEntry s_diagBuf[DIAG_FRAMES];
@@ -731,6 +735,26 @@ static volatile LONG s_FQOverflowDrops = 0;
 static volatile LONG s_FQSkippedFrames = 0;
 static ULONGLONG s_FQEmuFrameCounter = 0;
 
+// P73: passive producer trace published by the emulation thread.
+static volatile LONGLONG s_MmrRunEnterQPC = 0, s_MmrPaceEnterQPC = 0, s_MmrPaceWakeQPC = 0;
+static volatile LONGLONG s_MmrPaceCpuWake100ns = 0, s_MmrSafetyBeginQPC = 0, s_MmrSafetyEndQPC = 0;
+static volatile LONG s_MmrSafetyLoops = 0, s_MmrPaceTimerUsed = 0;
+static volatile LONGLONG s_MmrTraceSeq = 0;
+static bool DiagGetThreadCpu100ns(LONGLONG *out)
+{
+        FILETIME c={0},e={0},k={0},u={0};
+        if (!out || !GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return false;
+        ULARGE_INTEGER a,b; a.LowPart=k.dwLowDateTime; a.HighPart=k.dwHighDateTime;
+        b.LowPart=u.dwLowDateTime; b.HighPart=u.dwHighDateTime; *out=(LONGLONG)(a.QuadPart+b.QuadPart); return true;
+}
+void SetMMRProducerTrace(LONGLONG runEnterQPC, LONGLONG paceEnterQPC, LONGLONG paceWakeQPC, LONGLONG paceCpuWake100ns, LONGLONG safetyBeginQPC, LONGLONG safetyEndQPC, LONG safetyLoops, LONG paceTimerUsed)
+{
+        InterlockedExchange64(&s_MmrRunEnterQPC,runEnterQPC); InterlockedExchange64(&s_MmrPaceEnterQPC,paceEnterQPC);
+        InterlockedExchange64(&s_MmrPaceWakeQPC,paceWakeQPC); InterlockedExchange64(&s_MmrPaceCpuWake100ns,paceCpuWake100ns);
+        InterlockedExchange64(&s_MmrSafetyBeginQPC,safetyBeginQPC); InterlockedExchange64(&s_MmrSafetyEndQPC,safetyEndQPC);
+        InterlockedExchange(&s_MmrSafetyLoops,safetyLoops); InterlockedExchange(&s_MmrPaceTimerUsed,paceTimerUsed); InterlockedIncrement64(&s_MmrTraceSeq);
+}
+
 static volatile LONG s_RenderThreadActive = 0;
 static HANDLE        s_RenderThread = NULL;
 static volatile LONG s_RenderThreadStop = 0;
@@ -778,6 +802,17 @@ static void FQ_Produce(const unsigned char *src)
         memcpy(s_FQ_Buf[slot].pixels, src, FQ_FRAME_SIZE);
         QueryPerformanceCounter(&qpc);
         s_FQ_Buf[slot].producedQPC = qpc.QuadPart;
+        { LONGLONG cpu100=0; DiagGetThreadCpu100ns(&cpu100);
+          s_FQ_Buf[slot].prodCpuEnd100ns=cpu100;
+          s_FQ_Buf[slot].mmrRunEnterQPC=InterlockedExchangeAdd64(&s_MmrRunEnterQPC,0);
+          s_FQ_Buf[slot].mmrPaceEnterQPC=InterlockedExchangeAdd64(&s_MmrPaceEnterQPC,0);
+          s_FQ_Buf[slot].mmrPaceWakeQPC=InterlockedExchangeAdd64(&s_MmrPaceWakeQPC,0);
+          s_FQ_Buf[slot].mmrPaceCpuWake100ns=InterlockedExchangeAdd64(&s_MmrPaceCpuWake100ns,0);
+          s_FQ_Buf[slot].mmrSafetyBeginQPC=InterlockedExchangeAdd64(&s_MmrSafetyBeginQPC,0);
+          s_FQ_Buf[slot].mmrSafetyEndQPC=InterlockedExchangeAdd64(&s_MmrSafetyEndQPC,0);
+          s_FQ_Buf[slot].mmrSafetyLoops=InterlockedExchangeAdd(&s_MmrSafetyLoops,0);
+          s_FQ_Buf[slot].mmrPaceTimerUsed=InterlockedExchangeAdd(&s_MmrPaceTimerUsed,0);
+          s_FQ_Buf[slot].mmrTraceSeq=InterlockedExchangeAdd64(&s_MmrTraceSeq,0); }
         s_FQ_Buf[slot].paceTargetQPC = MonitorSync::GetLastPaceTargetQPC();
         s_FQ_Buf[slot].paceWakeQPC = MonitorSync::GetLastPaceWakeQPC();
         s_FQ_Buf[slot].paceSource = MonitorSync::WasLastPacePresentationAnchored() ? 1 : 0;
@@ -928,6 +963,16 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 s_diagBuf[idx].fqConsumeCsEnterQPC = packet ? packet->fqConsumeCsEnterQPC : 0;
                 s_diagBuf[idx].fqConsumeCsLeaveQPC = packet ? packet->fqConsumeCsLeaveQPC : 0;
                 s_diagBuf[idx].fqConsumeEndQPC = packet ? packet->fqConsumeEndQPC : 0;
+                s_diagBuf[idx].mmrRunEnterQPC = packet ? packet->mmrRunEnterQPC : 0;
+                s_diagBuf[idx].mmrPaceEnterQPC = packet ? packet->mmrPaceEnterQPC : 0;
+                s_diagBuf[idx].mmrPaceWakeQPC = packet ? packet->mmrPaceWakeQPC : 0;
+                s_diagBuf[idx].mmrPaceCpuWake100ns = packet ? packet->mmrPaceCpuWake100ns : 0;
+                s_diagBuf[idx].mmrSafetyBeginQPC = packet ? packet->mmrSafetyBeginQPC : 0;
+                s_diagBuf[idx].mmrSafetyEndQPC = packet ? packet->mmrSafetyEndQPC : 0;
+                s_diagBuf[idx].mmrSafetyLoops = packet ? packet->mmrSafetyLoops : 0;
+                s_diagBuf[idx].mmrPaceTimerUsed = packet ? packet->mmrPaceTimerUsed : 0;
+                s_diagBuf[idx].mmrTraceSeq = packet ? packet->mmrTraceSeq : 0;
+                s_diagBuf[idx].prodCpuEnd100ns = packet ? packet->prodCpuEnd100ns : 0;
                 s_diagBuf[idx].emuFrame = packet ? packet->emuFrame : 0;
                 s_diagBuf[idx].fqSkipped = packet ? packet->fqSkipped : 0;
                 s_diagBuf[idx].fqDepth = packet ? packet->fqDepth : 0;
@@ -1355,7 +1400,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         _ftprintf(f, _T("FrameQueue counters: overflow_drop=%ld, latest_wins_skip=%ld\n"),
                 (long)InterlockedExchangeAdd(&s_FQOverflowDrops, 0),
                 (long)InterlockedExchangeAdd(&s_FQSkippedFrames, 0));
-        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | pace->produce | prodGap | renderGap | consume->present | presentInterval | presentErr | fqP2C | fqPcs | fqCcs | fqSched | fqCS2 | fqPHold | fqCHold | fqSigWait | render2t0 | submit2dwm | dwmDispInt | dwmFrameStep | dwmMissStep | dwmDropStep | dwmLateStep | dwmLate | dwmSrc | dwmHr | dwmFrame | dwmRefresh | dwmVBlankInt | dwmComposeInt | dwmLateCount | dwmOutstanding | dwmUnique | dwmAvail | dwmMiss | dwmDrop | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
+        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | paceEnter | paceWait | pace->produce | postPaceCPU | postPaceWall | safetyMs | safetyLoops | traceSeq | prodGap | renderGap | consume->present | presentInterval | presentErr | fqP2C | fqPcs | fqCcs | fqSched | fqCS2 | fqPHold | fqCHold | fqSigWait | render2t0 | submit2dwm | dwmDispInt | dwmFrameStep | dwmMissStep | dwmDropStep | dwmLateStep | dwmLate | dwmSrc | dwmHr | dwmFrame | dwmRefresh | dwmVBlankInt | dwmComposeInt | dwmLateCount | dwmOutstanding | dwmUnique | dwmAvail | dwmMiss | dwmDrop | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
 
         // P43 (session 20): t0->t4 only spans GL_DrawFrame+OnFrameEnd+
         // UpdateDRC -- the video-draw slice of a frame. It does NOT cover
@@ -1414,6 +1459,17 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                                (e.t0 - e.tProd) * 1000.0 / freq : 0.0;
                 double dpace2prod = (e.paceWake > 0 && e.tProd >= e.paceWake) ?
                                     (e.tProd - e.paceWake) * 1000.0 / freq : 0.0;
+                double paceEnterMs = (e.mmrPaceEnterQPC > 0 && e.mmrRunEnterQPC > 0 && e.mmrPaceEnterQPC >= e.mmrRunEnterQPC) ?
+                                     (e.mmrPaceEnterQPC - e.mmrRunEnterQPC) * 1000.0 / freq : 0.0;
+                double paceWaitMs = (e.mmrPaceWakeQPC > 0 && e.mmrPaceEnterQPC > 0 && e.mmrPaceWakeQPC >= e.mmrPaceEnterQPC) ?
+                                    (e.mmrPaceWakeQPC - e.mmrPaceEnterQPC) * 1000.0 / freq : 0.0;
+                double postPaceWallMs = (e.tProd > 0 && e.mmrPaceWakeQPC > 0 && e.tProd >= e.mmrPaceWakeQPC) ?
+                                        (e.tProd - e.mmrPaceWakeQPC) * 1000.0 / freq : 0.0;
+                double postPaceCpuMs = (e.prodCpuEnd100ns > 0 && e.mmrPaceCpuWake100ns > 0 && e.prodCpuEnd100ns >= e.mmrPaceCpuWake100ns) ?
+                                       (e.prodCpuEnd100ns - e.mmrPaceCpuWake100ns) / 10000.0 : 0.0;
+                double postPaceDeschedMs = postPaceWallMs > postPaceCpuMs ? (postPaceWallMs - postPaceCpuMs) : 0.0;
+                double safetyMs = (e.mmrSafetyEndQPC > 0 && e.mmrSafetyBeginQPC > 0 && e.mmrSafetyEndQPC >= e.mmrSafetyBeginQPC) ?
+                                  (e.mmrSafetyEndQPC - e.mmrSafetyBeginQPC) * 1000.0 / freq : 0.0;
                 double dprodGap = (havePrevTProd && e.tProd > prevTProd) ?
                                   (e.tProd - prevTProd) * 1000.0 / freq : 0.0;
                 if (e.tProd > 0) { prevTProd = e.tProd; havePrevTProd = true; }
@@ -1486,13 +1542,20 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 bool presentStalled = (dpresent > 0.0 && fabs(presentErr) > 2.0);
 
                 _ftprintf(f,
-                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  pace->prod=%6.2f  prodGap=%7.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fqP2C=%6.2f  fqPcs=%5.2f  fqCcs=%5.2f  fqSched=%6.2f  fqCS2=%5.2f  fqPHold=%5.2f  fqCHold=%5.2f  fqSigWait=%6.2f  render2t0=%6.2f  submit2dwm=%7.2f  dwmDisp=%7.2f  dwmFrameStep=%2lld  dwmMissStep=%2lld  dwmDropStep=%2lld  dwmLateStep=%2lld  dwmLate=%d  dwmSrc=%d  dwmHr=0x%08lX  dwmFrame=%I64u  dwmRefresh=%I64u  dwmVBlankInt=%7.2f  dwmComposeInt=%7.2f  dwmLateCount=%I64u  dwmOutstanding=%I64u  dwmUnique=%I64u  dwmAvail=%I64u  dwmMiss=%I64u  dwmDrop=%I64u  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
+                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  paceEnter=%6.2f  paceWait=%6.2f  pace->prod=%6.2f  postPaceCPU=%6.2f  postPaceWall=%6.2f  safetyMs=%6.2f  safetyLoops=%d  traceSeq=%I64d  prodGap=%7.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fqP2C=%6.2f  fqPcs=%5.2f  fqCcs=%5.2f  fqSched=%6.2f  fqCS2=%5.2f  fqPHold=%5.2f  fqCHold=%5.2f  fqSigWait=%6.2f  render2t0=%6.2f  submit2dwm=%7.2f  dwmDisp=%7.2f  dwmFrameStep=%2lld  dwmMissStep=%2lld  dwmDropStep=%2lld  dwmLateStep=%2lld  dwmLate=%d  dwmSrc=%d  dwmHr=0x%08lX  dwmFrame=%I64u  dwmRefresh=%I64u  dwmVBlankInt=%7.2f  dwmComposeInt=%7.2f  dwmLateCount=%I64u  dwmOutstanding=%I64u  dwmUnique=%I64u  dwmAvail=%I64u  dwmMiss=%I64u  dwmDrop=%I64u  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
                         e.frameNum,
                         (unsigned __int64)e.emuFrame,
                         dprod,
                         paceErr,
                         (int)e.paceSource,
+                        paceEnterMs,
+                        paceWaitMs,
                         dpace2prod,
+                        postPaceCpuMs,
+                        postPaceWallMs,
+                        safetyMs,
+                        (int)e.mmrSafetyLoops,
+                        (long long)e.mmrTraceSeq,
                         dprodGap,
                         dgap, (gapStalled ? _T("*") : _T(" ")),
                         (e.t0 > 0 && e.t2 >= e.t0) ? (e.t2 - e.t0) * 1000.0 / freq : 0.0,
