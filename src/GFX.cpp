@@ -822,6 +822,7 @@ void ProduceFrameToQueue(const unsigned char *rgba)
 // them here keeps the two-threaded code grouped together for readability.
 static double DiagQPCFreq(void);
 static void DiagCompleteFrame(LONGLONG t3, LONGLONG t4);
+static bool DiagQueryDwmTiming(FrameTimingEntry &e);
 static void ApplyPendingResize(void);
 
 // P54: GL_DrawFrameFromBuffer — renders a frame from a pre-filled RGBA
