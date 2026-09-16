@@ -370,6 +370,8 @@ static double           g_LastPresentationErrorMs = 0.0;
 static int              g_PresentationGoodSamples = 0;
 static int              g_PresentationBadSamples = 0;
 static bool             g_PresentationLocked = false;
+static LONGLONG         g_PresentationNextTargetQPC = 0;
+static bool             g_PacingWasPresentationLocked = false;
 
 // P61 safety bounds. We deliberately keep the display-feedback correction
 // small: a transient scheduler/DWM anomaly must not move the emulation clock
@@ -741,6 +743,8 @@ void ResetState()
         g_PresentationGoodSamples = 0;
         g_PresentationBadSamples = 0;
         g_PresentationLocked = false;
+        g_PresentationNextTargetQPC = 0;
+        g_PacingWasPresentationLocked = false;
         LeaveCriticalSection(&g_PresentationCS);
     }
 }
@@ -799,14 +803,33 @@ void OnPresentationFeedback(LONGLONG qpc)
             ++g_PresentationGoodSamples;
             g_PresentationBadSamples = 0;
             if (g_PresentationGoodSamples >= 6)
+            {
+                if (!g_PresentationLocked)
+                {
+                    // Start a monotonically advancing producer schedule from
+                    // the presentation boundary. Do not derive every PaceSlot
+                    // from g_LastPresentationQPC: multiple producer calls can
+                    // otherwise observe the same presentation timestamp and
+                    // run back-to-back without waiting.
+                    double leadTicks = (P61_PHASE_LEAD_MS / 1000.0) * qpcFreq;
+                    double leadLimitTicks = (P61_PHASE_LEAD_LIMIT_MS / 1000.0) * qpcFreq;
+                    if (leadTicks > leadLimitTicks)
+                        leadTicks = leadLimitTicks;
+                    g_PresentationNextTargetQPC = qpc +
+                            (LONGLONG)(g_PresentationPeriodTicks - leadTicks + 0.5);
+                }
                 g_PresentationLocked = true;
+            }
         }
         else
         {
             g_PresentationGoodSamples = 0;
             ++g_PresentationBadSamples;
             if (g_PresentationBadSamples >= 3)
+            {
                 g_PresentationLocked = false;
+                g_PresentationNextTargetQPC = 0;
+            }
         }
     }
 
@@ -910,54 +933,62 @@ void PaceSlot()
     if (fallbackPeriodTicks < 1.0)
         fallbackPeriodTicks = 1.0;
 
-    // P61: prefer the filtered presentation-feedback clock once it is locked.
-    // The emulation is intentionally scheduled a small bounded amount before
-    // the next display boundary so the render queue has a fresh frame ready,
-    // without letting the producer run an entire frame ahead of presentation.
-    LONGLONG presentQPC = 0;
-    double presentPeriodTicks = 0.0;
+    // P61: when the presentation clock is locked, PaceSlot uses a dedicated
+    // monotonically advancing producer schedule. The presentation timestamp
+    // is used to initialise/correct that schedule, but never to recompute the
+    // same target for every call. This guarantees one cadence interval per
+    // emulated frame and prevents back-to-back producer bursts.
+    LONGLONG targetQPC = 0;
     bool presentLocked = false;
+    double presentPeriodTicks = 0.0;
+
     if (g_PresentationCSInit)
     {
         EnterCriticalSection(&g_PresentationCS);
-        presentQPC = g_LastPresentationQPC;
-        presentPeriodTicks = g_PresentationPeriodTicks;
         presentLocked = g_PresentationLocked;
+        presentPeriodTicks = g_PresentationPeriodTicks;
+
+        if (presentLocked && presentPeriodTicks > 0.0)
+        {
+            double feedbackAgeMs = (double)(now.QuadPart - g_LastPresentationQPC) * 1000.0 /
+                                   (double)g_QPCFreq.QuadPart;
+            double periodMs = presentPeriodTicks * 1000.0 / (double)g_QPCFreq.QuadPart;
+            if (g_LastPresentationQPC <= 0 || feedbackAgeMs > periodMs * 3.0)
+            {
+                presentLocked = false;
+                g_PresentationLocked = false;
+                g_PresentationNextTargetQPC = 0;
+            }
+        }
+
+        if (presentLocked && presentPeriodTicks > 0.0)
+        {
+            if (g_PresentationNextTargetQPC <= 0)
+            {
+                double leadTicks = (P61_PHASE_LEAD_MS / 1000.0) * (double)g_QPCFreq.QuadPart;
+                double leadLimitTicks = (P61_PHASE_LEAD_LIMIT_MS / 1000.0) * (double)g_QPCFreq.QuadPart;
+                if (leadTicks > leadLimitTicks)
+                    leadTicks = leadLimitTicks;
+                g_PresentationNextTargetQPC = g_LastPresentationQPC +
+                        (LONGLONG)(presentPeriodTicks - leadTicks + 0.5);
+            }
+            targetQPC = g_PresentationNextTargetQPC;
+        }
+
+        if (!presentLocked && g_PacingWasPresentationLocked)
+        {
+            // Switching away from feedback pacing must begin a fresh absolute
+            // QPC epoch. Reusing a stale fallback epoch could make the first
+            // fallback call immediately fire several frames in succession.
+            g_PaceEpochQPC = now;
+            g_PaceFrameIndex = 1;
+        }
+        g_PacingWasPresentationLocked = presentLocked;
         LeaveCriticalSection(&g_PresentationCS);
     }
 
-    LONGLONG targetQPC = 0;
-    if (presentLocked && presentQPC > 0 && presentPeriodTicks > 0.0)
+    if (!presentLocked)
     {
-        // A missing render/presentation update means the feedback clock is no
-        // longer authoritative. Fall back to the independent QPC schedule
-        // instead of letting stale feedback make the emulator run flat out.
-        double feedbackAgeMs = (double)(now.QuadPart - presentQPC) * 1000.0 /
-                               (double)g_QPCFreq.QuadPart;
-        if (feedbackAgeMs > (presentPeriodTicks * 3.0 * 1000.0 / (double)g_QPCFreq.QuadPart))
-        {
-            presentLocked = false;
-        }
-    }
-
-    if (presentLocked && presentQPC > 0 && presentPeriodTicks > 0.0)
-    {
-        double leadTicks = (P61_PHASE_LEAD_MS / 1000.0) * (double)g_QPCFreq.QuadPart;
-        if (leadTicks > P61_PHASE_LEAD_LIMIT_MS / 1000.0 * (double)g_QPCFreq.QuadPart)
-            leadTicks = (P61_PHASE_LEAD_LIMIT_MS / 1000.0) * (double)g_QPCFreq.QuadPart;
-
-        targetQPC = presentQPC + (LONGLONG)(presentPeriodTicks - leadTicks + 0.5);
-        if (targetQPC < now.QuadPart)
-        {
-            // We are already late. Do not wait an extra frame; bounded phase
-            // correction is preferable to turning one late frame into two.
-            targetQPC = now.QuadPart;
-        }
-    }
-    else
-    {
-        // QPC-only fallback. This path remains fully absolute, so a late wake
-        // does not create permanent phase drift.
         if (g_PaceEpochQPC.QuadPart == 0)
         {
             g_PaceEpochQPC = now;
@@ -1003,8 +1034,31 @@ void PaceSlot()
         SwitchToThread();
     }
 
-    if (!presentLocked)
+    if (presentLocked && g_PresentationCSInit)
+    {
+        // Advance exactly one presentation period for the next emulation
+        // frame. If the scheduler was late, re-anchor from the current time
+        // rather than allowing several already-expired targets to execute in
+        // a burst.
+        LARGE_INTEGER after;
+        QueryPerformanceCounter(&after);
+        EnterCriticalSection(&g_PresentationCS);
+        if (g_PresentationLocked && g_PresentationPeriodTicks > 0.0)
+        {
+            double next = (double)g_PresentationNextTargetQPC + g_PresentationPeriodTicks;
+            double lateTicks = (double)after.QuadPart - next;
+            if (lateTicks > g_PresentationPeriodTicks * 0.5)
+            {
+                next = (double)after.QuadPart + g_PresentationPeriodTicks;
+            }
+            g_PresentationNextTargetQPC = (LONGLONG)(next + 0.5);
+        }
+        LeaveCriticalSection(&g_PresentationCS);
+    }
+    else
+    {
         ++g_PaceFrameIndex;
+    }
 }
 
 
