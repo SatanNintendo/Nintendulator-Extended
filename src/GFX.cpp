@@ -632,9 +632,12 @@ struct FrameTimingEntry {
         LONGLONG t3;        // after OnFrameEnd (single-threaded path)
         LONGLONG t4;        // after UpdateDRC  (single-threaded path)
         LONGLONG tProd;     // emulation-thread frame publication QPC
+        LONGLONG paceTarget;// P67: PaceSlot target QPC for this emulation frame
+        LONGLONG paceWake;  // P67: PaceSlot wake QPC after its wait/yield
         ULONGLONG emuFrame; // emulation-frame sequence number
         LONG     fqSkipped; // queued frames skipped before this frame
         LONG     fqDepth;   // queue depth observed at consume time
+        LONG     paceSource;// P67: 1=presentation anchor, 0=QPC fallback
         DWORD    frameNum;  // render/diagnostic sequence
 };
 static FrameTimingEntry s_diagBuf[DIAG_FRAMES];
@@ -668,8 +671,11 @@ struct FQ_Packet {
         unsigned char pixels[FQ_FRAME_SIZE];
         ULONGLONG     emuFrame;
         LONGLONG      producedQPC;
+        LONGLONG      paceTargetQPC;
+        LONGLONG      paceWakeQPC;
         LONG          fqSkipped;
         LONG          fqDepth;
+        LONG          paceSource;
 };
 
 static FQ_Packet s_FQ_Buf[FQ_SLOTS];
@@ -727,6 +733,12 @@ static void FQ_Produce(const unsigned char *src)
         EnterCriticalSection(&s_FQ_CS);
         memcpy(s_FQ_Buf[s_FQ_Head].pixels, src, FQ_FRAME_SIZE);
         s_FQ_Buf[s_FQ_Head].producedQPC = qpc.QuadPart;
+        // P67: snapshot the pacing timestamps belonging to this emulation
+        // frame. This is diagnostic-only; none of these values feeds back into
+        // PaceSlot() or changes queue/presentation behaviour.
+        s_FQ_Buf[s_FQ_Head].paceTargetQPC = MonitorSync::GetLastPaceTargetQPC();
+        s_FQ_Buf[s_FQ_Head].paceWakeQPC = MonitorSync::GetLastPaceWakeQPC();
+        s_FQ_Buf[s_FQ_Head].paceSource = MonitorSync::WasLastPacePresentationAnchored() ? 1 : 0;
         s_FQ_Buf[s_FQ_Head].emuFrame = frameSeq;
         s_FQ_Buf[s_FQ_Head].fqSkipped = 0;
         s_FQ_Buf[s_FQ_Head].fqDepth = 0;
@@ -825,6 +837,9 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 s_diagBuf[idx].t3       = 0;
                 s_diagBuf[idx].t4       = 0;
                 s_diagBuf[idx].tProd    = packet ? packet->producedQPC : 0;
+                s_diagBuf[idx].paceTarget = packet ? packet->paceTargetQPC : 0;
+                s_diagBuf[idx].paceWake   = packet ? packet->paceWakeQPC : 0;
+                s_diagBuf[idx].paceSource = packet ? packet->paceSource : 0;
                 s_diagBuf[idx].emuFrame = packet ? packet->emuFrame : 0;
                 s_diagBuf[idx].fqSkipped = packet ? packet->fqSkipped : 0;
                 s_diagBuf[idx].fqDepth = packet ? packet->fqDepth : 0;
@@ -1279,7 +1294,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         _ftprintf(f, _T("FrameQueue counters: overflow_drop=%ld, latest_wins_skip=%ld\n"),
                 (long)InterlockedExchangeAdd(&s_FQOverflowDrops, 0),
                 (long)InterlockedExchangeAdd(&s_FQSkippedFrames, 0));
-        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | renderGap | consume->present | presentInterval | presentErr | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
+        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | renderGap | consume->present | presentInterval | presentErr | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
 
         // P43 (session 20): t0->t4 only spans GL_DrawFrame+OnFrameEnd+
         // UpdateDRC -- the video-draw slice of a frame. It does NOT cover
@@ -1339,6 +1354,11 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                                   1000.0 / MonitorSync::GetTargetHz() : 16.667;
                 double presentErr = havePrevT2 && dpresent > 0.0 ?
                                     (dpresent - centerMs) : 0.0;
+                // P67: this isolates timer/scheduler wake-up error from the
+                // later render/presentation stages. Positive values mean the
+                // emulation pacing wake-up happened after its target.
+                double paceErr = (e.paceTarget > 0 && e.paceWake > 0) ?
+                                 (e.paceWake - e.paceTarget) * 1000.0 / freq : 0.0;
 
                 // A real dropped/duplicated frame shows up as a gap far
                 // from one vblank period (~16.67ms at 60Hz) in EITHER
@@ -1354,10 +1374,12 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 bool presentStalled = (dpresent > 0.0 && fabs(presentErr) > 2.0);
 
                 _ftprintf(f,
-                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
+                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
                         e.frameNum,
                         (unsigned __int64)e.emuFrame,
                         dprod,
+                        paceErr,
+                        (int)e.paceSource,
                         dgap, (gapStalled ? _T("*") : _T(" ")),
                         (e.t0 > 0 && e.t2 >= e.t0) ? (e.t2 - e.t0) * 1000.0 / freq : 0.0,
                         dpresent, (presentStalled ? _T("*") : _T(" ")),
@@ -1540,6 +1562,9 @@ static void GL_DrawFrame(void)
                 s_diagBuf[idx].t2b      = 0;
                 s_diagBuf[idx].t3       = 0;
                 s_diagBuf[idx].t4       = 0;
+                s_diagBuf[idx].paceTarget = 0;
+                s_diagBuf[idx].paceWake   = 0;
+                s_diagBuf[idx].paceSource = 0;
                 s_diagBuf[idx].frameNum = s_diagFrameNum;
                 s_diagHead = (s_diagHead + 1) % DIAG_FRAMES;
         }

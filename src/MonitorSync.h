@@ -177,25 +177,19 @@ namespace MonitorSync
         // interval=0 switch actually happened.
         int     GetDwmSyncMode ();
 
-        // P62: return the next predicted presentation boundary derived from
-        // the real DWM presentation feedback clock. This is NOT an independent
-        // render clock: it advances from the last observed presentation and
-        // the filtered presentation period. After the first presentation, a
-        // temporary nominal target-rate period is used until a measured
-        // presentation period becomes available.
-        bool    GetNextPresentationTargetQPC (LONGLONG *targetQPC);
-
-        // Presentation feedback used by the phase-aware render gate.
-        void    NotifyFramePresented (LONGLONG qpcPresented);
-        bool    HasPresentationClock ();
-        double  GetPresentationHz ();
-        double  GetPresentationIntervalErrorMs ();
-
 
         // Authoritative emulator-frame/audio-slot pacer. Each slot is paced
         // from the PREVIOUS slot write using GetTargetHz(), so the emulator
         // cadence itself matches the monitor clock (for supported near-rate
         // combinations) instead of relying on frame-dropping in the renderer.
         void    PaceSlot ();
+
+        // P67: diagnostic-only snapshot of the most recent PaceSlot timing.
+        // These values are observational and are never used to alter pacing.
+        // sourcePresentation is TRUE when the presentation-anchored branch
+        // was used; FALSE means the absolute-QPC fallback branch was used.
+        LONGLONG GetLastPaceTargetQPC ();
+        LONGLONG GetLastPaceWakeQPC ();
+        bool     WasLastPacePresentationAnchored ();
 
 }

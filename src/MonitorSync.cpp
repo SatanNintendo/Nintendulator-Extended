@@ -355,6 +355,13 @@ static bool           g_VSyncActive = false;
 static LARGE_INTEGER  g_PaceEpochQPC = {0, 0};
 static ULONGLONG      g_PaceFrameIndex = 0;
 
+// P67: diagnostic-only timing snapshot for PaceSlot(). These values are
+// written after the pacing wait has completed and are consumed by the frame
+// queue diagnostic path. They never participate in pacing decisions.
+static volatile LONGLONG g_LastPaceTargetQPC = 0;
+static volatile LONGLONG g_LastPaceWakeQPC   = 0;
+static volatile LONG     g_LastPaceSource   = 0; // 1=presentation, 0=QPC fallback
+
 // P60: display-presentation feedback clock.
 //
 // PaceSlot() used to run entirely from an independent QPC schedule. That gave
@@ -572,6 +579,9 @@ void OnDisplayChange()
     InterlockedExchange(&g_PresentationClockLocked, FALSE);
     InterlockedExchange(&g_PresentationHzMilli, 0);
     InterlockedExchange(&g_PresentationIntervalErrUs, 0);
+    InterlockedExchange64(&g_LastPaceTargetQPC, 0);
+    InterlockedExchange64(&g_LastPaceWakeQPC, 0);
+    InterlockedExchange(&g_LastPaceSource, 0);
 }
 
 void Enable(BOOL on)
@@ -744,6 +754,9 @@ void ResetState()
     InterlockedExchange(&g_PresentationClockLocked, FALSE);
     InterlockedExchange(&g_PresentationHzMilli, 0);
     InterlockedExchange(&g_PresentationIntervalErrUs, 0);
+    InterlockedExchange64(&g_LastPaceTargetQPC, 0);
+    InterlockedExchange64(&g_LastPaceWakeQPC, 0);
+    InterlockedExchange(&g_LastPaceSource, 0);
 }
 
 void SetDwmSyncMode(bool useDwm)
@@ -787,11 +800,21 @@ static HANDLE CreatePaceTimer()
     return ht;
 }
 
+static void RecordPaceDiagnostic(LONGLONG targetQPC, LONGLONG wakeQPC, LONG source)
+{
+    // Diagnostic-only. Keep this separate from the pacing decision path so the
+    // recorded values can never feed back into the scheduler.
+    InterlockedExchange64(&g_LastPaceTargetQPC, targetQPC);
+    InterlockedExchange64(&g_LastPaceWakeQPC, wakeQPC);
+    InterlockedExchange(&g_LastPaceSource, source);
+}
+
 void PaceSlot()
 {
     if (g_QPCFreq.QuadPart <= 0)
     {
         SwitchToThread();
+        RecordPaceDiagnostic(0, 0, 0);
         return;
     }
 
@@ -863,6 +886,10 @@ void PaceSlot()
                 {
                     SwitchToThread();
                 }
+
+                LARGE_INTEGER paceWake;
+                QueryPerformanceCounter(&paceWake);
+                RecordPaceDiagnostic(targetQPC, paceWake.QuadPart, 1);
                 return;
             }
         }
@@ -879,6 +906,7 @@ void PaceSlot()
     {
         g_PaceEpochQPC = now;
         g_PaceFrameIndex = 1;
+        RecordPaceDiagnostic(now.QuadPart, now.QuadPart, 0);
         return;
     }
 
@@ -922,7 +950,26 @@ void PaceSlot()
         SwitchToThread();
     }
 
+    LARGE_INTEGER paceWake;
+    QueryPerformanceCounter(&paceWake);
+    RecordPaceDiagnostic(targetQPC, paceWake.QuadPart, 0);
+
     ++g_PaceFrameIndex;
+}
+
+LONGLONG GetLastPaceTargetQPC()
+{
+    return InterlockedExchangeAdd64(&g_LastPaceTargetQPC, 0);
+}
+
+LONGLONG GetLastPaceWakeQPC()
+{
+    return InterlockedExchangeAdd64(&g_LastPaceWakeQPC, 0);
+}
+
+bool WasLastPacePresentationAnchored()
+{
+    return InterlockedExchangeAdd(&g_LastPaceSource, 0) != 0;
 }
 
 void NotifyFramePresented(LONGLONG qpcPresented)
@@ -990,58 +1037,6 @@ void NotifyFramePresented(LONGLONG qpcPresented)
 bool HasPresentationClock()
 {
     return InterlockedExchangeAdd(&g_PresentationClockLocked, 0) != FALSE;
-}
-
-bool GetNextPresentationTargetQPC(LONGLONG *targetQPC)
-{
-    if (!targetQPC || !IsEnabled() || g_QPCFreq.QuadPart <= 0)
-        return false;
-
-    LONGLONG lastPresent =
-            InterlockedExchangeAdd64(&g_LastPresentationQPC, 0);
-    LONGLONG period =
-            InterlockedExchangeAdd64(&g_PresentationPeriodQPC, 0);
-
-    // After the first real DwmFlush there is a valid phase anchor, but there
-    // cannot yet be a measured presentation period because no second
-    // presentation has occurred. Bootstrap the gate from the configured
-    // target refresh period; once real feedback is available,
-    // g_PresentationPeriodQPC replaces this fallback. This does not claim a
-    // measured presentation lock and does not alter the reported Presentation Hz.
-    if (lastPresent <= 0)
-        return false;
-    if (period <= 0)
-    {
-        const double targetHz = GetTargetHz();
-        if (targetHz <= 0.0)
-            return false;
-        period = (LONGLONG)((double)g_QPCFreq.QuadPart / targetHz + 0.5);
-        if (period <= 0)
-            return false;
-    }
-
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-
-    // Match the 0.75 ms lead used by PaceSlot(). The render thread therefore
-    // reaches SwapBuffers/DwmFlush just before the predicted composition
-    // boundary instead of calling DwmFlush immediately after the producer
-    // event. This is phase alignment, not a second free-running clock.
-    const LONGLONG leadTicks =
-            (LONGLONG)((double)g_QPCFreq.QuadPart * 0.00075 + 0.5);
-
-    LONGLONG elapsed = now.QuadPart - lastPresent;
-    LONGLONG periodsAhead = 1;
-    if (elapsed >= 0)
-        periodsAhead = (elapsed / period) + 1;
-
-    LONGLONG target = lastPresent + periodsAhead * period - leadTicks;
-
-    if (target <= now.QuadPart)
-        return false;
-
-    *targetQPC = target;
-    return true;
 }
 
 double GetPresentationHz()
