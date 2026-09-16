@@ -1083,8 +1083,6 @@ static DWORD WINAPI RenderThreadProc(void *)
         AcquireGLContext();
         InterlockedExchange(&s_RenderThreadActive, 1);
 
-        HANDLE hPhaseTimer = CreateRenderPhaseTimer();
-
         while (!InterlockedExchangeAdd(&s_RenderThreadStop, 0))
         {
                 DWORD wait = WaitForSingleObject(s_FrameEvent, INFINITE);
@@ -1096,22 +1094,13 @@ static DWORD WINAPI RenderThreadProc(void *)
                 const FQ_Packet *packet = FQ_Consume(NULL, NULL);
                 if (packet)
                 {
-                        BOOL phaseGated = FALSE;
-                        if (MonitorSync::GetDwmSyncMode() != 0 && hPhaseTimer)
-                        {
-                                phaseGated = WaitForPresentationPhase(hPhaseTimer) ? TRUE : FALSE;
-
-                                // The producer can have published a newer frame while
-                                // we waited for the predicted presentation boundary.
-                                // Consume it now so a phase gate never deliberately
-                                // presents a stale packet when a newer one is ready.
-                                if (phaseGated)
-                                {
-                                        const FQ_Packet *newest = FQ_Consume(NULL, NULL);
-                                        if (newest)
-                                                packet = newest;
-                                }
-                        }
+                        // P64: do not add a software phase wait in front of
+                        // SwapBuffers/DwmFlush. DwmFlush is already the presentation
+                        // synchronizer in this path; the P62/P63 pre-wait introduced
+                        // a repeatable 33 ms cadence on real systems by making the
+                        // render submission itself phase-sensitive. Keep frame
+                        // consumption event-driven and let the native presentation
+                        // path provide the backpressure.
                         GL_DrawFrameFromBuffer(packet);
                 }
                 else
@@ -1123,8 +1112,6 @@ static DWORD WINAPI RenderThreadProc(void *)
                 }
         }
 
-        if (hPhaseTimer)
-                CloseHandle(hPhaseTimer);
         ReleaseGLContext();
         InterlockedExchange(&s_RenderThreadActive, 0);
         return 0;
