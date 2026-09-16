@@ -2107,19 +2107,7 @@ void    Run (void)
                 {
                         if (!isEnabled)
                                 break;
-                        // P5: SwitchToThread() instead of Sleep(1) in this
-                        // legacy (MMR-off) audio wait loop. Sleep(1) rounds
-                        // up to the 1-2ms (often ~15.6ms) timer tick on
-                        // Windows, quantizing the wait far coarser than one
-                        // DirectSound slot (~16.7ms at 60Hz) and adding a
-                        // whole timer-tick of latency to every iteration;
-                        // SwitchToThread() yields the remainder of our
-                        // timeslice to any ready thread (audiodg refreshing
-                        // its cursor) and returns immediately otherwise.
-                        // The MMR path above never reaches this loop -- it
-                        // paces through MonitorSync::PaceSlot() and uses the
-                        // worker-cached positions.
-                        SwitchToThread();
+                        Sleep(1);
                         Try(Buffer->GetCurrentPosition(&rpos, &wpos), Lang::GetString(LANG_ERR_APU_BUFFER));
                         rpos /= LockSize;
                         wpos /= LockSize;

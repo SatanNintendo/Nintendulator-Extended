@@ -184,39 +184,4 @@ namespace MonitorSync
         // combinations) instead of relying on frame-dropping in the renderer.
         void    PaceSlot ();
 
-        // ------------------------------------------------------------------
-        // P60/P61: presentation feedback clock.
-        //
-        // The render thread calls OnPresentationFeedback() once per frame,
-        // with the QPC timestamp taken AFTER the P61 presentation boundary
-        // (SwapBuffers FIRST, then DwmFlush -- see GFX.cpp). That timestamp
-        // is the closest available proxy for "the DWM just composited our
-        // frame", and it is the anchor the whole MMR cadence is phased
-        // against:
-        //
-        //   presentation boundary -> feedback -> PaceSlot phase control ->
-        //   FrameQueue -> render thread -> SwapBuffers + DwmFlush -> ...
-        //
-        // IsPresentationClockLocked() reports whether the feedback stream is
-        // currently trusted (>= 2 samples, a filtered period, and feedback
-        // no older than ~250 ms). While locked, PaceSlot anchors each
-        // emulation slot to the next predicted presentation boundary with a
-        // BOUNDED phase lead, using the filtered (EWMA) presentation
-        // period; when the clock is NOT locked, PaceSlot falls back to the
-        // absolute QPC cadence so a missing/stalled render thread can never
-        // block the emulation thread indefinitely.
-        //
-        // GetPresentationHz() and GetLastPresentErrMs() feed the timing-log
-        // header (presentation Hz / last interval error columns).
-        //
-        // Thread safety: the writer is whichever thread presents (render
-        // thread in the two-thread mode, emulation thread in the fallback
-        // single-thread mode -- never both at once). Readers (PaceSlot on
-        // the emulation thread, the diagnostic log writer) only touch the
-        // Interlocked-published values.
-        void    OnPresentationFeedback (LONGLONG qpcPresent);
-        bool    IsPresentationClockLocked ();
-        double  GetPresentationHz ();
-        double  GetLastPresentErrMs ();
-
 }
