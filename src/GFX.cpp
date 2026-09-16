@@ -968,7 +968,13 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
         SwapBuffers(hGLDC);
 
 #if USE_DWMFLUSH
-        if (MatchMonitorRate && !(Fullscreen && ExclusiveFullscreen))
+        // P65: when the OpenGL driver has verified swap interval=1, let
+        // SwapBuffers provide the presentation synchronization. DwmFlush is
+        // retained as a fallback only for systems where GL vsync was not
+        // verified. Calling DwmFlush in addition to verified GL-vsync caused
+        // a repeatable ~33 ms presentation cadence after the warmup phase.
+        if (MatchMonitorRate && !(Fullscreen && ExclusiveFullscreen) &&
+                !MonitorSync::IsVSyncActive())
         {
                 if (s_pfnDwmFlush == reinterpret_cast<PFN_DwmFlush>(1))
                 {
