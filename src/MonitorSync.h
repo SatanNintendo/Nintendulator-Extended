@@ -76,7 +76,7 @@ namespace MonitorSync
         // Feed back the actual presentation boundary observed by the render
         // thread. P61 uses this as the authoritative display clock when it
         // is stable enough; the QPC pacer remains the bounded fallback.
-        void    OnPresentationFeedback (LONGLONG qpc);
+        void    OnPresentationFeedback (LONGLONG qpc, bool synchronizedBoundary);
 
         // Presentation feedback diagnostics used by the MMR timing log.
         bool    IsPresentationClockLocked ();

@@ -994,7 +994,14 @@ static void GL_DrawFrameFromBuffer(const unsigned char *rgba, const FQ_FrameMeta
         if (MatchMonitorRate)
         {
                 LARGE_INTEGER qpcPresent; QueryPerformanceCounter(&qpcPresent);
-                MonitorSync::OnPresentationFeedback(qpcPresent.QuadPart);
+                // Only feed P61 from a timestamp that follows a real sync
+                // boundary.  During DwmFlush warm-up, SwapBuffers may return
+                // immediately and must not be mistaken for a vblank timestamp.
+                const bool synchronizedBoundary =
+                        (MonitorSync::GetDwmSyncMode() != 0) ||
+                        MonitorSync::IsVSyncActive() ||
+                        MonitorSync::HasDXGIVBlank();
+                MonitorSync::OnPresentationFeedback(qpcPresent.QuadPart, synchronizedBoundary);
                 int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
                 s_diagBuf[idx].t2b = qpcPresent.QuadPart;
                 s_diagBuf[idx].presentIntervalMs = MonitorSync::GetLastPresentationIntervalMs();
@@ -1729,7 +1736,15 @@ static void GL_DrawFrame(void)
         if (MatchMonitorRate)
         {
                 LARGE_INTEGER qpcPresent; QueryPerformanceCounter(&qpcPresent);
-                MonitorSync::OnPresentationFeedback(qpcPresent.QuadPart);
+                // A post-SwapBuffers timestamp is usable as P61 feedback only
+                // when the current presentation path actually has a sync
+                // boundary.  During DwmFlush warm-up, SwapBuffers may return
+                // immediately, so do not train the presentation clock from it.
+                const bool synchronizedBoundary =
+                        (MonitorSync::GetDwmSyncMode() != 0) ||
+                        MonitorSync::IsVSyncActive() ||
+                        MonitorSync::HasDXGIVBlank();
+                MonitorSync::OnPresentationFeedback(qpcPresent.QuadPart, synchronizedBoundary);
 
                 int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
                 s_diagBuf[idx].t2b = qpcPresent.QuadPart;

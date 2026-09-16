@@ -749,7 +749,7 @@ void ResetState()
     }
 }
 
-void OnPresentationFeedback(LONGLONG qpc)
+void OnPresentationFeedback(LONGLONG qpc, bool synchronizedBoundary)
 {
     if (!g_Initialized || qpc <= 0 || !g_PresentationCSInit)
         return;
@@ -759,6 +759,26 @@ void OnPresentationFeedback(LONGLONG qpc)
         return;
 
     EnterCriticalSection(&g_PresentationCS);
+
+    // A QPC timestamp taken immediately after SwapBuffers is NOT necessarily
+    // a presentation boundary.  In particular, during the DwmFlush warm-up
+    // window the swap interval may be 0/unsupported and DwmFlush is not yet
+    // armed, so such timestamps describe CPU return timing rather than vblank.
+    // Never train or lock the presentation clock from an unsynchronized sample.
+    if (!synchronizedBoundary)
+    {
+        g_PresentationLocked = false;
+        g_PresentationGoodSamples = 0;
+        g_PresentationBadSamples = 0;
+        g_PresentationNextTargetQPC = 0;
+        g_PresentationPeriodTicks = 0.0;
+        g_PresentationHz = 0.0;
+        g_LastPresentationQPC = 0;
+        g_LastPresentationIntervalMs = 0.0;
+        g_LastPresentationErrorMs = 0.0;
+        LeaveCriticalSection(&g_PresentationCS);
+        return;
+    }
 
     if (g_LastPresentationQPC > 0 && qpc > g_LastPresentationQPC)
     {
