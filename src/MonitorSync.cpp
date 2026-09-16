@@ -355,13 +355,6 @@ static bool           g_VSyncActive = false;
 static LARGE_INTEGER  g_PaceEpochQPC = {0, 0};
 static ULONGLONG      g_PaceFrameIndex = 0;
 
-// P67: diagnostic-only timing snapshot for PaceSlot(). These values are
-// written after the pacing wait has completed and are consumed by the frame
-// queue diagnostic path. They never participate in pacing decisions.
-static volatile LONGLONG g_LastPaceTargetQPC = 0;
-static volatile LONGLONG g_LastPaceWakeQPC   = 0;
-static volatile LONG     g_LastPaceSource   = 0; // 1=presentation, 0=QPC fallback
-
 // P60: display-presentation feedback clock.
 //
 // PaceSlot() used to run entirely from an independent QPC schedule. That gave
@@ -579,9 +572,6 @@ void OnDisplayChange()
     InterlockedExchange(&g_PresentationClockLocked, FALSE);
     InterlockedExchange(&g_PresentationHzMilli, 0);
     InterlockedExchange(&g_PresentationIntervalErrUs, 0);
-    InterlockedExchange64(&g_LastPaceTargetQPC, 0);
-    InterlockedExchange64(&g_LastPaceWakeQPC, 0);
-    InterlockedExchange(&g_LastPaceSource, 0);
 }
 
 void Enable(BOOL on)
@@ -754,9 +744,6 @@ void ResetState()
     InterlockedExchange(&g_PresentationClockLocked, FALSE);
     InterlockedExchange(&g_PresentationHzMilli, 0);
     InterlockedExchange(&g_PresentationIntervalErrUs, 0);
-    InterlockedExchange64(&g_LastPaceTargetQPC, 0);
-    InterlockedExchange64(&g_LastPaceWakeQPC, 0);
-    InterlockedExchange(&g_LastPaceSource, 0);
 }
 
 void SetDwmSyncMode(bool useDwm)
@@ -800,21 +787,11 @@ static HANDLE CreatePaceTimer()
     return ht;
 }
 
-static void RecordPaceDiagnostic(LONGLONG targetQPC, LONGLONG wakeQPC, LONG source)
-{
-    // Diagnostic-only. Keep this separate from the pacing decision path so the
-    // recorded values can never feed back into the scheduler.
-    InterlockedExchange64(&g_LastPaceTargetQPC, targetQPC);
-    InterlockedExchange64(&g_LastPaceWakeQPC, wakeQPC);
-    InterlockedExchange(&g_LastPaceSource, source);
-}
-
 void PaceSlot()
 {
     if (g_QPCFreq.QuadPart <= 0)
     {
         SwitchToThread();
-        RecordPaceDiagnostic(0, 0, 0);
         return;
     }
 
@@ -846,13 +823,14 @@ void PaceSlot()
 
         if (lastPresent > 0 && period > 0)
         {
-            // Keep the lead deliberately small. 5.0 ms is deliberately bounded: the current diagnostics show that the
-            // emulation/frame-production work after PaceSlot() commonly consumes
-            // roughly 2-6 ms. Using a modest lead here lets that existing work
-            // happen before the next real display boundary without adding a
-            // second pacing mechanism or a full-frame delay.
+            // Leave several milliseconds of execution slack between the
+            // pacing wake-up and frame publication. The timing log shows that
+            // normal frames need about 2.4-2.6 ms after PaceSlot(), while rare
+            // host-side execution spikes can reach about 6.4 ms. A 7 ms lead
+            // keeps those outliers from consuming the display-period budget
+            // without introducing a second timing mechanism or queue.
             const LONGLONG leadTicks =
-                    (LONGLONG)((double)g_QPCFreq.QuadPart * 0.0050 + 0.5);
+                    (LONGLONG)((double)g_QPCFreq.QuadPart * 0.007 + 0.5);
 
             LONGLONG targetQPC = lastPresent + period - leadTicks;
 
@@ -888,10 +866,6 @@ void PaceSlot()
                 {
                     SwitchToThread();
                 }
-
-                LARGE_INTEGER paceWake;
-                QueryPerformanceCounter(&paceWake);
-                RecordPaceDiagnostic(targetQPC, paceWake.QuadPart, 1);
                 return;
             }
         }
@@ -908,7 +882,6 @@ void PaceSlot()
     {
         g_PaceEpochQPC = now;
         g_PaceFrameIndex = 1;
-        RecordPaceDiagnostic(now.QuadPart, now.QuadPart, 0);
         return;
     }
 
@@ -952,26 +925,7 @@ void PaceSlot()
         SwitchToThread();
     }
 
-    LARGE_INTEGER paceWake;
-    QueryPerformanceCounter(&paceWake);
-    RecordPaceDiagnostic(targetQPC, paceWake.QuadPart, 0);
-
     ++g_PaceFrameIndex;
-}
-
-LONGLONG GetLastPaceTargetQPC()
-{
-    return InterlockedExchangeAdd64(&g_LastPaceTargetQPC, 0);
-}
-
-LONGLONG GetLastPaceWakeQPC()
-{
-    return InterlockedExchangeAdd64(&g_LastPaceWakeQPC, 0);
-}
-
-bool WasLastPacePresentationAnchored()
-{
-    return InterlockedExchangeAdd(&g_LastPaceSource, 0) != 0;
 }
 
 void NotifyFramePresented(LONGLONG qpcPresented)
