@@ -1259,7 +1259,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         _ftprintf(f, _T("FrameQueue counters: overflow_drop=%ld, latest_wins_skip=%ld\n"),
                 (long)InterlockedExchangeAdd(&s_FQOverflowDrops, 0),
                 (long)InterlockedExchangeAdd(&s_FQSkippedFrames, 0));
-        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | renderGap | consume->present | presentInterval | presentErr | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
+        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | pace->produce | prodGap | renderGap | consume->present | presentInterval | presentErr | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
 
         // P43 (session 20): t0->t4 only spans GL_DrawFrame+OnFrameEnd+
         // UpdateDRC -- the video-draw slice of a frame. It does NOT cover
@@ -1282,8 +1282,10 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         // inside it happens to be split.
         LONGLONG prevT0 = 0;
         LONGLONG prevT2 = 0;
+        LONGLONG prevTProd = 0;
         bool     havePrevT0 = false;
         bool     havePrevT2 = false;
+        bool     havePrevTProd = false;
 
         // Walk the circular buffer from oldest to newest
         for (int i = 0; i < DIAG_FRAMES; i++)
@@ -1306,6 +1308,15 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                              (e.t4  - e.t0)  * 1000.0 / freq : 0.0;
                 double dprod = (e.tProd > 0 && e.t0 >= e.tProd) ?
                                (e.t0 - e.tProd) * 1000.0 / freq : 0.0;
+                double dpace2prod = (e.paceWake > 0 && e.tProd >= e.paceWake) ?
+                                    (e.tProd - e.paceWake) * 1000.0 / freq : 0.0;
+                double dprodGap = (havePrevTProd && e.tProd > prevTProd) ?
+                                  (e.tProd - prevTProd) * 1000.0 / freq : 0.0;
+                if (e.tProd > 0)
+                {
+                    prevTProd = e.tProd;
+                    havePrevTProd = true;
+                }
                 double dpresent = (havePrevT2 && e.t2 > prevT2) ?
                                   (e.t2 - prevT2) * 1000.0 / freq : 0.0;
 
@@ -1322,6 +1333,11 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 // P67: this isolates timer/scheduler wake-up error from the
                 // later render/presentation stages. Positive values mean the
                 // emulation pacing wake-up happened after its target.
+                //
+                // P68: pace->produce measures the host-side work/scheduling time
+                // between the pacing wake-up and the frame being published to
+                // FrameQueue. prodGap measures the interval between frame
+                // publications. Neither value feeds back into pacing.
                 double paceErr = (e.paceTarget > 0 && e.paceWake > 0) ?
                                  (e.paceWake - e.paceTarget) * 1000.0 / freq : 0.0;
 
@@ -1339,12 +1355,14 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 bool presentStalled = (dpresent > 0.0 && fabs(presentErr) > 2.0);
 
                 _ftprintf(f,
-                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
+                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  pace->prod=%6.2f  prodGap=%7.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
                         e.frameNum,
                         (unsigned __int64)e.emuFrame,
                         dprod,
                         paceErr,
                         (int)e.paceSource,
+                        dpace2prod,
+                        dprodGap,
                         dgap, (gapStalled ? _T("*") : _T(" ")),
                         (e.t0 > 0 && e.t2 >= e.t0) ? (e.t2 - e.t0) * 1000.0 / freq : 0.0,
                         dpresent, (presentStalled ? _T("*") : _T(" ")),
