@@ -355,9 +355,33 @@ static bool           g_VSyncActive = false;
 static LARGE_INTEGER  g_PaceEpochQPC = {0, 0};
 static ULONGLONG      g_PaceFrameIndex = 0;
 
+// P61 presentation-feedback clock. The render thread reports the actual
+// post-presentation boundary after SwapBuffers -> DwmFlush (or after
+// SwapBuffers alone in paths without DWM). The emulation pacer uses this
+// filtered period and a small bounded lead instead of trying to predict the
+// display entirely from an independent software clock.
+static CRITICAL_SECTION g_PresentationCS;
+static bool             g_PresentationCSInit = false;
+static LONGLONG         g_LastPresentationQPC = 0;
+static double           g_PresentationPeriodTicks = 0.0;
+static double           g_PresentationHz = 0.0;
+static double           g_LastPresentationIntervalMs = 0.0;
+static double           g_LastPresentationErrorMs = 0.0;
+static int              g_PresentationGoodSamples = 0;
+static int              g_PresentationBadSamples = 0;
+static bool             g_PresentationLocked = false;
+
+// P61 safety bounds. We deliberately keep the display-feedback correction
+// small: a transient scheduler/DWM anomaly must not move the emulation clock
+// by a full frame or create a second visible cadence.
+static const double P61_PRESENT_FILTER_ALPHA = 0.10;
+static const double P61_PRESENT_ERROR_LIMIT_MS = 2.0;
+static const double P61_PHASE_LEAD_MS = 1.50;
+static const double P61_PHASE_LEAD_LIMIT_MS = 0.75;
+
 // ------------------------------------------------------------------
 // Deferred vsync interval (written by Enable/UI thread, applied by
-// NES thread in ApplyPendingVSync inside GL_DrawFrame).
+// NES/render thread in ApplyPendingVSync inside GL_DrawFrame).
 // ------------------------------------------------------------------
 static volatile LONG  g_PendingVSyncInterval = -1;
 
@@ -529,6 +553,11 @@ void Init(HWND hwnd)
 {
     g_hWnd = hwnd;
     QueryPerformanceFrequency(&g_QPCFreq);
+    if (!g_PresentationCSInit)
+    {
+        InitializeCriticalSection(&g_PresentationCS);
+        g_PresentationCSInit = true;
+    }
 
     double hz = QueryMonitorHz();
     InterlockedExchange(&g_MonitorHzMilli, (LONG)(hz * 1000.0 + 0.5));
@@ -700,6 +729,125 @@ void ResetState()
     // a fresh QPC epoch so a newly loaded ROM never inherits an old cadence.
     g_PaceEpochQPC.QuadPart = 0;
     g_PaceFrameIndex = 0;
+
+    if (g_PresentationCSInit)
+    {
+        EnterCriticalSection(&g_PresentationCS);
+        g_LastPresentationQPC = 0;
+        g_PresentationPeriodTicks = 0.0;
+        g_PresentationHz = 0.0;
+        g_LastPresentationIntervalMs = 0.0;
+        g_LastPresentationErrorMs = 0.0;
+        g_PresentationGoodSamples = 0;
+        g_PresentationBadSamples = 0;
+        g_PresentationLocked = false;
+        LeaveCriticalSection(&g_PresentationCS);
+    }
+}
+
+void OnPresentationFeedback(LONGLONG qpc)
+{
+    if (!g_Initialized || qpc <= 0 || !g_PresentationCSInit)
+        return;
+
+    double qpcFreq = (double)g_QPCFreq.QuadPart;
+    if (qpcFreq <= 0.0)
+        return;
+
+    EnterCriticalSection(&g_PresentationCS);
+
+    if (g_LastPresentationQPC > 0 && qpc > g_LastPresentationQPC)
+    {
+        double rawMs = (double)(qpc - g_LastPresentationQPC) * 1000.0 / qpcFreq;
+        double nominalHz = GetTargetHz();
+        double nominalMs = (nominalHz > 1.0) ? (1000.0 / nominalHz) : 16.667;
+        double normalizedMs = rawMs;
+
+        // A missed presentation can span 2+ display periods. Do not feed that
+        // multi-period gap into the filtered display clock; use the implied
+        // per-period interval for clock estimation while keeping the raw
+        // interval for diagnostics.
+        if (nominalMs > 0.0 && rawMs > nominalMs * 1.5)
+        {
+            double n = floor(rawMs / nominalMs + 0.5);
+            if (n >= 2.0 && n <= 8.0)
+                normalizedMs = rawMs / n;
+        }
+
+        double errMs = rawMs - nominalMs;
+        g_LastPresentationIntervalMs = rawMs;
+        g_LastPresentationErrorMs = errMs;
+
+        bool sampleGood = fabs(normalizedMs - nominalMs) <= P61_PRESENT_ERROR_LIMIT_MS;
+
+        if (g_PresentationPeriodTicks <= 0.0)
+        {
+            g_PresentationPeriodTicks = normalizedMs * qpcFreq / 1000.0;
+        }
+        else if (sampleGood)
+        {
+            double sampleTicks = normalizedMs * qpcFreq / 1000.0;
+            g_PresentationPeriodTicks +=
+                P61_PRESENT_FILTER_ALPHA * (sampleTicks - g_PresentationPeriodTicks);
+        }
+
+        g_PresentationHz = (g_PresentationPeriodTicks > 0.0)
+                ? qpcFreq / g_PresentationPeriodTicks : 0.0;
+
+        if (sampleGood)
+        {
+            ++g_PresentationGoodSamples;
+            g_PresentationBadSamples = 0;
+            if (g_PresentationGoodSamples >= 6)
+                g_PresentationLocked = true;
+        }
+        else
+        {
+            g_PresentationGoodSamples = 0;
+            ++g_PresentationBadSamples;
+            if (g_PresentationBadSamples >= 3)
+                g_PresentationLocked = false;
+        }
+    }
+
+    g_LastPresentationQPC = qpc;
+    LeaveCriticalSection(&g_PresentationCS);
+}
+
+bool IsPresentationClockLocked()
+{
+    if (!g_PresentationCSInit) return false;
+    EnterCriticalSection(&g_PresentationCS);
+    bool locked = g_PresentationLocked;
+    LeaveCriticalSection(&g_PresentationCS);
+    return locked;
+}
+
+double GetPresentationHz()
+{
+    if (!g_PresentationCSInit) return 0.0;
+    EnterCriticalSection(&g_PresentationCS);
+    double value = g_PresentationHz;
+    LeaveCriticalSection(&g_PresentationCS);
+    return value;
+}
+
+double GetLastPresentationIntervalMs()
+{
+    if (!g_PresentationCSInit) return 0.0;
+    EnterCriticalSection(&g_PresentationCS);
+    double value = g_LastPresentationIntervalMs;
+    LeaveCriticalSection(&g_PresentationCS);
+    return value;
+}
+
+double GetLastPresentationErrorMs()
+{
+    if (!g_PresentationCSInit) return 0.0;
+    EnterCriticalSection(&g_PresentationCS);
+    double value = g_LastPresentationErrorMs;
+    LeaveCriticalSection(&g_PresentationCS);
+    return value;
 }
 
 void SetDwmSyncMode(bool useDwm)
@@ -745,16 +893,6 @@ static HANDLE CreatePaceTimer()
 
 void PaceSlot()
 {
-    // Absolute QPC schedule.  The first call establishes the phase and writes
-    // immediately; every later call targets epoch + N * monitor_period.
-    // Because the target is absolute rather than "previous actual write +
-    // period", a late timer wake-up does NOT become permanent phase drift.
-    if (g_PaceTimer == NULL)
-    {
-        HANDLE ht = CreatePaceTimer();
-        g_PaceTimer = ht ? ht : INVALID_HANDLE_VALUE;
-    }
-
     if (g_QPCFreq.QuadPart <= 0)
     {
         SwitchToThread();
@@ -764,53 +902,111 @@ void PaceSlot()
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
 
-    if (g_PaceEpochQPC.QuadPart == 0)
-    {
-        g_PaceEpochQPC = now;
-        g_PaceFrameIndex = 1;
-        return;
-    }
-
     double targetHz = GetTargetHz();
     if (targetHz <= 0.0)
         targetHz = 60.0;
 
-    double periodTicks = (double)g_QPCFreq.QuadPart / targetHz;
-    if (periodTicks < 1.0)
-        periodTicks = 1.0;
+    double fallbackPeriodTicks = (double)g_QPCFreq.QuadPart / targetHz;
+    if (fallbackPeriodTicks < 1.0)
+        fallbackPeriodTicks = 1.0;
 
-    // Find the next absolute frame boundary. If the emulator is already
-    // behind because of a CPU/GPU/OS stall, skip missed boundaries rather
-    // than waiting an additional frame. This preserves real-time cadence.
-    double targetOffset = (double)g_PaceFrameIndex * periodTicks;
-    LONGLONG targetQPC = g_PaceEpochQPC.QuadPart +
-                         (LONGLONG)(targetOffset + 0.5);
-
-    while (targetQPC <= now.QuadPart)
+    // P61: prefer the filtered presentation-feedback clock once it is locked.
+    // The emulation is intentionally scheduled a small bounded amount before
+    // the next display boundary so the render queue has a fresh frame ready,
+    // without letting the producer run an entire frame ahead of presentation.
+    LONGLONG presentQPC = 0;
+    double presentPeriodTicks = 0.0;
+    bool presentLocked = false;
+    if (g_PresentationCSInit)
     {
-        ++g_PaceFrameIndex;
-        targetOffset = (double)g_PaceFrameIndex * periodTicks;
-        targetQPC = g_PaceEpochQPC.QuadPart +
-                    (LONGLONG)(targetOffset + 0.5);
+        EnterCriticalSection(&g_PresentationCS);
+        presentQPC = g_LastPresentationQPC;
+        presentPeriodTicks = g_PresentationPeriodTicks;
+        presentLocked = g_PresentationLocked;
+        LeaveCriticalSection(&g_PresentationCS);
+    }
+
+    LONGLONG targetQPC = 0;
+    if (presentLocked && presentQPC > 0 && presentPeriodTicks > 0.0)
+    {
+        // A missing render/presentation update means the feedback clock is no
+        // longer authoritative. Fall back to the independent QPC schedule
+        // instead of letting stale feedback make the emulator run flat out.
+        double feedbackAgeMs = (double)(now.QuadPart - presentQPC) * 1000.0 /
+                               (double)g_QPCFreq.QuadPart;
+        if (feedbackAgeMs > (presentPeriodTicks * 3.0 * 1000.0 / (double)g_QPCFreq.QuadPart))
+        {
+            presentLocked = false;
+        }
+    }
+
+    if (presentLocked && presentQPC > 0 && presentPeriodTicks > 0.0)
+    {
+        double leadTicks = (P61_PHASE_LEAD_MS / 1000.0) * (double)g_QPCFreq.QuadPart;
+        if (leadTicks > P61_PHASE_LEAD_LIMIT_MS / 1000.0 * (double)g_QPCFreq.QuadPart)
+            leadTicks = (P61_PHASE_LEAD_LIMIT_MS / 1000.0) * (double)g_QPCFreq.QuadPart;
+
+        targetQPC = presentQPC + (LONGLONG)(presentPeriodTicks - leadTicks + 0.5);
+        if (targetQPC < now.QuadPart)
+        {
+            // We are already late. Do not wait an extra frame; bounded phase
+            // correction is preferable to turning one late frame into two.
+            targetQPC = now.QuadPart;
+        }
+    }
+    else
+    {
+        // QPC-only fallback. This path remains fully absolute, so a late wake
+        // does not create permanent phase drift.
+        if (g_PaceEpochQPC.QuadPart == 0)
+        {
+            g_PaceEpochQPC = now;
+            g_PaceFrameIndex = 1;
+            return;
+        }
+
+        double targetOffset = (double)g_PaceFrameIndex * fallbackPeriodTicks;
+        targetQPC = g_PaceEpochQPC.QuadPart + (LONGLONG)(targetOffset + 0.5);
+        while (targetQPC <= now.QuadPart)
+        {
+            ++g_PaceFrameIndex;
+            targetOffset = (double)g_PaceFrameIndex * fallbackPeriodTicks;
+            targetQPC = g_PaceEpochQPC.QuadPart + (LONGLONG)(targetOffset + 0.5);
+        }
     }
 
     double remainMs = (double)(targetQPC - now.QuadPart) *
                       1000.0 / (double)g_QPCFreq.QuadPart;
 
-    if (remainMs >= 1.0 && g_PaceTimer != INVALID_HANDLE_VALUE)
+    if (remainMs >= 1.0)
     {
-        LARGE_INTEGER due;
-        due.QuadPart = -(LONGLONG)(remainMs * 10000.0);
-        SetWaitableTimer(g_PaceTimer, &due, 0, NULL, NULL, FALSE);
-        WaitForSingleObject(g_PaceTimer, 20);
+        if (g_PaceTimer == NULL)
+        {
+            HANDLE ht = CreatePaceTimer();
+            g_PaceTimer = ht ? ht : INVALID_HANDLE_VALUE;
+        }
+
+        if (g_PaceTimer != INVALID_HANDLE_VALUE)
+        {
+            LARGE_INTEGER due;
+            due.QuadPart = -(LONGLONG)(remainMs * 10000.0);
+            SetWaitableTimer(g_PaceTimer, &due, 0, NULL, NULL, FALSE);
+            WaitForSingleObject(g_PaceTimer, 20);
+        }
+        else
+        {
+            SwitchToThread();
+        }
     }
     else if (remainMs > 0.0)
     {
         SwitchToThread();
     }
 
-    ++g_PaceFrameIndex;
+    if (!presentLocked)
+        ++g_PaceFrameIndex;
 }
+
 
 void PaceFrame()
 {

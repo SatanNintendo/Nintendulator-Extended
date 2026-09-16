@@ -73,11 +73,24 @@ namespace MonitorSync
         // bogus QPC delta.
         void    ResetState ();
 
-        // Switch between DWM-sync mode (windowed) and GL-vsync mode (fullscreen).
+        // Feed back the actual presentation boundary observed by the render
+        // thread. P61 uses this as the authoritative display clock when it
+        // is stable enough; the QPC pacer remains the bounded fallback.
+        void    OnPresentationFeedback (LONGLONG qpc);
+
+        // Presentation feedback diagnostics used by the MMR timing log.
+        bool    IsPresentationClockLocked ();
+        double  GetPresentationHz ();
+        double  GetLastPresentationIntervalMs ();
+        double  GetLastPresentationErrorMs ();
+
+        // Switch between DWM-sync mode and ordinary GL-vsync. P61 uses DWM-sync
+        // only as the post-SwapBuffers presentation boundary in DWM-composited
+        // modes; exclusive fullscreen remains on ordinary GL-vsync.
         // In DWM-sync mode the GL swap interval is set to 0 (no driver vsync)
-        // because DwmFlush() in GL_DrawFrame already synchronises the present
-        // with the monitor composition tick.  Stacking driver vsync on top of
-        // DwmFlush blocks for TWO vblank periods per frame (~33ms at 60Hz),
+        // because P61 calls DwmFlush() AFTER SwapBuffers and uses that boundary
+        // for presentation feedback. Stacking driver vsync on top of DwmFlush
+        // would block for TWO vblank periods per frame (~33ms at 60Hz),
         // halving the effective frame rate to 30fps.
         // useDwm=TRUE  -> post SwapInterval(0), keep g_VSyncActive=true for PaceFrame
         // useDwm=FALSE -> post SwapInterval(1), normal GL-vsync path
@@ -120,17 +133,17 @@ namespace MonitorSync
         // No-op if no change is pending. Safe to call every frame.
         void    ApplyPendingVSync ();
 
-        // P28: DXGI vblank bypass.
+        // Legacy P28 DXGI vblank bypass API. P39 disabled the bypass permanently;
+        // these functions are retained only for compatibility/diagnostics.
         //
         // HasDXGIVBlank() returns true if IDXGIOutput::WaitForVBlank is
         // available on this system (Windows 7+, any dGPU or iGPU with
         // DXGI 1.0 support -- which is essentially every machine since 2009).
         // Call once after Init(); result is cached; never blocks.
         //
-        // WaitForDXGIVBlank() blocks until the next hardware vblank interrupt,
-        // bypassing DWM's composition scheduler entirely.  Call this in
-        // GL_DrawFrame BEFORE SwapBuffers(interval=0).  If DXGI is unavailable
-        // this is a no-op and SwapBuffers(interval=1) handles timing as before.
+        // WaitForDXGIVBlank() is a legacy compatibility API. P39 permanently
+        // disabled the DXGI bypass, so this remains a bounded no-op in the
+        // active MMR path. New presentation code must not call it.
         //
         // P36 (session 13): as of GFX.cpp's GL_DrawFrame, this is called
         // in BOTH windowed and fullscreen mode whenever MMR is active. It
