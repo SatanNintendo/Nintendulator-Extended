@@ -68,7 +68,7 @@ static PFN_DwmFlush s_pfnDwmFlush = reinterpret_cast<PFN_DwmFlush>(1); // 1 = no
 // GL_DrawFrame already anticipated and built a fix for. Re-enabling it is
 // scoped to windowed mode only (see the `if (MatchMonitorRate &&
 // !Fullscreen)` guard at its use site) -- fullscreen is untouched.
-#define USE_DWMFLUSH 1
+#define USE_DWMFLUSH 0
 
 // After a fullscreen<->windowed transition, DWM restarts its composition
 // pipeline. The first DwmFlush() calls during this warm-up period can block
@@ -1830,9 +1830,9 @@ static void GL_DrawFrame(void)
         }
 #endif // USE_DWMFLUSH
 
-        // Submit the rendered frame exactly once. The vblank wait and
-        // optional DwmFlush presentation feedback are handled by the
-        // single SwapBuffers() path above.
+        // Submit exactly one frame per draw call. MMR presentation pacing is
+        // provided by MonitorSync/GL swap interval; MMR OFF leaves OpenGL
+        // presentation unsynchronised (normal emulator behaviour).
 
 }
 

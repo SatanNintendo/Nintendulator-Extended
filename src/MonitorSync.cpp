@@ -380,14 +380,7 @@ static volatile LONG     g_PresentationIntervalErrUs = 0;
 // Deferred vsync interval (written by Enable/UI thread, applied by
 // NES thread in ApplyPendingVSync inside GL_DrawFrame).
 // ------------------------------------------------------------------
-// Default presentation mode when MMR is OFF: keep normal OpenGL
-// double-buffer presentation synchronized to the display vblank. The
-// previous -1 initialization meant that a fresh session with MMR disabled
-// never issued wglSwapIntervalEXT(1) at all; on drivers whose default is
-// interval=0 this produced visible tearing, especially in fullscreen.
-// MMR::Enable(TRUE) still replaces this with its selected interval (0 or 1),
-// and Enable(FALSE) explicitly restores 1 as before.
-static volatile LONG  g_PendingVSyncInterval = 1;
+static volatile LONG  g_PendingVSyncInterval = -1;
 
 // DWM-sync mode: interval=0 but g_VSyncActive stays true.
 static volatile LONG  g_DwmSyncMode = 0;
@@ -625,7 +618,14 @@ void Enable(BOOL on)
     }
     else
     {
-        InterlockedExchange(&g_PendingVSyncInterval, 1L);
+        // MMR OFF must return to the emulator's normal presentation mode.
+        // Do not force OpenGL to wait for the monitor here: that would make
+        // the supposedly independent 60.0988/50.0 Hz emulator cadence follow
+        // the display refresh and can create the exact periodic judder MMR is
+        // intended to eliminate.  interval=0 is the standard unsynchronised
+        // OpenGL path; the emulator/audio timing remains responsible for its
+        // own cadence.
+        InterlockedExchange(&g_PendingVSyncInterval, 0L);
         g_VSyncActive = false;
         g_PaceEpochQPC.QuadPart = 0;
         g_PaceFrameIndex = 0;
