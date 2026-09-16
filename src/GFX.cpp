@@ -589,7 +589,8 @@ static void ApplyPendingResize()
 // ============================================================
 // Per-frame timing diagnostics (active when MatchMonitorRate is on).
 //
-// Each frame we record QPC timestamps at 5 checkpoints:
+// Each frame we record QPC timestamps across the emulation/render hand-off, GL,
+// presentation and DWM stages:
 //   t0 = entry to GL_DrawFrame (after palette conversion)
 //   t1 = after glTexSubImage2D
 //   t2 = after SwapBuffers (= vblank wakeup)
@@ -657,6 +658,16 @@ struct FrameTimingEntry {
         LONG     dwmValid;
         LONG     dwmSource; // 1=window handle, 0=NULL/system, -1=query failed
         LONG     dwmHr;
+        // P71: passive producer/render hand-off diagnostics.
+        LONGLONG fqProduceQPC;
+        LONGLONG fqProduceCsEnterQPC;
+        LONGLONG fqProduceCsLeaveQPC;
+        LONGLONG fqSignalQPC;
+        LONGLONG fqWaitReturnQPC;
+        LONGLONG fqConsumeBeginQPC;
+        LONGLONG fqConsumeCsEnterQPC;
+        LONGLONG fqConsumeCsLeaveQPC;
+        LONGLONG fqConsumeEndQPC;
         DWORD    frameNum;  // render/diagnostic sequence
 };
 static FrameTimingEntry s_diagBuf[DIAG_FRAMES];
@@ -695,6 +706,16 @@ struct FQ_Packet {
         LONG          fqSkipped;
         LONG          fqDepth;
         LONG          paceSource;
+        // P71: diagnostic-only queue/thread hand-off timestamps.
+        LONGLONG      fqProduceQPC;
+        LONGLONG      fqProduceCsEnterQPC;
+        LONGLONG      fqProduceCsLeaveQPC;
+        LONGLONG      fqSignalQPC;
+        LONGLONG      fqWaitReturnQPC;
+        LONGLONG      fqConsumeBeginQPC;
+        LONGLONG      fqConsumeCsEnterQPC;
+        LONGLONG      fqConsumeCsLeaveQPC;
+        LONGLONG      fqConsumeEndQPC;
 };
 
 static FQ_Packet s_FQ_Buf[FQ_SLOTS];
@@ -748,24 +769,27 @@ static void FQ_Produce(const unsigned char *src)
         LARGE_INTEGER qpc;
         QueryPerformanceCounter(&qpc);
         ULONGLONG frameSeq = ++s_FQEmuFrameCounter;
+        int slot = s_FQ_Head;
 
+        s_FQ_Buf[slot].fqProduceQPC = qpc.QuadPart;
         EnterCriticalSection(&s_FQ_CS);
-        memcpy(s_FQ_Buf[s_FQ_Head].pixels, src, FQ_FRAME_SIZE);
-        s_FQ_Buf[s_FQ_Head].producedQPC = qpc.QuadPart;
-        // P67: snapshot the pacing timestamps belonging to this emulation
-        // frame. This is diagnostic-only; none of these values feeds back into
-        // PaceSlot() or changes queue/presentation behaviour.
-        s_FQ_Buf[s_FQ_Head].paceTargetQPC = MonitorSync::GetLastPaceTargetQPC();
-        s_FQ_Buf[s_FQ_Head].paceWakeQPC = MonitorSync::GetLastPaceWakeQPC();
-        s_FQ_Buf[s_FQ_Head].paceSource = MonitorSync::WasLastPacePresentationAnchored() ? 1 : 0;
-        s_FQ_Buf[s_FQ_Head].emuFrame = frameSeq;
-        s_FQ_Buf[s_FQ_Head].fqSkipped = 0;
-        s_FQ_Buf[s_FQ_Head].fqDepth = 0;
+        QueryPerformanceCounter(&qpc);
+        s_FQ_Buf[slot].fqProduceCsEnterQPC = qpc.QuadPart;
+        memcpy(s_FQ_Buf[slot].pixels, src, FQ_FRAME_SIZE);
+        QueryPerformanceCounter(&qpc);
+        s_FQ_Buf[slot].producedQPC = qpc.QuadPart;
+        s_FQ_Buf[slot].paceTargetQPC = MonitorSync::GetLastPaceTargetQPC();
+        s_FQ_Buf[slot].paceWakeQPC = MonitorSync::GetLastPaceWakeQPC();
+        s_FQ_Buf[slot].paceSource = MonitorSync::WasLastPacePresentationAnchored() ? 1 : 0;
+        s_FQ_Buf[slot].emuFrame = frameSeq;
+        s_FQ_Buf[slot].fqSkipped = 0;
+        s_FQ_Buf[slot].fqDepth = 0;
+        QueryPerformanceCounter(&qpc);
+        s_FQ_Buf[slot].fqProduceCsLeaveQPC = qpc.QuadPart;
         s_FQ_Head = (s_FQ_Head + 1) % FQ_SLOTS;
 
         if (s_FQ_Count >= FQ_SLOTS)
         {
-                // Overwrite oldest.
                 s_FQ_Tail = (s_FQ_Tail + 1) % FQ_SLOTS;
                 InterlockedIncrement(&s_FQOverflowDrops);
         }
@@ -775,18 +799,28 @@ static void FQ_Produce(const unsigned char *src)
         }
         LeaveCriticalSection(&s_FQ_CS);
 
+        QueryPerformanceCounter(&qpc);
+        s_FQ_Buf[slot].fqSignalQPC = qpc.QuadPart;
         if (s_FrameEvent) SetEvent(s_FrameEvent);
 }
 
 // Consumer (render thread): get the newest available frame. If several frames
 // are queued, discard older ones, but retain exact metadata for the frame that
 // is actually presented.
-static const FQ_Packet *FQ_Consume(LONG *skipped, LONG *depth)
+static const FQ_Packet *FQ_Consume(LONG *skipped, LONG *depth, LONGLONG waitReturnQPC)
 {
         if (skipped) *skipped = 0;
         if (depth) *depth = 0;
 
+        LARGE_INTEGER qpc;
+        QueryPerformanceCounter(&qpc);
+        LONGLONG consumeBeginQPC = qpc.QuadPart;
+        LONGLONG consumeCsEnterQPC = 0;
+        LONGLONG consumeCsLeaveQPC = 0;
+
         EnterCriticalSection(&s_FQ_CS);
+        QueryPerformanceCounter(&qpc);
+        consumeCsEnterQPC = qpc.QuadPart;
         if (s_FQ_Count <= 0)
         {
                 LeaveCriticalSection(&s_FQ_CS);
@@ -800,20 +834,26 @@ static const FQ_Packet *FQ_Consume(LONG *skipped, LONG *depth)
         if (queued > 1)
                 InterlockedExchangeAdd(&s_FQSkippedFrames, queued - 1);
 
-        // Skip to the newest queued frame.
         while (s_FQ_Count > 1)
         {
                 s_FQ_Tail = (s_FQ_Tail + 1) % FQ_SLOTS;
                 s_FQ_Count--;
         }
 
-        memcpy(&s_FQ_ConsumeCopy, &s_FQ_Buf[s_FQ_Tail],
-               sizeof(s_FQ_ConsumeCopy));
+        memcpy(&s_FQ_ConsumeCopy, &s_FQ_Buf[s_FQ_Tail], sizeof(s_FQ_ConsumeCopy));
         s_FQ_ConsumeCopy.fqSkipped = queued - 1;
         s_FQ_ConsumeCopy.fqDepth = queued;
         s_FQ_Tail = (s_FQ_Tail + 1) % FQ_SLOTS;
         s_FQ_Count--;
+        QueryPerformanceCounter(&qpc);
+        consumeCsLeaveQPC = qpc.QuadPart;
         LeaveCriticalSection(&s_FQ_CS);
+        QueryPerformanceCounter(&qpc);
+        s_FQ_ConsumeCopy.fqWaitReturnQPC = waitReturnQPC;
+        s_FQ_ConsumeCopy.fqConsumeBeginQPC = consumeBeginQPC;
+        s_FQ_ConsumeCopy.fqConsumeCsEnterQPC = consumeCsEnterQPC;
+        s_FQ_ConsumeCopy.fqConsumeCsLeaveQPC = consumeCsLeaveQPC;
+        s_FQ_ConsumeCopy.fqConsumeEndQPC = qpc.QuadPart;
         return &s_FQ_ConsumeCopy;
 }
 
@@ -879,6 +919,15 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 s_diagBuf[idx].dwmValid = 0;
                 s_diagBuf[idx].dwmSource = -1;
                 s_diagBuf[idx].dwmHr = 0;
+                s_diagBuf[idx].fqProduceQPC = packet ? packet->fqProduceQPC : 0;
+                s_diagBuf[idx].fqProduceCsEnterQPC = packet ? packet->fqProduceCsEnterQPC : 0;
+                s_diagBuf[idx].fqProduceCsLeaveQPC = packet ? packet->fqProduceCsLeaveQPC : 0;
+                s_diagBuf[idx].fqSignalQPC = packet ? packet->fqSignalQPC : 0;
+                s_diagBuf[idx].fqWaitReturnQPC = packet ? packet->fqWaitReturnQPC : 0;
+                s_diagBuf[idx].fqConsumeBeginQPC = packet ? packet->fqConsumeBeginQPC : 0;
+                s_diagBuf[idx].fqConsumeCsEnterQPC = packet ? packet->fqConsumeCsEnterQPC : 0;
+                s_diagBuf[idx].fqConsumeCsLeaveQPC = packet ? packet->fqConsumeCsLeaveQPC : 0;
+                s_diagBuf[idx].fqConsumeEndQPC = packet ? packet->fqConsumeEndQPC : 0;
                 s_diagBuf[idx].emuFrame = packet ? packet->emuFrame : 0;
                 s_diagBuf[idx].fqSkipped = packet ? packet->fqSkipped : 0;
                 s_diagBuf[idx].fqDepth = packet ? packet->fqDepth : 0;
@@ -1132,12 +1181,14 @@ static DWORD WINAPI RenderThreadProc(void *)
         while (!InterlockedExchangeAdd(&s_RenderThreadStop, 0))
         {
                 DWORD wait = WaitForSingleObject(s_FrameEvent, INFINITE);
+                LARGE_INTEGER waitQpc;
+                QueryPerformanceCounter(&waitQpc);
                 if (wait != WAIT_OBJECT_0)
                         continue;
                 if (InterlockedExchangeAdd(&s_RenderThreadStop, 0))
                         break;
 
-                const FQ_Packet *packet = FQ_Consume(NULL, NULL);
+                const FQ_Packet *packet = FQ_Consume(NULL, NULL, waitQpc.QuadPart);
                 if (packet)
                 {
                         // P64: do not add a software phase wait in front of
@@ -1304,7 +1355,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         _ftprintf(f, _T("FrameQueue counters: overflow_drop=%ld, latest_wins_skip=%ld\n"),
                 (long)InterlockedExchangeAdd(&s_FQOverflowDrops, 0),
                 (long)InterlockedExchangeAdd(&s_FQSkippedFrames, 0));
-        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | pace->produce | prodGap | renderGap | consume->present | presentInterval | presentErr | dwmDispInt | dwmLate | dwmSrc | dwmHr | dwmFrame | dwmRefresh | dwmVBlankInt | dwmComposeInt | dwmLateCount | dwmOutstanding | dwmUnique | dwmAvail | dwmMiss | dwmDrop | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
+        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | pace->produce | prodGap | renderGap | consume->present | presentInterval | presentErr | fqP2C | fqPcs | fqCcs | fqSched | fqCS2 | fqPHold | fqCHold | fqSigWait | render2t0 | submit2dwm | dwmDispInt | dwmFrameStep | dwmMissStep | dwmDropStep | dwmLateStep | dwmLate | dwmSrc | dwmHr | dwmFrame | dwmRefresh | dwmVBlankInt | dwmComposeInt | dwmLateCount | dwmOutstanding | dwmUnique | dwmAvail | dwmMiss | dwmDrop | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
 
         // P43 (session 20): t0->t4 only spans GL_DrawFrame+OnFrameEnd+
         // UpdateDRC -- the video-draw slice of a frame. It does NOT cover
@@ -1332,6 +1383,9 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         LONGLONG prevDwmVBlank = 0;
         LONGLONG prevDwmCompose = 0;
         ULONGLONG prevDwmFrameDisplayed = 0;
+        ULONGLONG prevDwmMiss = 0;
+        ULONGLONG prevDwmDrop = 0;
+        ULONGLONG prevDwmLate = 0;
         bool     havePrevT0 = false;
         bool     havePrevT2 = false;
         bool     havePrevTProd = false;
@@ -1381,12 +1435,30 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 // emulation pacing wake-up happened after its target.
                 double paceErr = (e.paceTarget > 0 && e.paceWake > 0) ?
                                  (e.paceWake - e.paceTarget) * 1000.0 / freq : 0.0;
+                double fqP2C = (e.fqWaitReturnQPC > 0 && e.fqProduceQPC > 0) ? (e.fqWaitReturnQPC - e.fqProduceQPC) * 1000.0 / freq : 0.0;
+                double fqPcs = (e.fqProduceCsEnterQPC > 0 && e.fqProduceQPC > 0) ? (e.fqProduceCsEnterQPC - e.fqProduceQPC) * 1000.0 / freq : 0.0;
+                double fqCcs = (e.fqConsumeCsEnterQPC > 0 && e.fqConsumeBeginQPC > 0) ? (e.fqConsumeCsEnterQPC - e.fqConsumeBeginQPC) * 1000.0 / freq : 0.0;
+                double fqSched = (e.fqConsumeBeginQPC > 0 && e.fqWaitReturnQPC > 0) ? (e.fqConsumeBeginQPC - e.fqWaitReturnQPC) * 1000.0 / freq : 0.0;
+                double fqCS2 = (e.fqConsumeEndQPC > 0 && e.fqConsumeCsLeaveQPC > 0) ? (e.fqConsumeEndQPC - e.fqConsumeCsLeaveQPC) * 1000.0 / freq : 0.0;
+                double fqPHold = (e.fqProduceCsLeaveQPC > 0 && e.fqProduceCsEnterQPC > 0) ? (e.fqProduceCsLeaveQPC - e.fqProduceCsEnterQPC) * 1000.0 / freq : 0.0;
+                double fqCHold = (e.fqConsumeCsLeaveQPC > 0 && e.fqConsumeCsEnterQPC > 0) ? (e.fqConsumeCsLeaveQPC - e.fqConsumeCsEnterQPC) * 1000.0 / freq : 0.0;
+                double fqSigWait = (e.fqWaitReturnQPC > 0 && e.fqSignalQPC > 0) ? (e.fqWaitReturnQPC - e.fqSignalQPC) * 1000.0 / freq : 0.0;
+                double render2t0 = (e.fqConsumeEndQPC > 0 && e.t0 > 0) ? (e.t0 - e.fqConsumeEndQPC) * 1000.0 / freq : 0.0;
+                double submit2dwm = (e.dwmDisplayed > 0 && e.t2 > 0) ? (e.dwmDisplayed - e.t2) * 1000.0 / freq : 0.0;
                 double dwmDispInt = (e.dwmValid && havePrevDwm && e.dwmDisplayed > prevDwmDisplayed) ?
                                     (e.dwmDisplayed - prevDwmDisplayed) * 1000.0 / freq : 0.0;
                 double dwmVBlankInt = (e.dwmValid && havePrevDwm && e.dwmVBlank > prevDwmVBlank) ?
                                     (e.dwmVBlank - prevDwmVBlank) * 1000.0 / freq : 0.0;
                 double dwmComposeInt = (e.dwmValid && havePrevDwm && e.dwmCompose > prevDwmCompose) ?
                                     (e.dwmCompose - prevDwmCompose) * 1000.0 / freq : 0.0;
+                long long dwmFrameStep = (e.dwmValid && havePrevDwm) ?
+                                    (long long)e.dwmFrameDisplayed - (long long)prevDwmFrameDisplayed : 0;
+                long long dwmMissStep = (e.dwmValid && havePrevDwm) ?
+                                    (long long)e.dwmFramesMissed - (long long)prevDwmMissed : 0;
+                long long dwmDropStep = (e.dwmValid && havePrevDwm) ?
+                                    (long long)e.dwmFramesDropped - (long long)prevDwmDrop : 0;
+                long long dwmLateStep = (e.dwmValid && havePrevDwm) ?
+                                    (long long)e.dwmFramesLate - (long long)prevDwmLate : 0;
                 bool dwmLate = (e.dwmValid && havePrevDwm && e.dwmFrameDisplayed == prevDwmFrameDisplayed);
                 if (e.dwmValid)
                 {
@@ -1394,6 +1466,9 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                         prevDwmVBlank = e.dwmVBlank;
                         prevDwmCompose = e.dwmCompose;
                         prevDwmFrameDisplayed = e.dwmFrameDisplayed;
+                        prevDwmMiss = e.dwmFramesMissed;
+                        prevDwmDrop = e.dwmFramesDropped;
+                        prevDwmLate = e.dwmFramesLate;
                         havePrevDwm = true;
                 }
 
@@ -1411,7 +1486,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 bool presentStalled = (dpresent > 0.0 && fabs(presentErr) > 2.0);
 
                 _ftprintf(f,
-                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  pace->prod=%6.2f  prodGap=%7.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  dwmDisp=%7.2f  dwmLate=%d  dwmSrc=%d  dwmHr=0x%08lX  dwmFrame=%I64u  dwmRefresh=%I64u  dwmVBlankInt=%7.2f  dwmComposeInt=%7.2f  dwmLateCount=%I64u  dwmOutstanding=%I64u  dwmUnique=%I64u  dwmAvail=%I64u  dwmMiss=%I64u  dwmDrop=%I64u  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
+                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  pace->prod=%6.2f  prodGap=%7.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fqP2C=%6.2f  fqPcs=%5.2f  fqCcs=%5.2f  fqSched=%6.2f  fqCS2=%5.2f  fqPHold=%5.2f  fqCHold=%5.2f  fqSigWait=%6.2f  render2t0=%6.2f  submit2dwm=%7.2f  dwmDisp=%7.2f  dwmFrameStep=%2lld  dwmMissStep=%2lld  dwmDropStep=%2lld  dwmLateStep=%2lld  dwmLate=%d  dwmSrc=%d  dwmHr=0x%08lX  dwmFrame=%I64u  dwmRefresh=%I64u  dwmVBlankInt=%7.2f  dwmComposeInt=%7.2f  dwmLateCount=%I64u  dwmOutstanding=%I64u  dwmUnique=%I64u  dwmAvail=%I64u  dwmMiss=%I64u  dwmDrop=%I64u  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
                         e.frameNum,
                         (unsigned __int64)e.emuFrame,
                         dprod,
@@ -1423,7 +1498,21 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                         (e.t0 > 0 && e.t2 >= e.t0) ? (e.t2 - e.t0) * 1000.0 / freq : 0.0,
                         dpresent, (presentStalled ? _T("*") : _T(" ")),
                         presentErr,
+                        fqP2C,
+                        fqPcs,
+                        fqCcs,
+                        fqSched,
+                        fqCS2,
+                        fqPHold,
+                        fqCHold,
+                        fqSigWait,
+                        render2t0,
+                        submit2dwm,
                         dwmDispInt,
+                        dwmFrameStep,
+                        dwmMissStep,
+                        dwmDropStep,
+                        dwmLateStep,
                         dwmLate ? 1 : 0,
                         (int)e.dwmSource,
                         (unsigned long)(e.dwmHr),
