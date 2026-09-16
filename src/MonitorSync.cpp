@@ -381,7 +381,7 @@ static volatile LONG     g_PresentationIntervalErrUs = 0;
 // NES thread in ApplyPendingVSync inside GL_DrawFrame).
 // ------------------------------------------------------------------
 // Default presentation mode when MMR is OFF: keep normal OpenGL
-double-buffer presentation synchronized to the display vblank. The
+// double-buffer presentation synchronized to the display vblank. The
 // previous -1 initialization meant that a fresh session with MMR disabled
 // never issued wglSwapIntervalEXT(1) at all; on drivers whose default is
 // interval=0 this produced visible tearing, especially in fullscreen.
