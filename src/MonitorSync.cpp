@@ -378,8 +378,8 @@ static bool             g_PacingWasPresentationLocked = false;
 // by a full frame or create a second visible cadence.
 static const double P61_PRESENT_FILTER_ALPHA = 0.10;
 static const double P61_PRESENT_ERROR_LIMIT_MS = 2.0;
-static const double P61_PHASE_LEAD_MS = 1.50;
-static const double P61_PHASE_LEAD_LIMIT_MS = 0.75;
+static const double P61_PHASE_LEAD_MS = 2.50;
+static const double P61_PHASE_LEAD_LIMIT_MS = 2.50;
 
 // ------------------------------------------------------------------
 // Deferred vsync interval (written by Enable/UI thread, applied by
@@ -804,20 +804,21 @@ void OnPresentationFeedback(LONGLONG qpc)
             g_PresentationBadSamples = 0;
             if (g_PresentationGoodSamples >= 6)
             {
-                if (!g_PresentationLocked)
-                {
-                    // Start a monotonically advancing producer schedule from
-                    // the presentation boundary. Do not derive every PaceSlot
-                    // from g_LastPresentationQPC: multiple producer calls can
-                    // otherwise observe the same presentation timestamp and
-                    // run back-to-back without waiting.
-                    double leadTicks = (P61_PHASE_LEAD_MS / 1000.0) * qpcFreq;
-                    double leadLimitTicks = (P61_PHASE_LEAD_LIMIT_MS / 1000.0) * qpcFreq;
-                    if (leadTicks > leadLimitTicks)
-                        leadTicks = leadLimitTicks;
-                    g_PresentationNextTargetQPC = qpc +
-                            (LONGLONG)(g_PresentationPeriodTicks - leadTicks + 0.5);
-                }
+                // Every accepted presentation is a real phase boundary.
+                // Re-anchor the producer's NEXT target here, rather than
+                // allowing an old target schedule to drift after a missed
+                // vblank. The producer still advances monotonically between
+                // feedback events, so repeated PaceSlot() calls cannot run
+                // back-to-back on the same timestamp.
+                double leadTicks = (P61_PHASE_LEAD_MS / 1000.0) * qpcFreq;
+                double leadLimitTicks = (P61_PHASE_LEAD_LIMIT_MS / 1000.0) * qpcFreq;
+                if (leadTicks > leadLimitTicks)
+                    leadTicks = leadLimitTicks;
+
+                double nextTicks = qpc + g_PresentationPeriodTicks - leadTicks;
+                if (nextTicks < (double)qpc + 0.25 * g_PresentationPeriodTicks)
+                    nextTicks = (double)qpc + 0.25 * g_PresentationPeriodTicks;
+                g_PresentationNextTargetQPC = (LONGLONG)(nextTicks + 0.5);
                 g_PresentationLocked = true;
             }
         }
@@ -969,8 +970,10 @@ void PaceSlot()
                 double leadLimitTicks = (P61_PHASE_LEAD_LIMIT_MS / 1000.0) * (double)g_QPCFreq.QuadPart;
                 if (leadTicks > leadLimitTicks)
                     leadTicks = leadLimitTicks;
-                g_PresentationNextTargetQPC = g_LastPresentationQPC +
-                        (LONGLONG)(presentPeriodTicks - leadTicks + 0.5);
+                double nextTicks = (double)g_LastPresentationQPC + presentPeriodTicks - leadTicks;
+                if (nextTicks < (double)g_LastPresentationQPC + 0.25 * presentPeriodTicks)
+                    nextTicks = (double)g_LastPresentationQPC + 0.25 * presentPeriodTicks;
+                g_PresentationNextTargetQPC = (LONGLONG)(nextTicks + 0.5);
             }
             targetQPC = g_PresentationNextTargetQPC;
         }
