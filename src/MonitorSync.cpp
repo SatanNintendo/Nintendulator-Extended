@@ -355,6 +355,12 @@ static bool           g_VSyncActive = false;
 static LARGE_INTEGER  g_PaceEpochQPC = {0, 0};
 static ULONGLONG      g_PaceFrameIndex = 0;
 
+// Pace diagnostics used by GFX.cpp. These values are diagnostic-only and
+// never participate in pacing decisions.
+static volatile LONGLONG g_LastPaceTargetQPC = 0;
+static volatile LONGLONG g_LastPaceWakeQPC   = 0;
+static volatile LONG     g_LastPaceSource   = 0; // 1=presentation, 0=fallback
+
 // P60: display-presentation feedback clock.
 //
 // PaceSlot() used to run entirely from an independent QPC schedule. That gave
@@ -572,6 +578,9 @@ void OnDisplayChange()
     InterlockedExchange(&g_PresentationClockLocked, FALSE);
     InterlockedExchange(&g_PresentationHzMilli, 0);
     InterlockedExchange(&g_PresentationIntervalErrUs, 0);
+    InterlockedExchange64(&g_LastPaceTargetQPC, 0);
+    InterlockedExchange64(&g_LastPaceWakeQPC, 0);
+    InterlockedExchange(&g_LastPaceSource, 0);
 }
 
 void Enable(BOOL on)
@@ -744,6 +753,9 @@ void ResetState()
     InterlockedExchange(&g_PresentationClockLocked, FALSE);
     InterlockedExchange(&g_PresentationHzMilli, 0);
     InterlockedExchange(&g_PresentationIntervalErrUs, 0);
+    InterlockedExchange64(&g_LastPaceTargetQPC, 0);
+    InterlockedExchange64(&g_LastPaceWakeQPC, 0);
+    InterlockedExchange(&g_LastPaceSource, 0);
 }
 
 void SetDwmSyncMode(bool useDwm)
@@ -785,6 +797,13 @@ static HANDLE CreatePaceTimer()
     if (!ht)
         ht = CreateWaitableTimer(NULL, FALSE, NULL);
     return ht;
+}
+
+static void RecordPaceDiagnostic(LONGLONG targetQPC, LONGLONG wakeQPC, LONG source)
+{
+    InterlockedExchange64(&g_LastPaceTargetQPC, targetQPC);
+    InterlockedExchange64(&g_LastPaceWakeQPC, wakeQPC);
+    InterlockedExchange(&g_LastPaceSource, source);
 }
 
 void PaceSlot()
@@ -866,6 +885,10 @@ void PaceSlot()
                 {
                     SwitchToThread();
                 }
+
+                LARGE_INTEGER paceWake;
+                QueryPerformanceCounter(&paceWake);
+                RecordPaceDiagnostic(targetQPC, paceWake.QuadPart, 1);
                 return;
             }
         }
@@ -882,6 +905,7 @@ void PaceSlot()
     {
         g_PaceEpochQPC = now;
         g_PaceFrameIndex = 1;
+        RecordPaceDiagnostic(now.QuadPart, now.QuadPart, 0);
         return;
     }
 
@@ -925,7 +949,26 @@ void PaceSlot()
         SwitchToThread();
     }
 
+    LARGE_INTEGER paceWake;
+    QueryPerformanceCounter(&paceWake);
+    RecordPaceDiagnostic(targetQPC, paceWake.QuadPart, 0);
+
     ++g_PaceFrameIndex;
+}
+
+LONGLONG GetLastPaceTargetQPC()
+{
+    return InterlockedExchangeAdd64(&g_LastPaceTargetQPC, 0);
+}
+
+LONGLONG GetLastPaceWakeQPC()
+{
+    return InterlockedExchangeAdd64(&g_LastPaceWakeQPC, 0);
+}
+
+bool WasLastPacePresentationAnchored()
+{
+    return InterlockedExchangeAdd(&g_LastPaceSource, 0) != 0;
 }
 
 void NotifyFramePresented(LONGLONG qpcPresented)
