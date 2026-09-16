@@ -720,6 +720,11 @@ struct FQ_Packet {
         LONGLONG      fqConsumeCsEnterQPC;
         LONGLONG      fqConsumeCsLeaveQPC;
         LONGLONG      fqConsumeEndQPC;
+        // P73: diagnostic-only producer/emulation trace copied through the queue.
+        LONGLONG      mmrRunEnterQPC, mmrPaceEnterQPC, mmrPaceWakeQPC;
+        LONGLONG      mmrPaceCpuWake100ns, mmrSafetyBeginQPC, mmrSafetyEndQPC;
+        LONG          mmrSafetyLoops, mmrPaceTimerUsed;
+        LONGLONG      mmrTraceSeq, prodCpuEnd100ns;
 };
 
 static FQ_Packet s_FQ_Buf[FQ_SLOTS];
