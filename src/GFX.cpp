@@ -71,7 +71,7 @@ static PFN_DwmGetCompositionTimingInfo s_pfnDwmGetCompositionTimingInfo = reinte
 // GL_DrawFrame already anticipated and built a fix for. Re-enabling it is
 // scoped to windowed mode only (see the `if (MatchMonitorRate &&
 // !Fullscreen)` guard at its use site) -- fullscreen is untouched.
-#define USE_DWMFLUSH 1
+#define USE_DWMFLUSH 0
 
 // After a fullscreen<->windowed transition, DWM restarts its composition
 // pipeline. The first DwmFlush() calls during this warm-up period can block
