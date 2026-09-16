@@ -642,10 +642,21 @@ struct FrameTimingEntry {
         LONG     fqDepth;   // queue depth observed at consume time
         LONG     paceSource;// P67: 1=presentation anchor, 0=QPC fallback
         LONGLONG dwmDisplayed;
+        LONGLONG dwmVBlank;
+        LONGLONG dwmRefreshPeriod;
+        LONGLONG dwmCompose;
+        ULONGLONG dwmRefresh;
+        ULONGLONG dwmFrame;
         ULONGLONG dwmFrameDisplayed;
+        ULONGLONG dwmFramesLate;
+        ULONGLONG dwmFramesOutstanding;
+        ULONGLONG dwmFramesDisplayed;
+        ULONGLONG dwmFramesAvailable;
         ULONGLONG dwmFramesMissed;
         ULONGLONG dwmFramesDropped;
         LONG     dwmValid;
+        LONG     dwmSource; // 1=window handle, 0=NULL/system, -1=query failed
+        LONG     dwmHr;
         DWORD    frameNum;  // render/diagnostic sequence
 };
 static FrameTimingEntry s_diagBuf[DIAG_FRAMES];
@@ -849,6 +860,25 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 s_diagBuf[idx].paceTarget = packet ? packet->paceTargetQPC : 0;
                 s_diagBuf[idx].paceWake   = packet ? packet->paceWakeQPC : 0;
                 s_diagBuf[idx].paceSource = packet ? packet->paceSource : 0;
+                // P70: initialize every DWM diagnostic field for the new
+                // ring-buffer entry. Without this, a failed DWM query could
+                // leave the previous frame's values marked as valid.
+                s_diagBuf[idx].dwmDisplayed = 0;
+                s_diagBuf[idx].dwmVBlank = 0;
+                s_diagBuf[idx].dwmRefreshPeriod = 0;
+                s_diagBuf[idx].dwmCompose = 0;
+                s_diagBuf[idx].dwmRefresh = 0;
+                s_diagBuf[idx].dwmFrame = 0;
+                s_diagBuf[idx].dwmFrameDisplayed = 0;
+                s_diagBuf[idx].dwmFramesLate = 0;
+                s_diagBuf[idx].dwmFramesOutstanding = 0;
+                s_diagBuf[idx].dwmFramesDisplayed = 0;
+                s_diagBuf[idx].dwmFramesAvailable = 0;
+                s_diagBuf[idx].dwmFramesMissed = 0;
+                s_diagBuf[idx].dwmFramesDropped = 0;
+                s_diagBuf[idx].dwmValid = 0;
+                s_diagBuf[idx].dwmSource = -1;
+                s_diagBuf[idx].dwmHr = 0;
                 s_diagBuf[idx].emuFrame = packet ? packet->emuFrame : 0;
                 s_diagBuf[idx].fqSkipped = packet ? packet->fqSkipped : 0;
                 s_diagBuf[idx].fqDepth = packet ? packet->fqDepth : 0;
@@ -1274,7 +1304,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         _ftprintf(f, _T("FrameQueue counters: overflow_drop=%ld, latest_wins_skip=%ld\n"),
                 (long)InterlockedExchangeAdd(&s_FQOverflowDrops, 0),
                 (long)InterlockedExchangeAdd(&s_FQSkippedFrames, 0));
-        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | pace->produce | prodGap | renderGap | consume->present | presentInterval | presentErr | dwmDispInt | dwmLate | dwmMiss | dwmDrop | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
+        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | pace->produce | prodGap | renderGap | consume->present | presentInterval | presentErr | dwmDispInt | dwmLate | dwmSrc | dwmHr | dwmFrame | dwmRefresh | dwmVBlankInt | dwmComposeInt | dwmLateCount | dwmOutstanding | dwmUnique | dwmAvail | dwmMiss | dwmDrop | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
 
         // P43 (session 20): t0->t4 only spans GL_DrawFrame+OnFrameEnd+
         // UpdateDRC -- the video-draw slice of a frame. It does NOT cover
@@ -1299,6 +1329,8 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         LONGLONG prevT2 = 0;
         LONGLONG prevTProd = 0;
         LONGLONG prevDwmDisplayed = 0;
+        LONGLONG prevDwmVBlank = 0;
+        LONGLONG prevDwmCompose = 0;
         ULONGLONG prevDwmFrameDisplayed = 0;
         bool     havePrevT0 = false;
         bool     havePrevT2 = false;
@@ -1351,10 +1383,16 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                                  (e.paceWake - e.paceTarget) * 1000.0 / freq : 0.0;
                 double dwmDispInt = (e.dwmValid && havePrevDwm && e.dwmDisplayed > prevDwmDisplayed) ?
                                     (e.dwmDisplayed - prevDwmDisplayed) * 1000.0 / freq : 0.0;
+                double dwmVBlankInt = (e.dwmValid && havePrevDwm && e.dwmVBlank > prevDwmVBlank) ?
+                                    (e.dwmVBlank - prevDwmVBlank) * 1000.0 / freq : 0.0;
+                double dwmComposeInt = (e.dwmValid && havePrevDwm && e.dwmCompose > prevDwmCompose) ?
+                                    (e.dwmCompose - prevDwmCompose) * 1000.0 / freq : 0.0;
                 bool dwmLate = (e.dwmValid && havePrevDwm && e.dwmFrameDisplayed == prevDwmFrameDisplayed);
                 if (e.dwmValid)
                 {
                         prevDwmDisplayed = e.dwmDisplayed;
+                        prevDwmVBlank = e.dwmVBlank;
+                        prevDwmCompose = e.dwmCompose;
                         prevDwmFrameDisplayed = e.dwmFrameDisplayed;
                         havePrevDwm = true;
                 }
@@ -1373,7 +1411,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 bool presentStalled = (dpresent > 0.0 && fabs(presentErr) > 2.0);
 
                 _ftprintf(f,
-                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  pace->prod=%6.2f  prodGap=%7.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  dwmDisp=%7.2f  dwmLate=%d  dwmMiss=%I64u  dwmDrop=%I64u  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
+                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  pace->prod=%6.2f  prodGap=%7.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  dwmDisp=%7.2f  dwmLate=%d  dwmSrc=%d  dwmHr=0x%08lX  dwmFrame=%I64u  dwmRefresh=%I64u  dwmVBlankInt=%7.2f  dwmComposeInt=%7.2f  dwmLateCount=%I64u  dwmOutstanding=%I64u  dwmUnique=%I64u  dwmAvail=%I64u  dwmMiss=%I64u  dwmDrop=%I64u  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
                         e.frameNum,
                         (unsigned __int64)e.emuFrame,
                         dprod,
@@ -1387,6 +1425,16 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                         presentErr,
                         dwmDispInt,
                         dwmLate ? 1 : 0,
+                        (int)e.dwmSource,
+                        (unsigned long)(e.dwmHr),
+                        (unsigned __int64)(e.dwmValid ? e.dwmFrame : 0),
+                        (unsigned __int64)(e.dwmValid ? e.dwmRefresh : 0),
+                        dwmVBlankInt,
+                        dwmComposeInt,
+                        (unsigned __int64)(e.dwmValid ? e.dwmFramesLate : 0),
+                        (unsigned __int64)(e.dwmValid ? e.dwmFramesOutstanding : 0),
+                        (unsigned __int64)(e.dwmValid ? e.dwmFramesDisplayed : 0),
+                        (unsigned __int64)(e.dwmValid ? e.dwmFramesAvailable : 0),
                         (unsigned __int64)(e.dwmValid ? e.dwmFramesMissed : 0),
                         (unsigned __int64)(e.dwmValid ? e.dwmFramesDropped : 0),
                         (int)e.fqSkipped, (int)e.fqDepth,
@@ -1559,16 +1607,47 @@ static bool DiagQueryDwmTiming(FrameTimingEntry &e)
                 s_pfnDwmGetCompositionTimingInfo = hDwm ? (PFN_DwmGetCompositionTimingInfo)GetProcAddress(hDwm, "DwmGetCompositionTimingInfo") : NULL;
         }
         if (!s_pfnDwmGetCompositionTimingInfo) return false;
-        DWM_TIMING_INFO ti; ZeroMemory(&ti, sizeof(ti)); ti.cbSize = sizeof(ti);
-        HRESULT hr = s_pfnDwmGetCompositionTimingInfo(NULL, &ti);
-        if (FAILED(hr) && hMainWnd)
+
+        // P70: Windows 7/8-era DWM expects a real HWND for this query,
+        // while Windows 8.1+ requires NULL. Try the actual NES window first
+        // (the important path for the legacy systems this project supports),
+        // then fall back to NULL for newer DWM implementations. This is
+        // diagnostics-only and never affects rendering or pacing.
+        DWM_TIMING_INFO ti;
+        ZeroMemory(&ti, sizeof(ti));
+        ti.cbSize = sizeof(ti);
+        HRESULT hr = E_FAIL;
+        LONG source = -1;
+
+        if (hMainWnd)
         {
-                ZeroMemory(&ti, sizeof(ti)); ti.cbSize = sizeof(ti);
                 hr = s_pfnDwmGetCompositionTimingInfo(hMainWnd, &ti);
+                if (SUCCEEDED(hr)) source = 1;
         }
-        if (FAILED(hr)) return false;
+        if (FAILED(hr))
+        {
+                ZeroMemory(&ti, sizeof(ti));
+                ti.cbSize = sizeof(ti);
+                hr = s_pfnDwmGetCompositionTimingInfo(NULL, &ti);
+                if (SUCCEEDED(hr)) source = 0;
+        }
+
+        e.dwmSource = source;
+        e.dwmHr = (LONG)hr;
+        if (FAILED(hr))
+                return false;
+
         e.dwmDisplayed = (LONGLONG)ti.qpcFrameDisplayed;
+        e.dwmVBlank = (LONGLONG)ti.qpcVBlank;
+        e.dwmRefreshPeriod = (LONGLONG)ti.qpcRefreshPeriod;
+        e.dwmCompose = (LONGLONG)ti.qpcCompose;
+        e.dwmRefresh = (ULONGLONG)ti.cRefresh;
+        e.dwmFrame = (ULONGLONG)ti.cFrame;
         e.dwmFrameDisplayed = (ULONGLONG)ti.cFrameDisplayed;
+        e.dwmFramesLate = (ULONGLONG)ti.cFramesLate;
+        e.dwmFramesOutstanding = (ULONGLONG)ti.cFramesOutstanding;
+        e.dwmFramesDisplayed = (ULONGLONG)ti.cFramesDisplayed;
+        e.dwmFramesAvailable = (ULONGLONG)ti.cFramesAvailable;
         e.dwmFramesMissed = (ULONGLONG)ti.cFramesMissed;
         e.dwmFramesDropped = (ULONGLONG)ti.cFramesDropped;
         e.dwmValid = 1;
@@ -1596,10 +1675,21 @@ static void GL_DrawFrame(void)
                 s_diagBuf[idx].paceWake   = 0;
                 s_diagBuf[idx].paceSource = 0;
                 s_diagBuf[idx].dwmDisplayed = 0;
+                s_diagBuf[idx].dwmVBlank = 0;
+                s_diagBuf[idx].dwmRefreshPeriod = 0;
+                s_diagBuf[idx].dwmCompose = 0;
+                s_diagBuf[idx].dwmRefresh = 0;
+                s_diagBuf[idx].dwmFrame = 0;
                 s_diagBuf[idx].dwmFrameDisplayed = 0;
+                s_diagBuf[idx].dwmFramesLate = 0;
+                s_diagBuf[idx].dwmFramesOutstanding = 0;
+                s_diagBuf[idx].dwmFramesDisplayed = 0;
+                s_diagBuf[idx].dwmFramesAvailable = 0;
                 s_diagBuf[idx].dwmFramesMissed = 0;
                 s_diagBuf[idx].dwmFramesDropped = 0;
                 s_diagBuf[idx].dwmValid = 0;
+                s_diagBuf[idx].dwmSource = -1;
+                s_diagBuf[idx].dwmHr = 0;
                 s_diagBuf[idx].frameNum = s_diagFrameNum;
                 s_diagHead = (s_diagHead + 1) % DIAG_FRAMES;
         }
