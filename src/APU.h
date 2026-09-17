@@ -67,6 +67,10 @@ long    GetAudioSafetyWaits (void);
 long    GetAudioCurrentFreq (void);
 long    GetAudioPlayPending (void);
 long    GetAudioPrimeSlots (void);
+long    GetAudioNotifyActive (void);
+long    GetAudioNotifySignals(void);
+long    GetAudioNotifyPlaySlot(void);
+long    GetAudioNotifyPeriodUs(void);
 
 // P30/P90: dedicated audio-control background thread.
 //

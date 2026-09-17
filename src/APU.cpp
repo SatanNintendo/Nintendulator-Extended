@@ -166,6 +166,16 @@ static LARGE_INTEGER      g_AudioPlayStartQPC = {0};
 static LARGE_INTEGER      g_AudioQPCFreq = {0};
 static volatile LONG     g_AudioPlayStarted = 0L;
 
+// P91: DirectSound position notifications provide the actual consumer phase
+// without recurring GetCurrentPosition IPC and without assuming the audio
+// engine clock is perfectly locked to QPC.
+static HANDLE             g_AudioNotifyEvents[FRAMEBUF] = {0};
+static volatile LONG      g_AudioNotifyActive = 0L;
+static volatile LONG      g_AudioNotifyPlaySlot = 0L;
+static volatile LONG      g_AudioNotifySignals = 0L;
+static volatile LONGLONG  g_AudioLastNotifyQPC = 0;
+static volatile LONG      g_AudioNotifyPeriodUs = 0L;
+
 static unsigned long PredictAudioPlaySlot()
 {
         if (!InterlockedExchangeAdd(&g_AudioPlayStarted, 0L) || LockSize == 0)
@@ -192,6 +202,127 @@ static unsigned long PredictAudioPlaySlot()
 static int AudioLeadSlots(unsigned long playSlot, unsigned long writeSlot)
 {
         return (int)((writeSlot + FRAMEBUF - (playSlot % FRAMEBUF)) % FRAMEBUF);
+}
+
+static void ResetAudioNotifyEvents()
+{
+        for (int i = 0; i < FRAMEBUF; ++i)
+                if (g_AudioNotifyEvents[i])
+                        ResetEvent(g_AudioNotifyEvents[i]);
+}
+
+static void CloseAudioNotifyEvents()
+{
+        for (int i = 0; i < FRAMEBUF; ++i)
+        {
+                if (g_AudioNotifyEvents[i])
+                {
+                        CloseHandle(g_AudioNotifyEvents[i]);
+                        g_AudioNotifyEvents[i] = NULL;
+                }
+        }
+        InterlockedExchange(&g_AudioNotifyActive, 0L);
+}
+
+static bool CreateAudioNotifyEvents()
+{
+        for (int i = 0; i < FRAMEBUF; ++i)
+        {
+                if (!g_AudioNotifyEvents[i])
+                {
+                        g_AudioNotifyEvents[i] = CreateEvent(NULL, FALSE, FALSE, NULL);
+                        if (!g_AudioNotifyEvents[i])
+                        {
+                                CloseAudioNotifyEvents();
+                                return false;
+                        }
+                }
+        }
+        ResetAudioNotifyEvents();
+        return true;
+}
+
+static bool ConfigureAudioNotifications()
+{
+        if (!Buffer || !CreateAudioNotifyEvents() || LockSize == 0)
+                return false;
+
+        LPDIRECTSOUNDNOTIFY notify = NULL;
+        HRESULT hr = Buffer->QueryInterface(IID_IDirectSoundNotify, (LPVOID*)&notify);
+        if (FAILED(hr) || !notify)
+                return false;
+
+        DSBPOSITIONNOTIFY positions[FRAMEBUF];
+        for (int i = 0; i < FRAMEBUF; ++i)
+        {
+                positions[i].dwOffset = (DWORD)(i * LockSize);
+                positions[i].hEventNotify = g_AudioNotifyEvents[i];
+        }
+
+        hr = notify->SetNotificationPositions(FRAMEBUF, positions);
+        notify->Release();
+        if (FAILED(hr))
+                return false;
+
+        InterlockedExchange(&g_AudioNotifyActive, 1L);
+        return true;
+}
+
+static void OnAudioNotifySlot(int slot)
+{
+        if (slot < 0 || slot >= FRAMEBUF)
+                return;
+
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        LONGLONG previousQPC = InterlockedExchange64(&g_AudioLastNotifyQPC, now.QuadPart);
+        if (previousQPC != 0 && g_AudioQPCFreq.QuadPart > 0)
+        {
+                LONGLONG dq = now.QuadPart - previousQPC;
+                LONG us = (LONG)((dq * 1000000LL) / g_AudioQPCFreq.QuadPart);
+                if (us > 0 && us < 1000000)
+                        InterlockedExchange(&g_AudioNotifyPeriodUs, us);
+        }
+        InterlockedExchange(&g_AudioNotifyPlaySlot, (LONG)slot);
+        InterlockedIncrement(&g_AudioNotifySignals);
+}
+
+static unsigned long GetAudioConsumerSlot()
+{
+        if (InterlockedExchangeAdd(&g_AudioNotifyActive, 0L) &&
+            InterlockedExchangeAdd(&g_AudioPlayStarted, 0L))
+        {
+                unsigned long slot = (unsigned long)(InterlockedExchangeAdd(&g_AudioNotifyPlaySlot, 0L) % FRAMEBUF);
+                LONGLONG lastQPC = InterlockedExchangeAdd64(&g_AudioLastNotifyQPC, 0);
+                LONG periodUs = InterlockedExchangeAdd(&g_AudioNotifyPeriodUs, 0L);
+
+                // Normally the notification thread updates the exact play slot.
+                // If Windows delayed the worker for an unusually long interval,
+                // advance conservatively from the last real DirectSound anchor
+                // rather than trusting a stale slot indefinitely.
+                if (lastQPC != 0 && periodUs > 0 && g_AudioQPCFreq.QuadPart > 0 && LockSize > 0)
+                {
+                        LARGE_INTEGER now;
+                        QueryPerformanceCounter(&now);
+                        LONGLONG age = now.QuadPart - lastQPC;
+                        LONGLONG staleQPC = (g_AudioQPCFreq.QuadPart * (LONGLONG)(periodUs * 2)) / 1000000LL;
+                        if (staleQPC < g_AudioQPCFreq.QuadPart / 50)
+                                staleQPC = g_AudioQPCFreq.QuadPart / 50; // 20 ms minimum
+                        if (age > staleQPC)
+                        {
+                                const unsigned long samplesPerSlot = LockSize / (BITS / 8);
+                                if (samplesPerSlot)
+                                {
+                                        double seconds = (double)age / (double)g_AudioQPCFreq.QuadPart;
+                                        double samples = seconds * (double)InterlockedExchangeAdd(&g_AudioCurrentFreq, 0L);
+                                        unsigned long extra = (unsigned long)(samples / (double)samplesPerSlot);
+                                        slot = (slot + extra) % FRAMEBUF;
+                                }
+                        }
+                }
+                return slot;
+        }
+        return PredictAudioPlaySlot();
 }
 
 // P88: do not start DirectSound playback until the first complete audio slot
@@ -259,11 +390,34 @@ static DWORD WINAPI AudioCtrlThreadProc(void*)
 
         while (!InterlockedExchangeAdd(&g_AudioCtrlStop, 0L))
         {
-                AudioCtrlTick();
-                if (g_AudioCtrlWakeEvent)
-                        WaitForSingleObject(g_AudioCtrlWakeEvent, INFINITE);
-                else
-                        Sleep(16);
+                if (!g_AudioCtrlWakeEvent || !g_AudioNotifyEvents[0])
+                {
+                        if (g_AudioCtrlWakeEvent)
+                                WaitForSingleObject(g_AudioCtrlWakeEvent, INFINITE);
+                        else
+                                Sleep(16);
+                        continue;
+                }
+
+                HANDLE waits[FRAMEBUF + 1];
+                waits[0] = g_AudioCtrlWakeEvent;
+                for (int i = 0; i < FRAMEBUF; ++i)
+                        waits[i + 1] = g_AudioNotifyEvents[i];
+
+                DWORD wr = WaitForMultipleObjects(FRAMEBUF + 1, waits, FALSE, INFINITE);
+                if (InterlockedExchangeAdd(&g_AudioCtrlStop, 0L))
+                        break;
+
+                if (wr == WAIT_OBJECT_0)
+                {
+                        AudioCtrlTick();
+                        continue;
+                }
+
+                if (wr >= WAIT_OBJECT_0 + 1 && wr < WAIT_OBJECT_0 + 1 + FRAMEBUF)
+                {
+                        OnAudioNotifySlot((int)(wr - (WAIT_OBJECT_0 + 1)));
+                }
         }
         return 0;
 }
@@ -1323,6 +1477,22 @@ long GetAudioPrimeSlots(void)
 {
         return (long)InterlockedExchangeAdd(&g_AudioPrimeSlots, 0L);
 }
+long GetAudioNotifyActive(void)
+{
+        return (long)InterlockedExchangeAdd(&g_AudioNotifyActive, 0L);
+}
+long GetAudioNotifySignals(void)
+{
+        return (long)InterlockedExchangeAdd(&g_AudioNotifySignals, 0L);
+}
+long GetAudioNotifyPlaySlot(void)
+{
+        return (long)InterlockedExchangeAdd(&g_AudioNotifyPlaySlot, 0L);
+}
+long GetAudioNotifyPeriodUs(void)
+{
+        return (long)InterlockedExchangeAdd(&g_AudioNotifyPeriodUs, 0L);
+}
 #endif
 
 // Forward the current NES region to the MonitorSync module.
@@ -1349,6 +1519,12 @@ void    Init (void)
         InterlockedExchange(&g_AudioPlayStarted, 0L);
         g_AudioPlayStartQPC.QuadPart = 0;
         g_AudioQPCFreq.QuadPart = 0;
+        InterlockedExchange(&g_AudioNotifyActive, 0L);
+        InterlockedExchange(&g_AudioNotifyPlaySlot, 0L);
+        InterlockedExchange(&g_AudioNotifySignals, 0L);
+        InterlockedExchange64(&g_AudioLastNotifyQPC, 0);
+        InterlockedExchange(&g_AudioNotifyPeriodUs, 0L);
+        CreateAudioNotifyEvents();
 
         // P30: critical section guarding the Buffer pointer against the
         // audio-control worker thread. Initialised once here; deleted in
@@ -1393,6 +1569,7 @@ void    Destroy (void)
         // but make sure the worker is never left running past the point
         // where g_BufferCS is torn down.
         StopAudioCtrlThread();
+        CloseAudioNotifyEvents();
         if (g_BufferCSInit)
         {
                 DeleteCriticalSection(&g_BufferCS);
@@ -1462,6 +1639,7 @@ void    Start (void)
                 MessageBox(hMainWnd, Lang::GetString(LANG_ERR_APU_BUFFER), Lang::GetString(LANG_DLG_NINTENDULATOR), MB_OK);
                 return;
         }
+        ConfigureAudioNotifications();
         EI.DbgOut(Lang::GetString(LANG_MSG_APU_STARTED));
 #endif  /* !NSFPLAYER */
 }
@@ -1472,6 +1650,12 @@ void    Stop (void)
         if (Buffer)
         {
                 SoundOFF();
+                InterlockedExchange(&g_AudioNotifyActive, 0L);
+                InterlockedExchange(&g_AudioNotifyPlaySlot, 0L);
+                InterlockedExchange(&g_AudioNotifySignals, 0L);
+                InterlockedExchange64(&g_AudioLastNotifyQPC, 0);
+                InterlockedExchange(&g_AudioNotifyPeriodUs, 0L);
+                ResetAudioNotifyEvents();
                 // P30: null the pointer under g_BufferCS, then Release()
                 // outside the lock. The audio-control worker AddRefs Buffer
                 // while holding the same lock before using it (AudioCtrlTick),
@@ -1552,6 +1736,11 @@ void    SoundOFF (void)
         InterlockedExchange(&g_AudioPrimeSlots, 0L);
         InterlockedExchange(&g_AudioPlayStarted, 0L);
         g_AudioPlayStartQPC.QuadPart = 0;
+        InterlockedExchange(&g_AudioNotifyPlaySlot, 0L);
+        InterlockedExchange(&g_AudioNotifySignals, 0L);
+        InterlockedExchange64(&g_AudioLastNotifyQPC, 0);
+        InterlockedExchange(&g_AudioNotifyPeriodUs, 0L);
+        ResetAudioNotifyEvents();
         if (Buffer)
                 Buffer->Stop();
 }
@@ -1586,6 +1775,11 @@ void    SoundON (void)
         InterlockedExchange(&g_AudioPrimeSlots, 0L);
         InterlockedExchange(&g_AudioPlayStarted, 0L);
         g_AudioPlayStartQPC.QuadPart = 0;
+        InterlockedExchange(&g_AudioNotifyPlaySlot, 0L);
+        InterlockedExchange(&g_AudioNotifySignals, 0L);
+        InterlockedExchange64(&g_AudioLastNotifyQPC, 0);
+        InterlockedExchange(&g_AudioNotifyPeriodUs, 0L);
+        ResetAudioNotifyEvents();
         QueryPerformanceFrequency(&g_AudioQPCFreq);
         next_pos = 0;
         // Establish the correct playback rate while the buffer is stopped.
@@ -2119,15 +2313,14 @@ void    Run (void)
                         LONG pendingPlay = InterlockedExchangeAdd(&g_AudioPlayPending, 0L);
                         if (!pendingPlay && InterlockedExchangeAdd(&g_AudioPlayStarted, 0L))
                         {
-                                // P90: no audiodg IPC in the MMR slot path.
-                                // Predict the read slot from QPC and keep at
-                                // least two complete slots of lead before a
-                                // write can wrap onto the playing side.
+                                // P91: prefer DirectSound position notifications
+                                // as the authoritative consumer slot. QPC remains
+                                // the fallback only if notifications are unavailable.
                                 int safetyLoops = 0;
                                 QueryPerformanceCounter(&p73SafetyBegin);
                                 while (safetyLoops < 2)
                                 {
-                                        unsigned long playSlot = PredictAudioPlaySlot();
+                                        unsigned long playSlot = GetAudioConsumerSlot();
                                         int lead = AudioLeadSlots(playSlot, next_pos);
                                         if (lead >= 2)
                                                 break;
@@ -2218,6 +2411,8 @@ void    Run (void)
                                 if (SUCCEEDED(playHr))
                                 {
                                         QueryPerformanceCounter(&g_AudioPlayStartQPC);
+                                        InterlockedExchange64(&g_AudioLastNotifyQPC, g_AudioPlayStartQPC.QuadPart);
+                                        InterlockedExchange(&g_AudioNotifyPlaySlot, 0L);
                                         InterlockedExchange(&g_AudioPlayStarted, 1L);
                                         InterlockedExchange(&g_AudioPlayPending, 0L);
                                         InterlockedIncrement(&g_AudioPlayStarts);
