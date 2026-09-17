@@ -41,59 +41,35 @@
 #endif
 
 // DwmFlush is loaded dynamically so the binary stays compatible with
-// Windows XP/2003 where dwmapi.dll does not exist. On Vista+ in windowed
-// mode we call DwmFlush() just before SwapBuffers to synchronise our GL
-// present with the DWM composition tick.  Without this, DWM may display
-// the same GL frame twice (or skip one) even when OpenGL vsync is on,
-// because the driver's vblank interrupt and DWM's composition cycle are
-// not phase-locked.  In fullscreen/exclusive mode DWM is bypassed, so the
-// call is skipped entirely to avoid adding latency.
+// Windows XP/2003 where dwmapi.dll does not exist.
+//
+// P84: in DWM-composited OpenGL modes (windowed/borderless), Match Monitor
+// Rate uses:
+//     wglSwapIntervalEXT(0) -> SwapBuffers() -> DwmFlush()
+//
+// SwapBuffers is deliberately non-blocking. DwmFlush is the presentation
+// backpressure point and its completion QPC is fed back to MonitorSync, so
+// emulator pacing can lock to an observed compositor phase instead of running
+// forever from a QPC-only fallback.
+//
+// The DwmFlush wait lives on the dedicated render thread, which owns the GL
+// context. The emulation/audio thread therefore does not wait on the compositor.
+//
+// Exclusive fullscreen is intentionally excluded because DWM is not in the
+// presentation path there; that path keeps using the existing GL/DXGI logic.
 typedef HRESULT (WINAPI *PFN_DwmFlush)(void);
 static PFN_DwmFlush s_pfnDwmFlush = reinterpret_cast<PFN_DwmFlush>(1); // 1 = not yet loaded
 typedef HRESULT (WINAPI *PFN_DwmGetCompositionTimingInfo)(HWND, DWM_TIMING_INFO *);
 static PFN_DwmGetCompositionTimingInfo s_pfnDwmGetCompositionTimingInfo = reinterpret_cast<PFN_DwmGetCompositionTimingInfo>(1);
 
-// P45 (session 22): moved up from its previous spot right above its use in
-// GL_DrawFrame so it's visible to the log-header diagnostic too (see
-// DiagOpenLogFile). Flipped 0 -> 1: session 21's log (after P44 removed the
-// per-frame wglMakeCurrent stall) showed `swap` reading ~0.00-0.03ms on
-// EVERY single frame for the whole windowed-mode session, both during and
-// after the ~13ms tex-upload stall block -- i.e. SwapBuffers is not
-// blocking on anything close to a real vblank, ever, in this window mode
-// session. With no GL-side backpressure at all, the only remaining pacing
-// mechanism was the DirectSound buffer-fill wait loop in APU::Run, which
-// is quantized to audiodg's own ~10ms service tick and produced a strict,
-// regular 20/20/10ms "gap" cadence (a 3:2-pulldown-style judder, not caught
-// by the >8ms single-frame anomaly threshold because no individual frame
-// deviates from ~16.67ms by that much -- the problem is the repeating
-// pattern itself, not any one frame). This is exactly the "frame doubling/
-// skipping on older drivers" case the comment above USE_DWMFLUSH in
-// GL_DrawFrame already anticipated and built a fix for. Re-enabling it is
-// scoped to windowed mode only (see the `if (MatchMonitorRate &&
-// !Fullscreen)` guard at its use site) -- fullscreen is untouched.
-#define USE_DWMFLUSH 0
+#define USE_DWMFLUSH 1
 
-// After a fullscreen<->windowed transition, DWM restarts its composition
-// pipeline. The first DwmFlush() calls during this warm-up period can block
-// for more than one vblank (DWM is re-syncing its internal state), causing
-// apparent slowdown (~30fps for 2-3 seconds). The previous value of 12
-// frames (200ms) was far too short — DWM actually stabilises over ~3 seconds
-// (~180 frames at 60fps). Switching to DwmFlush+interval=0 at frame 13 while
-// DWM was still re-syncing caused exactly the "3-second slowdown after
-// exiting fullscreen" symptom reported by users: each DwmFlush blocked for
-// ~33ms (two vblanks), halving the effective frame rate.
-// 180 frames = 3 seconds at 60fps, which gives DWM enough time to fully
-// stabilise before we hand pacing over to DwmFlush. The cost is ~1 vblank
-// of additional latency during the first 3 seconds after a mode switch,
-// which is imperceptible for retro gaming.
-#define DWM_WARMUP_FRAMES 180
+// P84: synchronize from the first frame. The wait is on the render thread,
+// so there is no reason to keep the old multi-second unsynchronised warmup.
+#define DWM_WARMUP_FRAMES 0
 static int  s_DwmWarmupFrames = 0;
-static bool s_DwmModeArmed    = false; // true once SetDwmSyncMode(true) has been called
-// P52: diagnostic counter — incremented on every entry to the #if USE_DWMFLUSH
-// block in GL_DrawFrame (before the MatchMonitorRate check). Read by
-// DiagWriteLogFile to determine whether the DwmFlush path is even being
-// reached. Must be at file scope (not inside GL_DrawFrame) so the log
-// writer can access it.
+static bool s_DwmModeArmed    = false;
+// Diagnostic counter: render passes that actually enter the DwmFlush path.
 static volatile LONG s_DwmFlushPathReached = 0;
 
 namespace GFX
@@ -1268,30 +1244,55 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 glColor4f(1, 1, 1, 1);
         }
 
-        // P61: submit the frame first, then wait for DWM to finish
-        // compositing that submitted frame.
+        // P84: in the current windowed path SwapBuffers() is not a
+        // presentation boundary. The runtime log showed swap ~= 0 ms while
+        // Match Monitor Rate was running from a QPC-only presentation clock.
         //
-        // The P60 implementation measured QPC immediately after
-        // SwapBuffers(). In the DWM interval=0 path that timestamp is NOT a
-        // presentation boundary: SwapBuffers only queues the back buffer for
-        // composition and may return immediately. Feeding that timestamp back
-        // into PaceSlot() created the observed 23ms/9ms phase alternation.
+        // That lets the producer run at nominal 60 Hz while DWM independently
+        // chooses which composition tick consumes each submit. The result can
+        // be a repeated frame or a missed composition phase even when the
+        // producer's average frame rate is correct.
         //
-        // The correct ordering for this path is:
+        // Use the render thread as a bridge between OpenGL and DWM:
+        //
         //     SwapBuffers(interval=0) -> DwmFlush() -> next frame
         //
-        // DwmFlush() is documented as waiting until the calling process has
-        // completed its outstanding DWM work for the current composition
-        // cycle. Its return is therefore the best available observed
-        // composition boundary on this Windows 7-compatible path.
+        // The return from DwmFlush is fed into MonitorSync as the observed
+        // presentation timestamp. Audio/CPU pacing never waits here because
+        // this code executes only on the dedicated GL render thread.
+
+        const bool useDwmPresentation =
+                (MatchMonitorRate &&
+                 !(Fullscreen && ExclusiveFullscreen) &&
+                 !MonitorSync::HasDXGIVBlank());
+
 #if USE_DWMFLUSH
-        InterlockedIncrement(&s_DwmFlushPathReached);
+        if (useDwmPresentation)
+                InterlockedIncrement(&s_DwmFlushPathReached);
 #endif
-        if (MatchMonitorRate)
+
+        if (useDwmPresentation)
+        {
+                // Keep SwapBuffers non-blocking. DwmFlush below is the sole
+                // compositor synchronizer for the DWM path.
+                if (!s_DwmModeArmed)
+                {
+                        MonitorSync::SetDwmSyncMode(true);
+                        s_DwmModeArmed = true;
+                }
+        }
+        else if (s_DwmModeArmed)
+        {
+                MonitorSync::SetDwmSyncMode(false);
+                s_DwmModeArmed = false;
+        }
+
+        // DXGI vblank and DwmFlush are alternative presentation masters.
+        // Never wait on both for the same frame.
+        if (MatchMonitorRate && MonitorSync::HasDXGIVBlank() &&
+                !useDwmPresentation)
                 MonitorSync::WaitForDXGIVBlank();
 
-        // P82: diagnostic-only measurement of time spent inside SwapBuffers.
-        // No pacing, sync mode, or swap behavior is changed.
         int diagSwapIdxPre = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
         if (MatchMonitorRate)
         {
@@ -1307,59 +1308,34 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 QueryThreadCycleTime(GetCurrentThread(), &s_diagBuf[diagSwapIdxPre].swapEndCycles);
         }
 
-        // P66: when DwmFlush is not used (verified GL-vsync path), the
-        // return from SwapBuffers is the only presentation-side timing
-        // checkpoint available to this logger. Record it in t2 so the
-        // diagnostic "swap" column measures the actual GL wait instead of
-        // remaining zero. This is diagnostic-only: it does NOT feed the
-        // presentation clock and does not alter pacing behavior.
+        // t2 = submit boundary. In the DWM path this is deliberately not the
+        // presentation timestamp: SwapBuffers only queues the new back buffer.
         LARGE_INTEGER swapDoneQpc;
         QueryPerformanceCounter(&swapDoneQpc);
         int diagSwapIdx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
-        bool diagDwmFlushCandidate =
-                (MatchMonitorRate && !(Fullscreen && ExclusiveFullscreen) &&
-                 !MonitorSync::IsVSyncActive());
-        if (!diagDwmFlushCandidate)
-                s_diagBuf[diagSwapIdx].t2 = swapDoneQpc.QuadPart;
+        s_diagBuf[diagSwapIdx].t2 = swapDoneQpc.QuadPart;
 
 #if USE_DWMFLUSH
-        // P65: when the OpenGL driver has verified swap interval=1, let
-        // SwapBuffers provide the presentation synchronization. DwmFlush is
-        // retained as a fallback only for systems where GL vsync was not
-        // verified. Calling DwmFlush in addition to verified GL-vsync caused
-        // a repeatable ~33 ms presentation cadence after the warmup phase.
-        if (MatchMonitorRate && !(Fullscreen && ExclusiveFullscreen) &&
-                !MonitorSync::IsVSyncActive())
+        if (useDwmPresentation)
         {
                 if (s_pfnDwmFlush == reinterpret_cast<PFN_DwmFlush>(1))
                 {
                         HMODULE hDwm = LoadLibrary(_T("dwmapi.dll"));
-                        s_pfnDwmFlush = hDwm ? (PFN_DwmFlush)GetProcAddress(hDwm, "DwmFlush") : NULL;
+                        s_pfnDwmFlush = hDwm ?
+                                (PFN_DwmFlush)GetProcAddress(hDwm, "DwmFlush") : NULL;
                 }
+
                 if (s_pfnDwmFlush)
                 {
-                        if (s_DwmWarmupFrames > 0)
-                        {
-                                --s_DwmWarmupFrames;
-                        }
-                        else
-                        {
-                                if (!s_DwmModeArmed)
-                                {
-                                        MonitorSync::SetDwmSyncMode(true);
-                                        s_DwmModeArmed = true;
-                                }
-                                LARGE_INTEGER flushQpc;
-                                HRESULT hr = s_pfnDwmFlush();
-                                QueryPerformanceCounter(&flushQpc);
-                                (void)hr;
-                                if (MatchMonitorRate)
-                                {
-                                        int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
-                                        s_diagBuf[idx].t2 = flushQpc.QuadPart;
-                                        MonitorSync::NotifyFramePresented(flushQpc.QuadPart);
-                                }
-                        }
+                        LARGE_INTEGER flushQpc;
+                        HRESULT hr = s_pfnDwmFlush();
+                        QueryPerformanceCounter(&flushQpc);
+                        (void)hr;
+
+                        // t2b = DwmFlush completion / presentation feedback.
+                        int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+                        s_diagBuf[idx].t2b = flushQpc.QuadPart;
+                        MonitorSync::NotifyFramePresented(flushQpc.QuadPart);
                 }
         }
 #endif
@@ -1373,7 +1349,11 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
         {
                 LARGE_INTEGER qpc2; QueryPerformanceCounter(&qpc2);
                 int idx2 = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
-                s_diagBuf[idx2].t2b = qpc2.QuadPart;
+
+                // DwmFlush already supplied the presentation timestamp for the
+                // DWM path. Other presentation paths use the post-submit QPC.
+                if (s_diagBuf[idx2].t2b == 0)
+                        s_diagBuf[idx2].t2b = qpc2.QuadPart;
 
                 // P54: complete the diag entry from the render thread.
                 // t3/t4 are the same as t2b here (no OnFrameEnd/UpdateDRC
@@ -1616,7 +1596,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         // a gap far from ~16.67ms, regardless of how the t0->t4 slice
         // inside it happens to be split.
         LONGLONG prevT0 = 0;
-        LONGLONG prevT2 = 0;
+        LONGLONG prevPresentation = 0;
         LONGLONG prevTProd = 0;
         LONGLONG prevDwmDisplayed = 0;
         LONGLONG prevDwmVBlank = 0;
@@ -1626,7 +1606,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         ULONGLONG prevDwmDrop = 0;
         ULONGLONG prevDwmLate = 0;
         bool     havePrevT0 = false;
-        bool     havePrevT2 = false;
+        bool     havePrevPresentation = false;
         bool     havePrevTProd = false;
         bool     havePrevDwm = false;
 
@@ -1691,18 +1671,23 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 double dprodGap = (havePrevTProd && e.tProd > prevTProd) ?
                                   (e.tProd - prevTProd) * 1000.0 / freq : 0.0;
                 if (e.tProd > 0) { prevTProd = e.tProd; havePrevTProd = true; }
-                double dpresent = (havePrevT2 && e.t2 > prevT2) ?
-                                  (e.t2 - prevT2) * 1000.0 / freq : 0.0;
+                // P84: "present" must use the observed presentation boundary,
+                // not merely SwapBuffers submit time. DwmFlush supplies t2b
+                // in the DWM path; other paths fall back to t2.
+                LONGLONG presentationStamp = (e.t2b > 0) ? e.t2b : e.t2;
+                double dpresent = (havePrevPresentation &&
+                                    presentationStamp > prevPresentation) ?
+                                   (presentationStamp - prevPresentation) * 1000.0 / freq : 0.0;
 
                 bool   haveGap = havePrevT0;
                 double dgap = haveGap ? (e.t0 - prevT0) * 1000.0 / freq : 0.0;
                 prevT0 = e.t0;
-                prevT2 = e.t2;
+                prevPresentation = presentationStamp;
                 havePrevT0 = true;
-                havePrevT2 = (e.t2 > 0);
+                havePrevPresentation = (presentationStamp > 0);
                 double centerMs = (MonitorSync::GetTargetHz() > 1.0) ?
                                   1000.0 / MonitorSync::GetTargetHz() : 16.667;
-                double presentErr = havePrevT2 && dpresent > 0.0 ?
+                double presentErr = havePrevPresentation && dpresent > 0.0 ?
                                     (dpresent - centerMs) : 0.0;
                 // P67: this isolates timer/scheduler wake-up error from the
                 // later render/presentation stages. Positive values mean the
@@ -2745,7 +2730,9 @@ void    Start (void)
                 if (MatchMonitorRate)
                 {
                         MonitorSync::Enable(TRUE);
-                        MonitorSync::SetDwmSyncMode(false);
+                        // P84: DWM synchronization is selected after the
+                        // fullscreen/windowed transition, when the actual mode
+                        // flags are final.
                         MonitorSync::OnDisplayChange();
                         MonitorSync::ResetState();
                         // P59: StartRenderThread() is deliberately NOT called
@@ -2872,6 +2859,14 @@ void    Start (void)
                 // right GL state already set up.
                 if (MatchMonitorRate)
                 {
+                        // P84: choose the presentation master after the mode
+                        // transition. Exclusive fullscreen stays on the
+                        // non-DWM path; windowed/borderless mode uses DwmFlush
+                        // when no DXGI vblank source is available.
+                        const bool useDwm =
+                                !(Fullscreen && ExclusiveFullscreen) &&
+                                !MonitorSync::HasDXGIVBlank();
+                        MonitorSync::SetDwmSyncMode(useDwm);
                         StartRenderThread();
                 }
 

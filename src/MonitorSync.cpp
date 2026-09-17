@@ -1075,15 +1075,20 @@ void ApplyPendingVSync()
 
     if (interval == 0)
     {
-        // interval=0 means either DXGI path or DWM-sync mode.
-        // In both cases g_VSyncActive should reflect whether we have
-        // a working sync mechanism:
-        //   - DXGI path: g_VSyncActive=true (WaitForDXGIVBlank provides sync)
-        //   - Enable(FALSE): g_VSyncActive stays false (was set in Enable)
-        //   - DWM-sync mode: g_VSyncActive=true (DwmFlush provides sync)
-        if (g_DXGIAvailable || InterlockedExchangeAdd(&g_DwmSyncMode, 0) != 0)
+        // P84: interval=0 has two different synchronization meanings.
+        //
+        // DXGI mode:
+        //   WaitForDXGIVBlank() is the real presentation synchronizer.
+        //
+        // DWM-sync mode:
+        //   DwmFlush() is the real presentation synchronizer. A successful
+        //   wglSwapIntervalEXT(0) call must NOT make g_VSyncActive=true,
+        //   otherwise GFX.cpp could incorrectly skip the DwmFlush path.
+        if (InterlockedExchangeAdd(&g_DwmSyncMode, 0) != 0)
+            g_VSyncActive = false;
+        else if (g_DXGIAvailable)
             g_VSyncActive = (ok != FALSE);
-        // else: g_VSyncActive was already set false by Enable(FALSE)
+        // else: keep g_VSyncActive false when there is no verified vblank source.
     }
     else // interval == 1
     {
