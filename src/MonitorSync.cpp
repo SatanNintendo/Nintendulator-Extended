@@ -386,6 +386,10 @@ static volatile LONG     g_PresentationIntervalErrUs = 0;
 // from being interpreted as a real presentation cadence.
 static volatile ULONGLONG g_LastDwmCompositionFrame = 0;
 static volatile LONG       g_PresentationSampleStreak = 0;
+// P86: DWM supplies phase, while PaceSlot owns one slot of cadence per call.
+static volatile LONGLONG  g_PresentationAnchorQPC = 0;
+static volatile ULONGLONG g_PresentationAnchorFrame = 0;
+static volatile LONG      g_PresentationAnchorGeneration = 0;
 
 // ------------------------------------------------------------------
 // Deferred vsync interval (written by Enable/UI thread, applied by
@@ -585,6 +589,9 @@ void OnDisplayChange()
     InterlockedExchange(&g_PresentationIntervalErrUs, 0);
     InterlockedExchange64((volatile LONGLONG*)&g_LastDwmCompositionFrame, 0);
     InterlockedExchange(&g_PresentationSampleStreak, 0);
+    InterlockedExchange64(&g_PresentationAnchorQPC, 0);
+    InterlockedExchange64((volatile LONGLONG*)&g_PresentationAnchorFrame, 0);
+    InterlockedIncrement(&g_PresentationAnchorGeneration);
     InterlockedExchange64(&g_LastPaceTargetQPC, 0);
     InterlockedExchange64(&g_LastPaceWakeQPC, 0);
     InterlockedExchange(&g_LastPaceSource, 0);
@@ -762,6 +769,9 @@ void ResetState()
     InterlockedExchange(&g_PresentationIntervalErrUs, 0);
     InterlockedExchange64((volatile LONGLONG*)&g_LastDwmCompositionFrame, 0);
     InterlockedExchange(&g_PresentationSampleStreak, 0);
+    InterlockedExchange64(&g_PresentationAnchorQPC, 0);
+    InterlockedExchange64((volatile LONGLONG*)&g_PresentationAnchorFrame, 0);
+    InterlockedIncrement(&g_PresentationAnchorGeneration);
     InterlockedExchange64(&g_LastPaceTargetQPC, 0);
     InterlockedExchange64(&g_LastPaceWakeQPC, 0);
     InterlockedExchange(&g_LastPaceSource, 0);
@@ -824,92 +834,95 @@ void PaceSlot()
     }
 
     const double targetHz = (GetTargetHz() > 0.0) ? GetTargetHz() : 60.0;
-    const double nominalPeriodTicks = (double)g_QPCFreq.QuadPart / targetHz;
-    const LONGLONG nominalPeriod = (LONGLONG)(nominalPeriodTicks + 0.5);
+    const LONGLONG nominalPeriod =
+            (LONGLONG)((double)g_QPCFreq.QuadPart / targetHz + 0.5);
 
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
 
-    // ---------------------------------------------------------------
-    // P60: presentation-anchored cadence.
-    //
-    // Once the render thread has observed a sane presentation interval,
-    // use the most recent presentation as the phase anchor for the next
-    // emulation slot. A small lead keeps the frame generation on the safe side
-    // of the target display boundary without adding a full-frame of latency.
-    //
-    // IMPORTANT: this is NOT a wait on the render thread and does not wait for
-    // DwmFlush. A DWM maintenance stall simply unlocks this path temporarily;
-    // the QPC fallback below keeps emulation/audio moving.
-    // ---------------------------------------------------------------
+    // P86: presentation feedback is a PHASE ANCHOR, not the cadence itself.
+    // P85 recalculated lastCompose + period - lead on every call. If PaceSlot
+    // is entered more often than DWM advances cFrame, multiple producer calls
+    // can reuse one sample and the emulator can run faster than the monitor.
+    // Keep an independent target sequence: DWM can move phase, but every
+    // PaceSlot call consumes exactly one presentation-period slot.
+    static ULONGLONG s_seenAnchorFrame = 0;
+    static LONG      s_seenAnchorGeneration = 0;
+    static LONGLONG  s_nextPresentationTargetQPC = 0;
+
+    LONG anchorGeneration = InterlockedExchangeAdd(&g_PresentationAnchorGeneration, 0);
+    if (anchorGeneration != s_seenAnchorGeneration)
+    {
+        s_seenAnchorGeneration = anchorGeneration;
+        s_seenAnchorFrame = 0;
+        s_nextPresentationTargetQPC = 0;
+    }
+
     if (InterlockedExchangeAdd(&g_PresentationClockLocked, 0) != FALSE)
     {
-        LONGLONG lastPresent =
-                InterlockedExchangeAdd64(&g_LastPresentationQPC, 0);
-        LONGLONG period =
-                InterlockedExchangeAdd64(&g_PresentationPeriodQPC, 0);
+        LONGLONG anchorQPC = InterlockedExchangeAdd64(&g_PresentationAnchorQPC, 0);
+        ULONGLONG anchorFrame = (ULONGLONG)InterlockedExchangeAdd64(
+                (volatile LONGLONG*)&g_PresentationAnchorFrame, 0);
+        LONGLONG period = InterlockedExchangeAdd64(&g_PresentationPeriodQPC, 0);
 
-        if (lastPresent > 0 && period > 0)
+        if (anchorQPC > 0 && anchorFrame > 0 && period > 0)
         {
-            // Leave several milliseconds of execution slack between the
-            // pacing wake-up and frame publication. The timing log shows that
-            // normal frames need about 2.4-2.6 ms after PaceSlot(), while rare
-            // host-side execution spikes can reach about 6.4 ms. A 7 ms lead
-            // keeps those outliers from consuming the display-period budget
-            // without introducing a second timing mechanism or queue.
             const LONGLONG leadTicks =
                     (LONGLONG)((double)g_QPCFreq.QuadPart * 0.007 + 0.5);
 
-            LONGLONG targetQPC = lastPresent + period - leadTicks;
-
-            // A presentation stall can leave the anchor behind the current
-            // time. In that case do NOT stack waits; fall through to the
-            // absolute-QPC recovery path below.
-            if (targetQPC > now.QuadPart)
+            if (anchorFrame != s_seenAnchorFrame || s_nextPresentationTargetQPC <= 0)
             {
-                double remainMs = (double)(targetQPC - now.QuadPart) *
-                                  1000.0 / (double)g_QPCFreq.QuadPart;
+                s_seenAnchorFrame = anchorFrame;
+                s_nextPresentationTargetQPC = anchorQPC + period - leadTicks;
+            }
 
-                if (remainMs >= 1.0)
+            LONGLONG targetQPC = s_nextPresentationTargetQPC;
+
+            // If a host stall made the scheduled target historical, skip only
+            // the stale phase targets. This call still consumes one current slot.
+            while (targetQPC <= now.QuadPart)
+                targetQPC += period;
+
+            double remainMs = (double)(targetQPC - now.QuadPart) *
+                              1000.0 / (double)g_QPCFreq.QuadPart;
+
+            if (remainMs >= 1.0)
+            {
+                if (g_PaceTimer == NULL)
                 {
-                    if (g_PaceTimer == NULL)
-                    {
-                        HANDLE ht = CreatePaceTimer();
-                        g_PaceTimer = ht ? ht : INVALID_HANDLE_VALUE;
-                    }
+                    HANDLE ht = CreatePaceTimer();
+                    g_PaceTimer = ht ? ht : INVALID_HANDLE_VALUE;
+                }
 
-                    if (g_PaceTimer != INVALID_HANDLE_VALUE)
-                    {
-                        LARGE_INTEGER due;
-                        due.QuadPart = -(LONGLONG)(remainMs * 10000.0);
-                        SetWaitableTimer(g_PaceTimer, &due, 0, NULL, NULL, FALSE);
-                        WaitForSingleObject(g_PaceTimer, 20);
-                    }
-                    else
-                    {
-                        SwitchToThread();
-                    }
+                if (g_PaceTimer != INVALID_HANDLE_VALUE)
+                {
+                    LARGE_INTEGER due;
+                    due.QuadPart = -(LONGLONG)(remainMs * 10000.0);
+                    SetWaitableTimer(g_PaceTimer, &due, 0, NULL, NULL, FALSE);
+                    WaitForSingleObject(g_PaceTimer, 20);
                 }
                 else
                 {
                     SwitchToThread();
                 }
-
-                LARGE_INTEGER paceWake;
-                QueryPerformanceCounter(&paceWake);
-                RecordPaceDiagnostic(targetQPC, paceWake.QuadPart, 1);
-                return;
             }
+            else if (remainMs > 0.0)
+            {
+                SwitchToThread();
+            }
+
+            LARGE_INTEGER paceWake;
+            QueryPerformanceCounter(&paceWake);
+            RecordPaceDiagnostic(targetQPC, paceWake.QuadPart, 1);
+
+            // Critical P86 rule: one cadence step per PaceSlot invocation.
+            s_nextPresentationTargetQPC = targetQPC + period;
+            return;
         }
     }
 
-    // ---------------------------------------------------------------
-    // P60 fallback: absolute QPC schedule.
-    //
-    // This remains the safety net for startup, display transitions and long
-    // presentation stalls. It never inherits "previous actual wake-up +
-    // period" drift.
-    // ---------------------------------------------------------------
+    // QPC fallback remains authoritative whenever the presentation clock has
+    // not qualified or has been invalidated by a display transition.
     if (g_PaceEpochQPC.QuadPart == 0)
     {
         g_PaceEpochQPC = now;
@@ -995,6 +1008,9 @@ void NotifyFramePresented(LONGLONG qpcPresented)
     {
         InterlockedExchange(&g_PresentationClockLocked, FALSE);
         InterlockedExchange(&g_PresentationSampleStreak, 0);
+        InterlockedExchange64(&g_PresentationAnchorQPC, 0);
+        InterlockedExchange64((volatile LONGLONG*)&g_PresentationAnchorFrame, 0);
+        InterlockedIncrement(&g_PresentationAnchorGeneration);
         return;
     }
 
@@ -1029,6 +1045,9 @@ void NotifyFramePresented(LONGLONG qpcPresented)
     {
         InterlockedExchange(&g_PresentationClockLocked, FALSE);
         InterlockedExchange(&g_PresentationSampleStreak, 0);
+        InterlockedExchange64(&g_PresentationAnchorQPC, 0);
+        InterlockedExchange64((volatile LONGLONG*)&g_PresentationAnchorFrame, 0);
+        InterlockedIncrement(&g_PresentationAnchorGeneration);
         InterlockedExchange(&g_PresentationIntervalErrUs,
                             (LONG)(((delta - nominal) * 1000000LL) /
                                    g_QPCFreq.QuadPart));
@@ -1058,6 +1077,9 @@ void NotifyDwmCompositionSample(LONGLONG qpcCompose, ULONGLONG dwmFrame)
     {
         InterlockedExchange(&g_PresentationClockLocked, FALSE);
         InterlockedExchange(&g_PresentationSampleStreak, 0);
+        InterlockedExchange64(&g_PresentationAnchorQPC, 0);
+        InterlockedExchange64((volatile LONGLONG*)&g_PresentationAnchorFrame, 0);
+        InterlockedIncrement(&g_PresentationAnchorGeneration);
         return;
     }
 
@@ -1078,6 +1100,9 @@ void NotifyDwmCompositionSample(LONGLONG qpcCompose, ULONGLONG dwmFrame)
     {
         InterlockedExchange(&g_PresentationClockLocked, FALSE);
         InterlockedExchange(&g_PresentationSampleStreak, 0);
+        InterlockedExchange64(&g_PresentationAnchorQPC, 0);
+        InterlockedExchange64((volatile LONGLONG*)&g_PresentationAnchorFrame, 0);
+        InterlockedIncrement(&g_PresentationAnchorGeneration);
         InterlockedExchange(&g_PresentationIntervalErrUs,
                             (LONG)(((delta - nominal) * 1000000LL) /
                                    g_QPCFreq.QuadPart));
@@ -1105,12 +1130,16 @@ void NotifyDwmCompositionSample(LONGLONG qpcCompose, ULONGLONG dwmFrame)
     InterlockedExchange(&g_PresentationHzMilli, hzMilli);
 
     LONG streak = InterlockedIncrement(&g_PresentationSampleStreak);
-    // P85: require three consecutive unique DWM composition samples before
-    // PaceSlot() is allowed to leave the deterministic QPC startup schedule.
-    // This removes the cold-start fallback/anchor toggling that could make
-    // the first seconds of a windowed ROM run much too fast.
+    // P85/P86: qualify after three consecutive unique DWM composition samples.
+    // P86 also publishes qpcCompose/cFrame as the phase anchor used by the
+    // producer-side target sequence.
     if (streak >= 3)
+    {
+        InterlockedExchange64(&g_PresentationAnchorQPC, qpcCompose);
+        InterlockedExchange64((volatile LONGLONG*)&g_PresentationAnchorFrame,
+                              (LONGLONG)dwmFrame);
         InterlockedExchange(&g_PresentationClockLocked, TRUE);
+    }
 }
 
 bool HasPresentationClock()
