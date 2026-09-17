@@ -156,9 +156,17 @@ static int    glWinH = 0;
 static BOOL   UsingOpenGL = FALSE;
 
 // ------------------------------------------------------------------
-// PBO (Pixel Buffer Object) double-buffering for glTexSubImage2D.
+// PBO (Pixel Buffer Object) streaming for glTexSubImage2D.
 //
-// ROOT CAUSE of tex=24ms stall (confirmed by diagnostic log):
+// P83 update: the current Log(10) does NOT implicate SwapBuffers. Its ~16.6ms
+// `tex` value is exactly the t0->t1 interval around the PBO/texture upload.
+// With the two-PBO implementation, the render thread can be forced to recycle
+// a still-in-flight PBO because the windowed SwapBuffers path provides little
+// CPU backpressure. The most likely blocking point is therefore glMapBuffer.
+// The P83 fix increases the PBO pool to four and splits the diagnostic timing
+// so the next run can confirm whether pboMap is the full-refresh stall.
+//
+// ROOT CAUSE of the older client-pointer tex=24ms stall (historical P29 reason):
 //
 //   glTexSubImage2D with a client-side pointer (no PBO) is a SYNCHRONOUS
 //   operation: the GL driver must wait until the GPU has finished reading
@@ -177,15 +185,13 @@ static BOOL   UsingOpenGL = FALSE;
 //     2. glTexSubImage2D reads from the PBO, not from client memory.
 //        The driver queues the DMA transfer and returns immediately --
 //        no waiting for the GPU.
-//     3. On the next frame, glMapBuffer of the SAME PBO would stall
-//        if the DMA from step 2 is still in flight. So we use TWO
-//        PBOs in alternating fashion (double-buffering):
-//          - Frame N:   map PBO[0], write pixels, unmap, TexSubImage from PBO[0]
-//          - Frame N+1: map PBO[1], write pixels, unmap, TexSubImage from PBO[1]
-//          - Frame N+2: map PBO[0] again -- by now the GPU has surely finished
-//                       DMA from frame N, so the map is instant.
-//        This gives the GPU a full frame period (~16ms) to complete the
-//        DMA before we try to reuse that buffer -- eliminating the stall.
+//   3. glMapBuffer of a PBO that is still being consumed by the GPU must wait.
+//      P29 originally used only TWO PBOs, assuming one intervening frame was
+//      always enough for the DMA. That assumption is false when the windowed
+//      presentation path lets SwapBuffers return without strong GPU backpressure:
+//      the driver/compositor can keep a submitted PBO in flight for more than
+//      one frame. P83 increases the pool to FOUR PBOs so normal multi-frame
+//      in-flight latency does not force a map wait.
 //
 // COMPATIBILITY:
 //   GL_ARB_pixel_buffer_object / GL_EXT_pixel_buffer_object has been
@@ -221,12 +227,24 @@ static PFN_glBufferData    pfn_glBufferData    = NULL;
 static PFN_glMapBuffer     pfn_glMapBuffer     = NULL;
 static PFN_glUnmapBuffer   pfn_glUnmapBuffer   = NULL;
 
-// Two PBOs: we alternate between them each frame (ping-pong).
-// PBO size = 256 * 240 * 4 bytes = 245760 bytes.
-#define PBO_SIZE (256 * 240 * 4)
-static GLuint  s_PBO[2]    = {0, 0};  // 0 = not created / PBO unavailable
-static int     s_PBOIndex  = 0;       // which PBO to write this frame (0 or 1)
-static BOOL    s_PBOReady  = FALSE;   // TRUE once both PBOs are allocated
+// PBO streaming buffers.
+//
+// The previous P29 implementation used only two PBOs in a ping-pong pattern.
+// That is unsafe once SwapBuffers stops providing CPU backpressure (as in the
+// current DWM-composited/windowed path): a PBO submitted on frame N can still
+// be owned by the GPU when the same PBO is mapped again on frame N+2.
+// glMapBuffer() must then wait for the old DMA to retire, which can consume
+// almost exactly one refresh period (~16.6 ms) and shift presentation phase.
+//
+// Keep several frames of storage in flight so normal compositor/driver latency
+// does not force the CPU to recycle a live PBO. Four 245760-byte buffers are
+// still under 1 MiB total and add no visible frame latency because the render
+// queue remains latest-wins.
+#define PBO_SIZE  (256 * 240 * 4)
+#define PBO_COUNT 4
+static GLuint  s_PBO[PBO_COUNT] = {0, 0, 0, 0};  // 0 = not created / PBO unavailable
+static int     s_PBOIndex  = 0;                  // PBO to write this frame
+static BOOL    s_PBOReady  = FALSE;              // TRUE once all PBOs are allocated
 
 // Deferred GL viewport resize.
 // WM_SIZE arrives on the UI thread; GL_Resize calls wglMakeCurrent which races
@@ -325,12 +343,12 @@ static BOOL GL_Init(int winW, int winH)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glEnable(GL_TEXTURE_2D);
 
-        // Attempt to load PBO extension functions and create the two ping-pong
-        // buffers. On failure s_PBOReady stays FALSE and we fall back to the
-        // original synchronous glTexSubImage2D path transparently.
+        // Attempt to load PBO extension functions and create the streaming
+        // buffer set. On failure s_PBOReady stays FALSE and we fall back to
+        // the original synchronous glTexSubImage2D path transparently.
         s_PBOReady = FALSE;
         s_PBOIndex = 0;
-        s_PBO[0] = s_PBO[1] = 0;
+        ZeroMemory(s_PBO, sizeof(s_PBO));
 
         pfn_glGenBuffers    = (PFN_glGenBuffers)   wglGetProcAddress("glGenBuffers");
         pfn_glDeleteBuffers = (PFN_glDeleteBuffers)wglGetProcAddress("glDeleteBuffers");
@@ -342,12 +360,21 @@ static BOOL GL_Init(int winW, int winH)
         if (pfn_glGenBuffers && pfn_glDeleteBuffers && pfn_glBindBuffer &&
             pfn_glBufferData && pfn_glMapBuffer && pfn_glUnmapBuffer)
         {
-                pfn_glGenBuffers(2, s_PBO);
-                if (s_PBO[0] && s_PBO[1])
+                pfn_glGenBuffers(PBO_COUNT, s_PBO);
+                bool allPBOsValid = true;
+                for (int i = 0; i < PBO_COUNT; i++)
                 {
-                        // Pre-allocate both buffers with STREAM_DRAW hint
+                        if (!s_PBO[i])
+                        {
+                                allPBOsValid = false;
+                                break;
+                        }
+                }
+                if (allPBOsValid)
+                {
+                        // Pre-allocate all buffers with STREAM_DRAW hint
                         // (written once per frame by CPU, read once by GPU).
-                        for (int i = 0; i < 2; i++)
+                        for (int i = 0; i < PBO_COUNT; i++)
                         {
                                 pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, s_PBO[i]);
                                 pfn_glBufferData(GL_PIXEL_UNPACK_BUFFER, PBO_SIZE,
@@ -358,11 +385,11 @@ static BOOL GL_Init(int winW, int winH)
                 }
                 else
                 {
-                        // glGenBuffers returned 0 -- driver or context issue.
+                        // glGenBuffers did not allocate the full PBO set.
                         // Clean up and fall back.
-                        if (s_PBO[0]) pfn_glDeleteBuffers(1, &s_PBO[0]);
-                        if (s_PBO[1]) pfn_glDeleteBuffers(1, &s_PBO[1]);
-                        s_PBO[0] = s_PBO[1] = 0;
+                        for (int i = 0; i < PBO_COUNT; i++)
+                                if (s_PBO[i]) pfn_glDeleteBuffers(1, &s_PBO[i]);
+                        ZeroMemory(s_PBO, sizeof(s_PBO));
                 }
         }
         glDisable(GL_DEPTH_TEST);
@@ -395,8 +422,8 @@ static void GL_Destroy(void)
                 if (s_PBOReady && pfn_glDeleteBuffers)
                 {
                         pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-                        pfn_glDeleteBuffers(2, s_PBO);
-                        s_PBO[0] = s_PBO[1] = 0;
+                        pfn_glDeleteBuffers(PBO_COUNT, s_PBO);
+                        ZeroMemory(s_PBO, sizeof(s_PBO));
                         s_PBOReady = FALSE;
                 }
                 wglMakeCurrent(NULL, NULL);
@@ -686,6 +713,14 @@ struct FrameTimingEntry {
         // P82: diagnostic-only SwapBuffers thread CPU/cycle timing.
         LONGLONG swapStartCPU100ns, swapEndCPU100ns;
         ULONGLONG swapStartCycles, swapEndCycles;
+        // P83: passive split of the texture/PBO stage. These timestamps are
+        // render-thread QPC samples only; they never affect pacing.
+        LONGLONG pboSetupEndQPC;
+        LONGLONG pboOrphanEndQPC;
+        LONGLONG pboMapEndQPC;
+        LONGLONG pboCopyEndQPC;
+        LONGLONG pboUnmapEndQPC;
+        LONGLONG pboSubmitEndQPC;
         DWORD    frameNum;  // render/diagnostic sequence
 };
 static FrameTimingEntry s_diagBuf[DIAG_FRAMES];
@@ -1035,6 +1070,12 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 s_diagBuf[idx].swapEndCPU100ns = 0;
                 s_diagBuf[idx].swapStartCycles = 0;
                 s_diagBuf[idx].swapEndCycles = 0;
+                s_diagBuf[idx].pboSetupEndQPC = 0;
+                s_diagBuf[idx].pboOrphanEndQPC = 0;
+                s_diagBuf[idx].pboMapEndQPC = 0;
+                s_diagBuf[idx].pboCopyEndQPC = 0;
+                s_diagBuf[idx].pboUnmapEndQPC = 0;
+                s_diagBuf[idx].pboSubmitEndQPC = 0;
                 s_diagBuf[idx].emuFrame = packet ? packet->emuFrame : 0;
                 s_diagBuf[idx].fqSkipped = packet ? packet->fqSkipped : 0;
                 s_diagBuf[idx].fqDepth = packet ? packet->fqDepth : 0;
@@ -1053,33 +1094,107 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
         glViewport(0, 0, glWinW, glWinH);
         glBindTexture(GL_TEXTURE_2D, glTex);
 
+        // P83: split the old broad "tex" measurement into the actual PBO
+        // operations. The first diagnostic revision showed tex ~= one full
+        // refresh while SwapBuffers itself was effectively non-blocking.
+        // That makes an internal PBO reuse wait the leading suspect.
+        LONGLONG pboSetupEndQPC = 0;
+        LONGLONG pboOrphanEndQPC = 0;
+        LONGLONG pboMapEndQPC = 0;
+        LONGLONG pboCopyEndQPC = 0;
+        LONGLONG pboUnmapEndQPC = 0;
+        LONGLONG pboSubmitEndQPC = 0;
+        if (MatchMonitorRate)
+        {
+                LARGE_INTEGER qpc;
+                QueryPerformanceCounter(&qpc);
+                pboSetupEndQPC = qpc.QuadPart;
+        }
+
         // Texture upload from the pre-filled buffer (no palette conversion).
         if (s_PBOReady)
         {
                 GLuint writePBO = s_PBO[s_PBOIndex];
                 pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, writePBO);
                 pfn_glBufferData(GL_PIXEL_UNPACK_BUFFER, PBO_SIZE, NULL, GL_STREAM_DRAW);
+                if (MatchMonitorRate)
+                {
+                        LARGE_INTEGER qpc;
+                        QueryPerformanceCounter(&qpc);
+                        pboOrphanEndQPC = qpc.QuadPart;
+                }
+
                 void* pboMem = pfn_glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY);
+                if (MatchMonitorRate)
+                {
+                        LARGE_INTEGER qpc;
+                        QueryPerformanceCounter(&qpc);
+                        pboMapEndQPC = qpc.QuadPart;
+                }
+
                 if (pboMem)
                 {
                         memcpy(pboMem, packet->pixels, FQ_FRAME_SIZE);
+                        if (MatchMonitorRate)
+                        {
+                                LARGE_INTEGER qpc;
+                                QueryPerformanceCounter(&qpc);
+                                pboCopyEndQPC = qpc.QuadPart;
+                        }
+
                         pfn_glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+                        if (MatchMonitorRate)
+                        {
+                                LARGE_INTEGER qpc;
+                                QueryPerformanceCounter(&qpc);
+                                pboUnmapEndQPC = qpc.QuadPart;
+                        }
+
                         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 240,
                                 GL_BGRA_EXT, GL_UNSIGNED_BYTE, NULL);
+                        if (MatchMonitorRate)
+                        {
+                                LARGE_INTEGER qpc;
+                                QueryPerformanceCounter(&qpc);
+                                pboSubmitEndQPC = qpc.QuadPart;
+                        }
                 }
                 else
                 {
                         pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
                         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 240,
                                 GL_BGRA_EXT, GL_UNSIGNED_BYTE, packet->pixels);
+                        if (MatchMonitorRate)
+                        {
+                                LARGE_INTEGER qpc;
+                                QueryPerformanceCounter(&qpc);
+                                pboSubmitEndQPC = qpc.QuadPart;
+                        }
                 }
                 pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-                s_PBOIndex ^= 1;
+                s_PBOIndex = (s_PBOIndex + 1) % PBO_COUNT;
         }
         else
         {
                 glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 240,
                         GL_BGRA_EXT, GL_UNSIGNED_BYTE, packet->pixels);
+                if (MatchMonitorRate)
+                {
+                        LARGE_INTEGER qpc;
+                        QueryPerformanceCounter(&qpc);
+                        pboSubmitEndQPC = qpc.QuadPart;
+                }
+        }
+
+        if (MatchMonitorRate)
+        {
+                int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+                s_diagBuf[idx].pboSetupEndQPC = pboSetupEndQPC;
+                s_diagBuf[idx].pboOrphanEndQPC = pboOrphanEndQPC;
+                s_diagBuf[idx].pboMapEndQPC = pboMapEndQPC;
+                s_diagBuf[idx].pboCopyEndQPC = pboCopyEndQPC;
+                s_diagBuf[idx].pboUnmapEndQPC = pboUnmapEndQPC;
+                s_diagBuf[idx].pboSubmitEndQPC = pboSubmitEndQPC;
         }
 
         if (MatchMonitorRate)
@@ -1477,7 +1592,9 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         _ftprintf(f, _T("FrameQueue counters: overflow_drop=%ld, latest_wins_skip=%ld\n"),
                 (long)InterlockedExchangeAdd(&s_FQOverflowDrops, 0),
                 (long)InterlockedExchangeAdd(&s_FQSkippedFrames, 0));
-        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | paceEnter | paceWait | pace->produce | postPaceCPU | postPaceWall | postPaceCycles | buildWall | buildCPU | buildCycles | swapCPU | swapCycles | safetyMs | safetyLoops | traceSeq | prodGap | renderGap | consume->present | presentInterval | presentErr | fqP2C | fqPcs | fqCcs | fqSched | fqCS2 | fqPHold | fqCHold | fqSigWait | render2t0 | submit2dwm | dwmDispInt | dwmFrameStep | dwmMissStep | dwmDropStep | dwmLateStep | dwmLate | dwmSrc | dwmHr | dwmFrame | dwmRefresh | dwmVBlankInt | dwmComposeInt | dwmLateCount | dwmOutstanding | dwmUnique | dwmAvail | dwmMiss | dwmDrop | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
+        _ftprintf(f, _T("PBO streaming: ready=%d count=%d\n"),
+                s_PBOReady ? 1 : 0, PBO_COUNT);
+        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | paceEnter | paceWait | pace->produce | postPaceCPU | postPaceWall | postPaceCycles | buildWall | buildCPU | buildCycles | swapCPU | swapCycles | pboOrphan | pboMap | pboCopy | pboUnmap | pboSubmit | safetyMs | safetyLoops | traceSeq | prodGap | renderGap | consume->present | presentInterval | presentErr | fqP2C | fqPcs | fqCcs | fqSched | fqCS2 | fqPHold | fqCHold | fqSigWait | render2t0 | submit2dwm | dwmDispInt | dwmFrameStep | dwmMissStep | dwmDropStep | dwmLateStep | dwmLate | dwmSrc | dwmHr | dwmFrame | dwmRefresh | dwmVBlankInt | dwmComposeInt | dwmLateCount | dwmOutstanding | dwmUnique | dwmAvail | dwmMiss | dwmDrop | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
 
         // P43 (session 20): t0->t4 only spans GL_DrawFrame+OnFrameEnd+
         // UpdateDRC -- the video-draw slice of a frame. It does NOT cover
@@ -1532,6 +1649,18 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                              (e.t4  - e.t3)  * 1000.0 / freq : 0.0;
                 double dtot= (e.t4 > e.t0 && e.t0 > 0) ?
                              (e.t4  - e.t0)  * 1000.0 / freq : 0.0;
+                double pboOrphanMs = (e.pboOrphanEndQPC > e.pboSetupEndQPC && e.pboSetupEndQPC > 0) ?
+                                    (e.pboOrphanEndQPC - e.pboSetupEndQPC) * 1000.0 / freq : 0.0;
+                double pboMapMs = (e.pboMapEndQPC > e.pboOrphanEndQPC && e.pboOrphanEndQPC > 0) ?
+                                  (e.pboMapEndQPC - e.pboOrphanEndQPC) * 1000.0 / freq : 0.0;
+                double pboCopyMs = (e.pboCopyEndQPC > e.pboMapEndQPC && e.pboMapEndQPC > 0) ?
+                                   (e.pboCopyEndQPC - e.pboMapEndQPC) * 1000.0 / freq : 0.0;
+                double pboUnmapMs = (e.pboUnmapEndQPC > e.pboCopyEndQPC && e.pboCopyEndQPC > 0) ?
+                                    (e.pboUnmapEndQPC - e.pboCopyEndQPC) * 1000.0 / freq : 0.0;
+                double pboSubmitMs = (e.pboSubmitEndQPC > e.pboUnmapEndQPC && e.pboUnmapEndQPC > 0) ?
+                                     (e.pboSubmitEndQPC - e.pboUnmapEndQPC) * 1000.0 / freq :
+                                     ((e.pboSubmitEndQPC > e.pboSetupEndQPC && e.pboSetupEndQPC > 0) ?
+                                      (e.pboSubmitEndQPC - e.pboSetupEndQPC) * 1000.0 / freq : 0.0);
                 double dprod = (e.tProd > 0 && e.t0 >= e.tProd) ?
                                (e.t0 - e.tProd) * 1000.0 / freq : 0.0;
                 double dpace2prod = (e.paceWake > 0 && e.tProd >= e.paceWake) ?
@@ -1631,7 +1760,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 bool presentStalled = (dpresent > 0.0 && fabs(presentErr) > 2.0);
 
                 _ftprintf(f,
-                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  paceEnter=%6.2f  paceWait=%6.2f  pace->prod=%6.2f  postPaceCPU=%6.2f  postPaceWall=%6.2f  postPaceCycles=%I64u  buildWall=%6.2f  buildCPU=%6.2f  buildCycles=%I64u  swapCPU=%6.2f  swapCycles=%I64u  safetyMs=%6.2f  safetyLoops=%d  traceSeq=%I64d  prodGap=%7.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fqP2C=%6.2f  fqPcs=%5.2f  fqCcs=%5.2f  fqSched=%6.2f  fqCS2=%5.2f  fqPHold=%5.2f  fqCHold=%5.2f  fqSigWait=%6.2f  render2t0=%6.2f  submit2dwm=%7.2f  dwmDisp=%7.2f  dwmFrameStep=%2lld  dwmMissStep=%2lld  dwmDropStep=%2lld  dwmLateStep=%2lld  dwmLate=%d  dwmSrc=%d  dwmHr=0x%08lX  dwmFrame=%I64u  dwmRefresh=%I64u  dwmVBlankInt=%7.2f  dwmComposeInt=%7.2f  dwmLateCount=%I64u  dwmOutstanding=%I64u  dwmUnique=%I64u  dwmAvail=%I64u  dwmMiss=%I64u  dwmDrop=%I64u  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
+                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  paceEnter=%6.2f  paceWait=%6.2f  pace->prod=%6.2f  postPaceCPU=%6.2f  postPaceWall=%6.2f  postPaceCycles=%I64u  buildWall=%6.2f  buildCPU=%6.2f  buildCycles=%I64u  swapCPU=%6.2f  swapCycles=%I64u  pboOrphan=%6.3f  pboMap=%6.3f  pboCopy=%6.3f  pboUnmap=%6.3f  pboSubmit=%6.3f  safetyMs=%6.2f  safetyLoops=%d  traceSeq=%I64d  prodGap=%7.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fqP2C=%6.2f  fqPcs=%5.2f  fqCcs=%5.2f  fqSched=%6.2f  fqCS2=%5.2f  fqPHold=%5.2f  fqCHold=%5.2f  fqSigWait=%6.2f  render2t0=%6.2f  submit2dwm=%7.2f  dwmDisp=%7.2f  dwmFrameStep=%2lld  dwmMissStep=%2lld  dwmDropStep=%2lld  dwmLateStep=%2lld  dwmLate=%d  dwmSrc=%d  dwmHr=0x%08lX  dwmFrame=%I64u  dwmRefresh=%I64u  dwmVBlankInt=%7.2f  dwmComposeInt=%7.2f  dwmLateCount=%I64u  dwmOutstanding=%I64u  dwmUnique=%I64u  dwmAvail=%I64u  dwmMiss=%I64u  dwmDrop=%I64u  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
                         e.frameNum,
                         (unsigned __int64)e.emuFrame,
                         dprod,
@@ -1648,6 +1777,11 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                         buildCycles,
                         swapCpuMs,
                         swapCycles,
+                        pboOrphanMs,
+                        pboMapMs,
+                        pboCopyMs,
+                        pboUnmapMs,
+                        pboSubmitMs,
                         safetyMs,
                         (int)e.mmrSafetyLoops,
                         (long long)e.mmrTraceSeq,
@@ -1944,6 +2078,12 @@ static void GL_DrawFrame(void)
                 s_diagBuf[idx].dwmValid = 0;
                 s_diagBuf[idx].dwmSource = -1;
                 s_diagBuf[idx].dwmHr = 0;
+                s_diagBuf[idx].pboSetupEndQPC = 0;
+                s_diagBuf[idx].pboOrphanEndQPC = 0;
+                s_diagBuf[idx].pboMapEndQPC = 0;
+                s_diagBuf[idx].pboCopyEndQPC = 0;
+                s_diagBuf[idx].pboUnmapEndQPC = 0;
+                s_diagBuf[idx].pboSubmitEndQPC = 0;
                 s_diagBuf[idx].frameNum = s_diagFrameNum;
                 s_diagHead = (s_diagHead + 1) % DIAG_FRAMES;
         }
@@ -1981,21 +2121,17 @@ static void GL_DrawFrame(void)
         if (s_PBOReady)
         {
                 // -------------------------------------------------------
-                // ASYNC PBO PATH (P29): eliminates glTexSubImage2D stall.
+                // ASYNC PBO PATH (P29/P83).
                 //
-                // We use two PBOs in ping-pong fashion:
-                //   - Bind PBO[index], map it, memcpy pixels, unmap.
-                //   - Call glTexSubImage2D with offset=NULL (reads from PBO).
-                //     This queues a DMA transfer and returns IMMEDIATELY --
-                //     no waiting for the GPU to finish reading last frame.
-                //   - Next frame: bind the OTHER PBO (which the GPU had a
-                //     full frame period ~16ms to finish DMAing), map, write,
-                //     etc. By then the DMA is long done so the map is instant.
+                // P83 uses four streaming PBOs instead of two. With the
+                // windowed path's weak SwapBuffers backpressure, two buffers
+                // were not enough to guarantee that the buffer selected on
+                // this frame was no longer in flight on the GPU.
                 //
-                // The stall (tex=24ms) happened because the CPU was waiting
-                // for the GPU to finish reading the texture before overwriting
-                // it. With PBO the driver manages that synchronisation via
-                // DMA, overlapping GPU read of frame N with CPU write of N+1.
+                // The PBO still decouples CPU frame construction from texture
+                // DMA; the larger pool gives the driver more room to retire
+                // submitted transfers without forcing glMapBuffer() to
+                // synchronize with an earlier frame.
                 // -------------------------------------------------------
                 GLuint writePBO = s_PBO[s_PBOIndex];
                 pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, writePBO);
@@ -2028,7 +2164,7 @@ static void GL_DrawFrame(void)
 
                 pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
                 // Advance to the other PBO for the next frame.
-                s_PBOIndex ^= 1;
+                s_PBOIndex = (s_PBOIndex + 1) % PBO_COUNT;
         }
         else
         {
