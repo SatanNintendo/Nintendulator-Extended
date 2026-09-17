@@ -195,6 +195,20 @@ static bool              g_BufferCSInit    = false;
 static HANDLE            g_AudioCtrlThread = NULL;
 static volatile LONG     g_AudioCtrlStop   = 0L;
 static volatile LONG     g_AudioCtrlReady  = 0L;
+static volatile LONG     g_AudioWorkerPolls = 0L;
+static volatile LONG     g_AudioSetFreqCalls = 0L;
+static volatile LONG     g_AudioPlayStarts = 0L;
+static volatile LONG     g_AudioSafetyWaits = 0L;
+static volatile LONG     g_AudioCurrentFreq = FREQ;
+
+// P88: do not start DirectSound playback until the first complete audio slot
+// has been written. Starting the secondary buffer immediately after zeroing it
+// lets the play cursor race the first Lock/Unlock on a cold start. On machines
+// where DirectSound/WASAPI starts with a different scheduling phase, that race
+// can manifest as a persistent crackle which disappears after a stop/start or
+// fullscreen toggle. The buffer is therefore primed while stopped, then Play()
+// is issued exactly once after slot 0 has been filled.
+static volatile LONG     g_AudioPlayPending = 0L;
 
 // Runs on the worker thread. Grabs a ref-counted snapshot of Buffer under
 // g_BufferCS so it can never race with APU::Stop()'s Release(). See the
@@ -214,17 +228,31 @@ static void AudioCtrlTick()
                 return;
         }
 
+        InterlockedIncrement(&g_AudioWorkerPolls);
+
         // Apply a pending full-frequency reset first (matches the original
         // ordering in UpdateDRC: reset takes priority over a stale in-flight
         // DRC target computed against the pre-reset frequency).
         LONG pendingReset = InterlockedExchange(&g_PendingFreq, -1L);
         if (pendingReset > 0)
-                localBuf->SetFrequency((DWORD)pendingReset);
+        {
+                if (SUCCEEDED(localBuf->SetFrequency((DWORD)pendingReset)))
+                {
+                        InterlockedIncrement(&g_AudioSetFreqCalls);
+                        InterlockedExchange(&g_AudioCurrentFreq, pendingReset);
+                }
+        }
 
         // Apply the most recent DRC-computed target, if any.
         LONG pendingDRC = InterlockedExchange(&g_DRCApplyFreq, -1L);
         if (pendingDRC > 0)
-                localBuf->SetFrequency((DWORD)pendingDRC);
+        {
+                if (SUCCEEDED(localBuf->SetFrequency((DWORD)pendingDRC)))
+                {
+                        InterlockedIncrement(&g_AudioSetFreqCalls);
+                        InterlockedExchange(&g_AudioCurrentFreq, pendingDRC);
+                }
+        }
 
         // Refresh the position caches. This is the one GetCurrentPosition
         // call in the whole pipeline now -- entirely off the NES thread.
@@ -243,18 +271,18 @@ static void AudioCtrlTick()
 
 static DWORD WINAPI AudioCtrlThreadProc(void*)
 {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         InterlockedExchange(&g_AudioCtrlReady, 1L);
 
         while (!InterlockedExchangeAdd(&g_AudioCtrlStop, 0L))
         {
                 AudioCtrlTick();
-                // ~8ms cadence: finer than the old once-per-frame (16.7ms)
-                // refresh, and this thread is not on any vblank-critical
-                // path, so plain Sleep() granularity is fine here -- no
-                // need for the high-resolution waitable timer used by
-                // MonitorSync::PaceFrame.
-                Sleep(8);
+                // P88: this worker is diagnostic/safety support, not the
+                // pacing clock. Polling audiodg every 8ms at ABOVE_NORMAL
+                // priority could itself disturb the Windows 7 audio engine.
+                // A 32ms low-priority cadence still leaves plenty of headroom
+                // inside the 100ms (6-slot) ring buffer.
+                Sleep(32);
         }
         return 0;
 }
@@ -1275,6 +1303,33 @@ void    SetRegion (void)
 #endif  /* !NSFPLAYER */
 }
 
+#ifndef NSFPLAYER
+long GetAudioWorkerPolls(void)
+{
+        return (long)InterlockedExchangeAdd(&g_AudioWorkerPolls, 0L);
+}
+long GetAudioSetFreqCalls(void)
+{
+        return (long)InterlockedExchangeAdd(&g_AudioSetFreqCalls, 0L);
+}
+long GetAudioPlayStarts(void)
+{
+        return (long)InterlockedExchangeAdd(&g_AudioPlayStarts, 0L);
+}
+long GetAudioSafetyWaits(void)
+{
+        return (long)InterlockedExchangeAdd(&g_AudioSafetyWaits, 0L);
+}
+long GetAudioCurrentFreq(void)
+{
+        return (long)InterlockedExchangeAdd(&g_AudioCurrentFreq, 0L);
+}
+long GetAudioPlayPending(void)
+{
+        return (long)InterlockedExchangeAdd(&g_AudioPlayPending, 0L);
+}
+#endif
+
 // Forward the current NES region to the MonitorSync module.
 // Implemented here (rather than in NES.cpp) so the call site does not
 // have to include MonitorSync.h, and so the dependency on
@@ -1294,6 +1349,7 @@ void    Init (void)
         Buffer          = NULL;
         buffer          = nullptr;
         isEnabled       = FALSE;
+        InterlockedExchange(&g_AudioPlayPending, 0L);
 
         // P30: critical section guarding the Buffer pointer against the
         // audio-control worker thread. Initialised once here; deleted in
@@ -1493,6 +1549,7 @@ void    SoundOFF (void)
         if (!isEnabled)
                 return;
         isEnabled = FALSE;
+        InterlockedExchange(&g_AudioPlayPending, 0L);
         if (Buffer)
                 Buffer->Stop();
 }
@@ -1519,12 +1576,32 @@ void    SoundON (void)
         // calls SoundOFF/SoundON and was observed to cure the crackle, so make
         // that recovery deterministic rather than driver-position dependent.
         Try(Buffer->SetCurrentPosition(0), Lang::GetString(LANG_ERR_APU_BUFFER));
-        Try(Buffer->SetFrequency(FREQ), Lang::GetString(LANG_ERR_APU_BUFFER));
+        // P88: keep the buffer stopped until the first complete audio slot
+        // has been copied into slot 0. This removes the cold-start race
+        // between DirectSound's play cursor and the first producer Lock().
+        // The control worker is responsible for the MMR frequency target;
+        // non-MMR operation remains at the native 44100 Hz rate.
         isEnabled = TRUE;
-        Try(Buffer->Play(0, 0, DSBPLAY_LOOPING), Lang::GetString(LANG_ERR_APU_BUFFER));
+        InterlockedExchange(&g_AudioPlayPending, 1L);
         next_pos = 0;
-        // Reset DRC to standard frequency on every sound start
-        drc_play_freq = FREQ;
+        // P88: establish the correct playback rate while the buffer is still
+        // stopped. For MMR this is targetHz/NESHz; for normal operation it is
+        // the native 44100 Hz. Doing this before Play() avoids changing the
+        // DirectSound rate underneath active playback on the cold-start path.
+        DWORD startFreq = FREQ;
+        if (MonitorSync::IsEnabled())
+        {
+                double targetHz = MonitorSync::GetTargetHz();
+                double nesHz = MonitorSync::GetNESHz();
+                if (targetHz > 0.0 && nesHz > 0.0)
+                        startFreq = (DWORD)((double)FREQ * (targetHz / nesHz) + 0.5);
+        }
+        if (startFreq < 100) startFreq = 100;
+        if (startFreq > 100000) startFreq = 100000;
+        Try(Buffer->SetFrequency(startFreq), Lang::GetString(LANG_ERR_APU_BUFFER));
+        InterlockedIncrement(&g_AudioSetFreqCalls);
+        InterlockedExchange(&g_AudioCurrentFreq, (LONG)startFreq);
+        drc_play_freq = startFreq;
         // Invalidate the DS position cache so the first APU::Run pre-check
         // after start uses a live GetCurrentPosition call rather than stale
         // data from a previous session. UpdateDRC will populate the cache
@@ -1882,19 +1959,21 @@ void    UpdateDRC (void)
         if (!Buffer || !isEnabled)
                 return;
 
-        // P87: MMR owns the cadence of fixed-size audio slots. Once that
-        // cadence is locked to the monitor target, the correct DirectSound
-        // playback rate is deterministic:
+        // P88: MMR owns the cadence of NES video frames. Audio slots are
+        // produced from the same NES master clock, so when the frame rate is
+        // slowed from 60.0988 Hz to a 60.000 Hz display, the generated audio
+        // sample rate slows by the same ratio. The correct DirectSound target
+        // is therefore deterministic:
         //
-        //     audio_hz = FREQ * (target_hz / NES_frame_hz)
+        //     audio_hz = FREQ * (target_hz / NES_native_hz)
         //
-        // The previous Layer-2 DRC inferred emulator queue fill from the
-        // DirectSound hardware write cursor minus play cursor. That is not
-        // the amount of audio queued by the emulator. The feedback loop could
-        // therefore keep posting SetFrequency() changes even while the
-        // software producer/consumer cadence was already correct. Because
-        // SetFrequency crosses into the Windows audio engine, those repeated
-        // rate changes are a plausible source of audible crackle.
+        // The old Layer-2 DRC inferred emulator queue fill from the DirectSound
+        // hardware write cursor minus play cursor. That is not the amount of
+        // audio queued by the emulator. The feedback loop could keep posting
+        // SetFrequency() changes even while the software producer/consumer
+        // cadence was already correct. Because SetFrequency crosses into the
+        // Windows audio engine, those repeated rate changes were a plausible
+        // source of audible crackle.
         //
         // P87 removes that fill-feedback loop. MMR now determines the audio
         // rate from the same target clock that determines PaceSlot(). The
@@ -1904,9 +1983,14 @@ void    UpdateDRC (void)
         if (MonitorSync::IsEnabled())
         {
                 double targetHz = MonitorSync::GetTargetHz();
-                double frameHz  = MonitorSync::GetFrameHz();
-                if (frameHz > 0.0 && targetHz > 0.0)
-                        newFreqD = (double)FREQ * (targetHz / frameHz);
+                double nesHz    = MonitorSync::GetNESHz();
+                // P88: audio data is generated from the NES master clock.
+                // Once frame pacing is slowed from 60.0988 -> 60.000 Hz,
+                // the generated sample rate falls by the same ratio. The
+                // DirectSound playback frequency must therefore be target/NES,
+                // not target/nominalFrame(60.0).
+                if (nesHz > 0.0 && targetHz > 0.0)
+                        newFreqD = (double)FREQ * (targetHz / nesHz);
         }
 
         // Keep the existing hard safety envelope.
@@ -1991,35 +2075,43 @@ void    Run (void)
                         LARGE_INTEGER p73PaceEnter = {0}, p73PaceWake = {0};
                         LARGE_INTEGER p73SafetyBegin = {0}, p73SafetyEnd = {0};
                         ULONGLONG p80PaceWakeCycles = 0;
+                        // P88: MMR is now frame-driven. The display cadence is
+                        // paced once per NES frame in GFX::DrawScreen, not when
+                        // the APU happens to cross its 735-sample slot boundary.
+                        // The audio slot writer therefore performs NO display
+                        // pacing here. This is the key separation between
+                        // video timing and DirectSound buffering.
                         QueryPerformanceCounter(&p73PaceEnter);
-                        MonitorSync::PaceSlot();
-                        QueryPerformanceCounter(&p73PaceWake);
+                        p73PaceWake = p73PaceEnter;
                         QueryThreadCycleTime(GetCurrentThread(), &p80PaceWakeCycles);
                         LONG p73SafetyLoops = 0;
 
+                        // Keep the cached cursor only as a safety check. If the
+                        // buffer is ever reported critically full, use a short
+                        // real-time sleep rather than consuming another monitor
+                        // cadence slot. Under normal matched-rate operation this
+                        // path is not entered (and the current logs show
+                        // safetyLoops=0 throughout the steady-state window).
                         LONG cacheAge = InterlockedExchangeAdd(&g_DSCacheAge, 1L);
-                        if (cacheAge <= 2)
+                        if (cacheAge <= 4)
                         {
                                 unsigned long sr = (unsigned long)InterlockedExchangeAdd(&g_DSCacheRpos, 0L);
                                 unsigned long sw = (unsigned long)InterlockedExchangeAdd(&g_DSCacheWpos, 0L);
                                 if (sw < sr) sw += FRAMEBUF;
 
-                                // If the target slot is critically overfull,
-                                // allow at most two additional paced intervals
-                                // for the playback cursor to advance. This is
-                                // deliberately bounded: a temporary audio
-                                // hiccup must never freeze the whole emulator.
                                 int safetyLoops = 0;
                                 QueryPerformanceCounter(&p73SafetyBegin);
                                 while ((sr <= next_pos) && (next_pos <= sw) && safetyLoops < 2)
                                 {
-                                        MonitorSync::PaceSlot();
+                                        Sleep(1);
                                         sr = (unsigned long)InterlockedExchangeAdd(&g_DSCacheRpos, 0L);
                                         sw = (unsigned long)InterlockedExchangeAdd(&g_DSCacheWpos, 0L);
                                         if (sw < sr) sw += FRAMEBUF;
                                         ++safetyLoops;
                                 }
                                 p73SafetyLoops = safetyLoops;
+                                if (safetyLoops > 0)
+                                        InterlockedExchangeAdd(&g_AudioSafetyWaits, safetyLoops);
                                 QueryPerformanceCounter(&p73SafetyEnd);
                         }
 
@@ -2087,6 +2179,17 @@ void    Run (void)
                         Try(Buffer->Lock(next_pos * LockSize, LockSize, &bufPtr, &bufBytes, NULL, 0, 0), Lang::GetString(LANG_ERR_APU_BUFFER));
                         memcpy(bufPtr, buffer, bufBytes);
                         Try(Buffer->Unlock(bufPtr, bufBytes, NULL, 0), Lang::GetString(LANG_ERR_APU_BUFFER));
+
+                        // P88: start playback only after a complete slot has
+                        // been written. Until this point the DirectSound play
+                        // cursor is stationary at zero, so slot 0 can never be
+                        // overwritten underneath active playback.
+                        if (InterlockedExchange(&g_AudioPlayPending, 0L) != 0)
+                        {
+                                Try(Buffer->Play(0, 0, DSBPLAY_LOOPING), Lang::GetString(LANG_ERR_APU_BUFFER));
+                                InterlockedIncrement(&g_AudioPlayStarts);
+                        }
+
                         next_pos = (next_pos + 1) % FRAMEBUF;
 
                         // NOTE: SetFrequency is NO LONGER called from here.

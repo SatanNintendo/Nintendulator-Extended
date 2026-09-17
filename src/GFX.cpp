@@ -1585,6 +1585,13 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 (long)InterlockedExchangeAdd(&s_FQSkippedFrames, 0));
         _ftprintf(f, _T("PBO streaming: ready=%d count=%d\n"),
                 s_PBOReady ? 1 : 0, PBO_COUNT);
+        _ftprintf(f, _T("Audio MMR state: workerPolls=%ld setFreq=%ld playStarts=%ld playPending=%ld currentFreq=%ld safetyWaits=%ld\n"),
+                APU::GetAudioWorkerPolls(),
+                APU::GetAudioSetFreqCalls(),
+                APU::GetAudioPlayStarts(),
+                APU::GetAudioPlayPending(),
+                APU::GetAudioCurrentFreq(),
+                APU::GetAudioSafetyWaits());
         _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | paceEnter | paceWait | pace->produce | postPaceCPU | postPaceWall | postPaceCycles | buildWall | buildCPU | buildCycles | swapCPU | swapCycles | pboOrphan | pboMap | pboCopy | pboUnmap | pboSubmit | safetyMs | safetyLoops | traceSeq | prodGap | renderGap | consume->present | presentInterval | presentErr | fqP2C | fqPcs | fqCcs | fqSched | fqCS2 | fqPHold | fqCHold | fqSigWait | render2t0 | submit2dwm | dwmDispInt | dwmFrameStep | dwmMissStep | dwmDropStep | dwmLateStep | dwmLate | dwmSrc | dwmHr | dwmFrame | dwmRefresh | dwmVBlankInt | dwmComposeInt | dwmLateCount | dwmOutstanding | dwmUnique | dwmAvail | dwmMiss | dwmDrop | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
 
         // P43 (session 20): t0->t4 only spans GL_DrawFrame+OnFrameEnd+
@@ -3314,6 +3321,37 @@ void    DrawScreen (void)
                 AVI::AddVideo();
         if (SlowDown)
                 Sleep(SlowRate * 1000 / WantFPS);
+
+        // P88: authoritative MMR pacing now happens at the NES frame boundary,
+        // not when APU::Run crosses its fixed 735-sample audio slot boundary.
+        // The old arrangement left the NES producer close to its native
+        // 60.0988 Hz while the monitor was 60.000 Hz, so the render queue had
+        // to absorb the 0.0988 Hz beat. That can look like a tiny scroll hitch
+        // even when every individual present is near 16.67 ms.
+        //
+        // By pacing here, exactly one emulated video frame consumes exactly one
+        // monitor-period target. Audio buffering remains independent and gets
+        // its playback-rate correction from targetHz / NESHz in APU::UpdateDRC.
+        if (MatchMonitorRate)
+        {
+                LARGE_INTEGER mmrFramePaceEnter = {0}, mmrFramePaceWake = {0};
+                ULONGLONG mmrFramePaceCycles = 0;
+                QueryPerformanceCounter(&mmrFramePaceEnter);
+                MonitorSync::PaceFrame();
+                QueryPerformanceCounter(&mmrFramePaceWake);
+                QueryThreadCycleTime(GetCurrentThread(), &mmrFramePaceCycles);
+                SetMMRProducerTrace(
+                        mmrFramePaceEnter.QuadPart,
+                        mmrFramePaceEnter.QuadPart,
+                        mmrFramePaceWake.QuadPart,
+                        0,
+                        mmrFramePaceCycles,
+                        0,
+                        0,
+                        0,
+                        0);
+        }
+
         if ((++FPSCnt > FSkip) || forceNoSkip)
         {
                 // P54 (Stage 2): two-threaded path. When the render thread is
@@ -3351,10 +3389,10 @@ void    DrawScreen (void)
                         Update();
                 }
                 FPSCnt = 0;
-                // MMR's cadence is established in APU::Run/PaceSlot before
-                // this frame is produced. OnFrameEnd is now only a lightweight
-                // compatibility hook; monitor-rate measurement is independent
-                // of emulator frame timing.
+                // MMR cadence was already consumed at this frame boundary by
+                // PaceFrame(). OnFrameEnd is now only a lightweight compatibility
+                // hook; monitor-rate measurement is independent of emulator
+                // frame timing.
                 if (MatchMonitorRate)
                 {
                         MonitorSync::OnFrameEnd();

@@ -64,8 +64,10 @@ namespace MonitorSync
         // It no longer calibrates the monitor rate from emulator timing.
         void    OnFrameEnd ();
 
-        // Authoritative MMR cadence hook. Kept as a compatibility wrapper;
-        // new code should use PaceSlot(), which targets the display clock.
+        // Authoritative MMR cadence hook. Must be called exactly once per NES
+        // video frame. The internal monitor-clock scheduler may re-use the
+        // legacy PaceSlot implementation, but the semantic unit is now a
+        // VIDEO FRAME, not an APU audio slot.
         void    PaceFrame ();
 
         // Reset per-frame timing state. Called when (re)starting emulation
@@ -178,13 +180,12 @@ namespace MonitorSync
         int     GetDwmSyncMode ();
 
 
-        // Authoritative emulator-frame/audio-slot pacer. Each slot is paced
-        // from the PREVIOUS slot write using GetTargetHz(), so the emulator
-        // cadence itself matches the monitor clock (for supported near-rate
-        // combinations) instead of relying on frame-dropping in the renderer.
+        // Legacy/internal monitor-clock wait primitive used by PaceFrame().
+        // P88 no longer calls this from APU::Run; audio-slot generation must
+        // remain independent from the video-frame cadence.
         void    PaceSlot ();
 
-        // P67: diagnostic-only snapshot of the most recent PaceSlot timing.
+        // Diagnostic-only snapshot of the most recent PaceFrame/PaceSlot timing.
         // These values are observational and are never used to alter pacing.
         // sourcePresentation is TRUE when the presentation-anchored branch
         // was used; FALSE means the absolute-QPC fallback branch was used.

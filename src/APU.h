@@ -59,6 +59,14 @@ void    ResetDRC        (void);
 // NSFPLAYER build does not use MonitorSync, so the function is absent there.
 void    NotifyMonitorSyncRegion (void);
 
+// P88 diagnostic counters for MMR/DirectSound startup and steady state.
+long    GetAudioWorkerPolls (void);
+long    GetAudioSetFreqCalls (void);
+long    GetAudioPlayStarts (void);
+long    GetAudioSafetyWaits (void);
+long    GetAudioCurrentFreq (void);
+long    GetAudioPlayPending (void);
+
 // P30: dedicated audio-control background thread.
 //
 // Starts/stops a low-priority worker thread that owns 100% of the

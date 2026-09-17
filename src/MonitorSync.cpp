@@ -386,7 +386,8 @@ static volatile LONG     g_PresentationIntervalErrUs = 0;
 // from being interpreted as a real presentation cadence.
 static volatile ULONGLONG g_LastDwmCompositionFrame = 0;
 static volatile LONG       g_PresentationSampleStreak = 0;
-// P86: DWM supplies phase, while PaceSlot owns one slot of cadence per call.
+// P86/P88: DWM supplies phase, while PaceSlot owns one display-period target
+// per call. In P88 the semantic caller is PaceFrame(), once per NES frame.
 static volatile LONGLONG  g_PresentationAnchorQPC = 0;
 static volatile ULONGLONG g_PresentationAnchorFrame = 0;
 static volatile LONG      g_PresentationAnchorGeneration = 0;
@@ -712,17 +713,19 @@ double GetTargetHz()
     double monitorHz = GetMonitorHz();
     double frameHz = g_FrameHz;
     if (monitorHz < 30.0 || monitorHz > 1000.0 || frameHz <= 0.0)
-        return frameHz;
+        return (g_NESHz > 0.0) ? g_NESHz : frameHz;
 
-    // Match Monitor Rate is intended to remove the small clock mismatch
-    // between the emulator's nominal 60/50 Hz frame cadence and the physical
-    // display (for example 59.940 Hz or 60.000 Hz).  Do not accelerate a
+    // Match Monitor Rate removes the small clock mismatch between the native
+    // NES master-clock rate and the physical display. Do not accelerate a
     // 60-Hz game to a 75/120/144-Hz desktop refresh: those modes require frame
     // duplication rather than changing emulation speed.
     double relative = fabs(monitorHz - frameHz) / frameHz;
     if (relative <= 0.05)
         return monitorHz;
-    return frameHz;
+    // Outside the supported near-rate window, stay at the actual NES-native
+    // rate, not the nominal rounded 60/50 Hz label. This keeps MMR from
+    // unintentionally slowing NTSC 60.0988 Hz on a 75/120/144 Hz desktop.
+    return g_NESHz;
 }
 
 double GetFrameHz()
@@ -915,7 +918,8 @@ void PaceSlot()
             QueryPerformanceCounter(&paceWake);
             RecordPaceDiagnostic(targetQPC, paceWake.QuadPart, 1);
 
-            // Critical P86 rule: one cadence step per PaceSlot invocation.
+            // Critical P86/P88 rule: one display-period target is consumed per
+            // PaceFrame invocation.
             s_nextPresentationTargetQPC = targetQPC + period;
             return;
         }
@@ -1159,8 +1163,9 @@ double GetPresentationIntervalErrorMs()
 
 void PaceFrame()
 {
-    // Compatibility wrapper for legacy callers. MMR's only real cadence
-    // source is the monitor-rate PaceSlot schedule.
+    // P88: this is the authoritative MMR frame boundary. PaceSlot() contains
+    // the actual monitor-clock wait logic for historical API compatibility,
+    // but callers now invoke this wrapper exactly once per NES video frame.
     PaceSlot();
 }
 
