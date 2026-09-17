@@ -104,417 +104,31 @@ static volatile LONG    g_DSCacheWpos   = -1L;
 static volatile LONG    g_DSCacheAge    = 99L;
 
 // ------------------------------------------------------------------
-// P30/P90 — Audio control background thread.
+// P93 — no background DirectSound control thread.
 //
-// P30 moved DirectSound control calls off the NES thread. P90 tightens this
-// further: while MMR is active, the worker is event-driven and performs only
-// deferred SetFrequency() requests. It no longer calls GetCurrentPosition()
-// every few milliseconds. MMR's write-ahead safety check predicts the
-// consumer slot from QPC, so steady-state audio no longer depends on an
-// audiodg.exe polling cadence.
-//
-// This preserves the original non-MMR GetCurrentPosition safety path while
-// removing recurring audio-engine IPC from the MMR path. SetFrequency remains
-// deferred whenever it is requested by UpdateDRC/ResetDRC.
-//
-// The worker touches the COM Buffer pointer, which the NES thread can set to
-// NULL and Release() during APU::Stop(), region switches, and ROM close.
-// g_BufferCS + an AddRef-while-locked pattern makes this safe.
-// THREAD SAFETY:
-//   The worker touches the COM `Buffer` pointer, which the NES thread
-//   can set to NULL and Release() at any time (APU::Stop(), region
-//   switches, ROM close). g_BufferCS + an AddRef-while-locked pattern
-//   (see AudioCtrlTick) makes this safe: the worker either observes a
-//   live, ref-counted Buffer for the duration of its call, or observes
-//   NULL and skips the tick. APU::Stop() only nulls the pointer and
-//   calls Release() outside the critical section, so a slow worker call
-//   cannot be starved by holding the lock, and Stop() cannot free the
-//   object while the worker is using it. This lock is only ever
-//   contended around Stop()/region-switch (rare, not part of the
-//   steady 60fps path), never during normal gameplay.
+// The previous P30/P90/P91/P92 worker architecture is deliberately removed
+// from the active path.  It could block in SetFrequency/GetCurrentPosition
+// inside audiodg.exe, and P92 waited indefinitely for that worker during MMR
+// shutdown.  MMR does not need a consumer cursor at all: producer cadence and
+// the DirectSound sample clock are deterministic once the ring is primed.
+// Frequency changes are therefore performed only during an explicit
+// SoundOFF/SoundON transition when Match Monitor Rate is toggled.
 // ------------------------------------------------------------------
-static volatile LONG    g_DSCacheRposBytes = -1L; // byte-precision play cursor
-static volatile LONG    g_DSCacheWposBytes = -1L; // byte-precision write cursor
-static volatile LONG    g_DRCApplyFreq     = -1L; // DRC-computed target freq, -1 = none pending
-
-static CRITICAL_SECTION g_BufferCS;
-static bool              g_BufferCSInit    = false;
-
-static HANDLE            g_AudioCtrlThread = NULL;
-static HANDLE            g_AudioCtrlWakeEvent = NULL;
-static volatile LONG     g_AudioCtrlStop   = 0L;
-static volatile LONG     g_AudioCtrlReady  = 0L;
 static volatile LONG     g_AudioWorkerPolls = 0L;
 static volatile LONG     g_AudioSetFreqCalls = 0L;
 static volatile LONG     g_AudioPlayStarts = 0L;
 static volatile LONG     g_AudioSafetyWaits = 0L;
 static volatile LONG     g_AudioCurrentFreq = FREQ;
-static double GetEffectiveProducerSampleRate();
 
-// P90: keep a larger, deterministic audio lead before starting DirectSound.
-// Four complete slots are about 66.7 ms at 60 Hz, while the total ring remains
-// 100 ms. This leaves substantial scheduler headroom without changing any
-// emulated APU timing.
+// P93: prime four complete slots (~66.7 ms at 60 Hz) before Play().
 #define AUDIO_PRIME_SLOTS 4
 static volatile LONG     g_AudioPrimeSlots = 0L;
-
-// P90: MMR no longer polls audiodg.exe for the hardware play cursor.
-// Predict the consumer slot from the QPC timestamp captured when Play()
-// starts. This is only a conservative buffer-safety check and never affects
-// CPU/PPU/APU emulation timing.
-static LARGE_INTEGER      g_AudioPlayStartQPC = {0};
-static LARGE_INTEGER      g_AudioQPCFreq = {0};
-static volatile LONG     g_AudioPlayStarted = 0L;
-
-// P91: DirectSound position notifications provide the actual consumer phase
-// without recurring GetCurrentPosition IPC and without assuming the audio
-// engine clock is perfectly locked to QPC.
-static HANDLE             g_AudioNotifyEvents[FRAMEBUF] = {0};
-static HANDLE             g_AudioCtrlStopEvent = NULL;
-static volatile LONG      g_AudioNotifyActive = 0L;
-static volatile LONG      g_AudioNotifyPlaySlot = 0L;
-static volatile LONG      g_AudioNotifySignals = 0L;
-static volatile LONGLONG  g_AudioLastNotifyQPC = 0;
-static volatile LONG      g_AudioNotifyPeriodUs = 0L;
-
-static unsigned long PredictAudioPlaySlot()
-{
-        if (!InterlockedExchangeAdd(&g_AudioPlayStarted, 0L) || LockSize == 0)
-                return next_pos;
-
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-
-        LONGLONG dq = now.QuadPart - g_AudioPlayStartQPC.QuadPart;
-        if (dq <= 0 || g_AudioQPCFreq.QuadPart <= 0)
-                return 0;
-
-        double elapsedSeconds = (double)dq / (double)g_AudioQPCFreq.QuadPart;
-        double playedSamples = elapsedSeconds * (double)InterlockedExchangeAdd(&g_AudioCurrentFreq, 0L);
-
-        const unsigned long samplesPerSlot = LockSize / (BITS / 8);
-        if (samplesPerSlot == 0)
-                return 0;
-
-        ULONGLONG slot = (ULONGLONG)(playedSamples / (double)samplesPerSlot);
-        return (unsigned long)(slot % FRAMEBUF);
-}
-
-static int AudioLeadSlots(unsigned long playSlot, unsigned long writeSlot)
-{
-        return (int)((writeSlot + FRAMEBUF - (playSlot % FRAMEBUF)) % FRAMEBUF);
-}
-
-static void ResetAudioNotifyEvents()
-{
-        for (int i = 0; i < FRAMEBUF; ++i)
-                if (g_AudioNotifyEvents[i])
-                        ResetEvent(g_AudioNotifyEvents[i]);
-}
-
-static void CloseAudioNotifyEvents()
-{
-        for (int i = 0; i < FRAMEBUF; ++i)
-        {
-                if (g_AudioNotifyEvents[i])
-                {
-                        CloseHandle(g_AudioNotifyEvents[i]);
-                        g_AudioNotifyEvents[i] = NULL;
-                }
-        }
-        InterlockedExchange(&g_AudioNotifyActive, 0L);
-}
-
-static bool CreateAudioNotifyEvents()
-{
-        for (int i = 0; i < FRAMEBUF; ++i)
-        {
-                if (!g_AudioNotifyEvents[i])
-                {
-                        g_AudioNotifyEvents[i] = CreateEvent(NULL, FALSE, FALSE, NULL);
-                        if (!g_AudioNotifyEvents[i])
-                        {
-                                CloseAudioNotifyEvents();
-                                return false;
-                        }
-                }
-        }
-        ResetAudioNotifyEvents();
-        return true;
-}
-
-static bool ConfigureAudioNotifications()
-{
-        if (!Buffer || !CreateAudioNotifyEvents() || LockSize == 0)
-                return false;
-
-        LPDIRECTSOUNDNOTIFY notify = NULL;
-        HRESULT hr = Buffer->QueryInterface(IID_IDirectSoundNotify, (LPVOID*)&notify);
-        if (FAILED(hr) || !notify)
-                return false;
-
-        DSBPOSITIONNOTIFY positions[FRAMEBUF];
-        for (int i = 0; i < FRAMEBUF; ++i)
-        {
-                positions[i].dwOffset = (DWORD)(i * LockSize);
-                positions[i].hEventNotify = g_AudioNotifyEvents[i];
-        }
-
-        hr = notify->SetNotificationPositions(FRAMEBUF, positions);
-        notify->Release();
-        if (FAILED(hr))
-                return false;
-
-        InterlockedExchange(&g_AudioNotifyActive, 1L);
-        return true;
-}
-
-static void OnAudioNotifySlot(int slot)
-{
-        if (slot < 0 || slot >= FRAMEBUF)
-                return;
-
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-        LONGLONG previousQPC = InterlockedExchange64(&g_AudioLastNotifyQPC, now.QuadPart);
-        if (previousQPC != 0 && g_AudioQPCFreq.QuadPart > 0)
-        {
-                LONGLONG dq = now.QuadPart - previousQPC;
-                LONG us = (LONG)((dq * 1000000LL) / g_AudioQPCFreq.QuadPart);
-                if (us > 0 && us < 1000000)
-                        InterlockedExchange(&g_AudioNotifyPeriodUs, us);
-        }
-        InterlockedExchange(&g_AudioNotifyPlaySlot, (LONG)slot);
-        InterlockedIncrement(&g_AudioNotifySignals);
-}
-
-static unsigned long GetAudioConsumerSlot()
-{
-        if (InterlockedExchangeAdd(&g_AudioNotifyActive, 0L) &&
-            InterlockedExchangeAdd(&g_AudioPlayStarted, 0L))
-        {
-                unsigned long slot = (unsigned long)(InterlockedExchangeAdd(&g_AudioNotifyPlaySlot, 0L) % FRAMEBUF);
-                LONGLONG lastQPC = InterlockedExchangeAdd64(&g_AudioLastNotifyQPC, 0);
-                LONG periodUs = InterlockedExchangeAdd(&g_AudioNotifyPeriodUs, 0L);
-
-                // Normally the notification thread updates the exact play slot.
-                // If Windows delayed the worker for an unusually long interval,
-                // advance conservatively from the last real DirectSound anchor
-                // rather than trusting a stale slot indefinitely.
-                if (lastQPC != 0 && periodUs > 0 && g_AudioQPCFreq.QuadPart > 0 && LockSize > 0)
-                {
-                        LARGE_INTEGER now;
-                        QueryPerformanceCounter(&now);
-                        LONGLONG age = now.QuadPart - lastQPC;
-                        LONGLONG staleQPC = (g_AudioQPCFreq.QuadPart * (LONGLONG)(periodUs * 2)) / 1000000LL;
-                        if (staleQPC < g_AudioQPCFreq.QuadPart / 50)
-                                staleQPC = g_AudioQPCFreq.QuadPart / 50; // 20 ms minimum
-                        if (age > staleQPC)
-                        {
-                                const unsigned long samplesPerSlot = LockSize / (BITS / 8);
-                                if (samplesPerSlot)
-                                {
-                                        double seconds = (double)age / (double)g_AudioQPCFreq.QuadPart;
-                                        double samples = seconds * (double)InterlockedExchangeAdd(&g_AudioCurrentFreq, 0L);
-                                        unsigned long extra = (unsigned long)(samples / (double)samplesPerSlot);
-                                        slot = (slot + extra) % FRAMEBUF;
-                                }
-                        }
-                }
-                return slot;
-        }
-        return PredictAudioPlaySlot();
-}
-
-// P88: do not start DirectSound playback until the first complete audio slot
-// has been written. Starting the secondary buffer immediately after zeroing it
-// lets the play cursor race the first Lock/Unlock on a cold start. On machines
-// where DirectSound/WASAPI starts with a different scheduling phase, that race
-// can manifest as a persistent crackle which disappears after a stop/start or
-// fullscreen toggle. The buffer is therefore primed while stopped, then Play()
-// is issued exactly once after slot 0 has been filled.
 static volatile LONG     g_AudioPlayPending = 0L;
+static volatile LONG     g_AudioRestartPending = 0L;
 
-// Runs on the worker thread. Grabs a ref-counted snapshot of Buffer under
-// g_BufferCS so it can never race with APU::Stop()'s Release(). See the
-// P30 header comment above for the full thread-safety argument.
-static void AudioCtrlTick()
-{
-        EnterCriticalSection(&g_BufferCS);
-        LPDIRECTSOUNDBUFFER localBuf = Buffer;
-        if (localBuf)
-                localBuf->AddRef();
-        LeaveCriticalSection(&g_BufferCS);
 
-        if (!localBuf || !isEnabled)
-        {
-                if (localBuf) localBuf->Release();
-                return;
-        }
-
-        InterlockedIncrement(&g_AudioWorkerPolls);
-
-        // P90: event-driven control only. There is no GetCurrentPosition()
-        // call here. P89 performed that audiodg IPC roughly every 32 ms even
-        // though the MMR producer/consumer cadence is deterministic. Removing
-        // the recurring IPC avoids a long-lived dependency on audiodg's service
-        // schedule, which is the strongest remaining explanation for a delayed
-        // crackle that disappeared after NES Stop/Start on fullscreen changes.
-
-        LONG pendingReset = InterlockedExchange(&g_PendingFreq, -1L);
-        if (pendingReset > 0)
-        {
-                if (SUCCEEDED(localBuf->SetFrequency((DWORD)pendingReset)))
-                {
-                        InterlockedIncrement(&g_AudioSetFreqCalls);
-                        InterlockedExchange(&g_AudioCurrentFreq, pendingReset);
-                }
-        }
-
-        LONG pendingDRC = InterlockedExchange(&g_DRCApplyFreq, -1L);
-        if (pendingDRC > 0)
-        {
-                if (SUCCEEDED(localBuf->SetFrequency((DWORD)pendingDRC)))
-                {
-                        InterlockedIncrement(&g_AudioSetFreqCalls);
-                        InterlockedExchange(&g_AudioCurrentFreq, pendingDRC);
-                }
-        }
-
-        localBuf->Release();
-}
-
-static DWORD WINAPI AudioCtrlThreadProc(void*)
-{
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-        InterlockedExchange(&g_AudioCtrlReady, 1L);
-
-        while (!InterlockedExchangeAdd(&g_AudioCtrlStop, 0L))
-        {
-                // P92: the stop event is a manual-reset event and occupies
-                // index 0 so WaitForMultipleObjects always selects it before
-                // continuously-signalled audio-notify events. This makes
-                // shutdown deterministic even when DirectSound is looping.
-                if (!g_AudioCtrlStopEvent)
-                {
-                        if (g_AudioCtrlWakeEvent)
-                                WaitForSingleObject(g_AudioCtrlWakeEvent, INFINITE);
-                        else
-                                Sleep(16);
-                        continue;
-                }
-
-                DWORD wr;
-                if (!g_AudioNotifyEvents[0])
-                {
-                        // The worker can be started before APU::PowerOn()/Start()
-                        // has created the DirectSound notification handles. Keep
-                        // the wait valid in that phase; never pass NULL handles
-                        // to WaitForMultipleObjects.
-                        HANDLE waits[2];
-                        waits[0] = g_AudioCtrlStopEvent;
-                        waits[1] = g_AudioCtrlWakeEvent;
-                        wr = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-                        if (wr == WAIT_OBJECT_0)
-                                break;
-                        if (InterlockedExchangeAdd(&g_AudioCtrlStop, 0L))
-                                break;
-                        if (wr == WAIT_OBJECT_0 + 1)
-                                AudioCtrlTick();
-                        continue;
-                }
-
-                HANDLE waits[FRAMEBUF + 2];
-                waits[0] = g_AudioCtrlStopEvent;
-                waits[1] = g_AudioCtrlWakeEvent;
-                for (int i = 0; i < FRAMEBUF; ++i)
-                        waits[i + 2] = g_AudioNotifyEvents[i];
-
-                wr = WaitForMultipleObjects(FRAMEBUF + 2, waits, FALSE, INFINITE);
-                if (wr == WAIT_OBJECT_0)
-                        break;
-
-                if (InterlockedExchangeAdd(&g_AudioCtrlStop, 0L))
-                        break;
-
-                if (wr == WAIT_OBJECT_0 + 1)
-                {
-                        AudioCtrlTick();
-                        continue;
-                }
-
-                if (wr >= WAIT_OBJECT_0 + 2 && wr < WAIT_OBJECT_0 + 2 + FRAMEBUF)
-                        OnAudioNotifySlot((int)(wr - (WAIT_OBJECT_0 + 2)));
-        }
-        InterlockedExchange(&g_AudioCtrlReady, 0L);
-        return 0;
-}
-
-void StartAudioCtrlThread()
-{
-        if (g_AudioCtrlThread) return;
-
-        InterlockedExchange(&g_AudioCtrlStop, 0L);
-        InterlockedExchange(&g_AudioCtrlReady, 0L);
-
-        // Manual-reset stop event: once set, shutdown stays signalled until the
-        // thread has definitely left the wait loop.
-        g_AudioCtrlStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-        if (!g_AudioCtrlStopEvent)
-                return;
-
-        if (!g_AudioCtrlWakeEvent)
-                g_AudioCtrlWakeEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-        if (!g_AudioCtrlWakeEvent)
-        {
-                CloseHandle(g_AudioCtrlStopEvent);
-                g_AudioCtrlStopEvent = NULL;
-                return;
-        }
-
-        g_AudioCtrlThread = CreateThread(NULL, 0, AudioCtrlThreadProc, NULL, 0, NULL);
-        if (!g_AudioCtrlThread)
-        {
-                CloseHandle(g_AudioCtrlStopEvent);
-                g_AudioCtrlStopEvent = NULL;
-                return;
-        }
-
-        for (int i = 0; i < 100 && !InterlockedExchangeAdd(&g_AudioCtrlReady, 0L); i++)
-                Sleep(1);
-}
-
-void StopAudioCtrlThread()
-{
-        if (!g_AudioCtrlThread) return;
-
-        InterlockedExchange(&g_AudioCtrlStop, 1L);
-        if (g_AudioCtrlStopEvent)
-                SetEvent(g_AudioCtrlStopEvent);
-        if (g_AudioCtrlWakeEvent)
-                SetEvent(g_AudioCtrlWakeEvent);
-
-        // P92: do not close the thread handle after a short timeout. Doing so
-        // can leave the worker alive while its DirectSound notification handles
-        // or Buffer object are being torn down by the caller. The worker is
-        // guaranteed to leave WaitForMultipleObjects through the stop event;
-        // AudioCtrlTick is only posted by explicit frequency changes.
-        WaitForSingleObject(g_AudioCtrlThread, INFINITE);
-        CloseHandle(g_AudioCtrlThread);
-        g_AudioCtrlThread = NULL;
-        InterlockedExchange(&g_AudioCtrlReady, 0L);
-
-        if (g_AudioCtrlStopEvent)
-        {
-                CloseHandle(g_AudioCtrlStopEvent);
-                g_AudioCtrlStopEvent = NULL;
-        }
-        if (g_AudioCtrlWakeEvent)
-        {
-                CloseHandle(g_AudioCtrlWakeEvent);
-                g_AudioCtrlWakeEvent = NULL;
-        }
-}
+void StartAudioCtrlThread() {}
+void StopAudioCtrlThread() {}
 
 #endif
 
@@ -1536,19 +1150,19 @@ long GetAudioPrimeSlots(void)
 }
 long GetAudioNotifyActive(void)
 {
-        return (long)InterlockedExchangeAdd(&g_AudioNotifyActive, 0L);
+        return 0;
 }
 long GetAudioNotifySignals(void)
 {
-        return (long)InterlockedExchangeAdd(&g_AudioNotifySignals, 0L);
+        return 0;
 }
 long GetAudioNotifyPlaySlot(void)
 {
-        return (long)InterlockedExchangeAdd(&g_AudioNotifyPlaySlot, 0L);
+        return 0;
 }
 long GetAudioNotifyPeriodUs(void)
 {
-        return (long)InterlockedExchangeAdd(&g_AudioNotifyPeriodUs, 0L);
+        return 0;
 }
 #endif
 
@@ -1573,25 +1187,7 @@ void    Init (void)
         isEnabled       = FALSE;
         InterlockedExchange(&g_AudioPlayPending, 0L);
         InterlockedExchange(&g_AudioPrimeSlots, 0L);
-        InterlockedExchange(&g_AudioPlayStarted, 0L);
-        g_AudioPlayStartQPC.QuadPart = 0;
-        g_AudioQPCFreq.QuadPart = 0;
-        InterlockedExchange(&g_AudioNotifyActive, 0L);
-        InterlockedExchange(&g_AudioNotifyPlaySlot, 0L);
-        InterlockedExchange(&g_AudioNotifySignals, 0L);
-        InterlockedExchange64(&g_AudioLastNotifyQPC, 0);
-        InterlockedExchange(&g_AudioNotifyPeriodUs, 0L);
-        CreateAudioNotifyEvents();
-
-        // P30: critical section guarding the Buffer pointer against the
-        // audio-control worker thread. Initialised once here; deleted in
-        // Destroy(). See the P30 block comment above g_DSCacheRposBytes
-        // for the full thread-safety rationale.
-        if (!g_BufferCSInit)
-        {
-                InitializeCriticalSection(&g_BufferCS);
-                g_BufferCSInit = true;
-        }
+        InterlockedExchange(&g_AudioRestartPending, 0L);
 #endif  /* !NSFPLAYER */
         MHz             = 1;
 #ifndef NSFPLAYER
@@ -1622,16 +1218,6 @@ void    Destroy (void)
 {
         Stop();
 #ifndef NSFPLAYER
-        // Defensive: normally already stopped via MonitorSync::Enable(FALSE),
-        // but make sure the worker is never left running past the point
-        // where g_BufferCS is torn down.
-        StopAudioCtrlThread();
-        CloseAudioNotifyEvents();
-        if (g_BufferCSInit)
-        {
-                DeleteCriticalSection(&g_BufferCS);
-                g_BufferCSInit = false;
-        }
         if (DirectSound)
         {
                 DirectSound->Release();
@@ -1686,7 +1272,7 @@ void    Start (void)
         // the legacy software mixer code path which adds latency and slightly
         // increases the probability of IPC stalls when audiodg.exe is busy.
         // Omitting it lets the driver choose the optimal path.
-        DSBD.dwFlags = DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_CTRLFREQUENCY | DSBCAPS_CTRLPOSITIONNOTIFY;
+        DSBD.dwFlags = DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_CTRLFREQUENCY;
         DSBD.dwBufferBytes = LockSize * FRAMEBUF;
         DSBD.lpwfxFormat = &WFX;
 
@@ -1696,7 +1282,6 @@ void    Start (void)
                 MessageBox(hMainWnd, Lang::GetString(LANG_ERR_APU_BUFFER), Lang::GetString(LANG_DLG_NINTENDULATOR), MB_OK);
                 return;
         }
-        ConfigureAudioNotifications();
         EI.DbgOut(Lang::GetString(LANG_MSG_APU_STARTED));
 #endif  /* !NSFPLAYER */
 }
@@ -1707,34 +1292,10 @@ void    Stop (void)
         if (Buffer)
         {
                 SoundOFF();
-                InterlockedExchange(&g_AudioNotifyActive, 0L);
-                InterlockedExchange(&g_AudioNotifyPlaySlot, 0L);
-                InterlockedExchange(&g_AudioNotifySignals, 0L);
-                InterlockedExchange64(&g_AudioLastNotifyQPC, 0);
-                InterlockedExchange(&g_AudioNotifyPeriodUs, 0L);
-                ResetAudioNotifyEvents();
-                // P30: null the pointer under g_BufferCS, then Release()
-                // outside the lock. The audio-control worker AddRefs Buffer
-                // while holding the same lock before using it (AudioCtrlTick),
-                // so it either sees the live pointer here (and its AddRef
-                // keeps the object alive until it Release()s its own
-                // reference) or sees NULL and skips the tick -- never a
-                // dangling pointer. Releasing outside the lock keeps this
-                // call from blocking on a slow in-flight worker IPC call.
-                LPDIRECTSOUNDBUFFER tmpBuffer = NULL;
-                if (g_BufferCSInit)
-                {
-                        EnterCriticalSection(&g_BufferCS);
-                        tmpBuffer = Buffer;
-                        Buffer = NULL;
-                        LeaveCriticalSection(&g_BufferCS);
-                }
-                else
-                {
-                        tmpBuffer = Buffer;
-                        Buffer = NULL;
-                }
-                tmpBuffer->Release();
+                LPDIRECTSOUNDBUFFER tmpBuffer = Buffer;
+                Buffer = NULL;
+                if (tmpBuffer)
+                        tmpBuffer->Release();
         }
         if (PrimaryBuffer)
         {
@@ -1791,13 +1352,6 @@ void    SoundOFF (void)
         isEnabled = FALSE;
         InterlockedExchange(&g_AudioPlayPending, 0L);
         InterlockedExchange(&g_AudioPrimeSlots, 0L);
-        InterlockedExchange(&g_AudioPlayStarted, 0L);
-        g_AudioPlayStartQPC.QuadPart = 0;
-        InterlockedExchange(&g_AudioNotifyPlaySlot, 0L);
-        InterlockedExchange(&g_AudioNotifySignals, 0L);
-        InterlockedExchange64(&g_AudioLastNotifyQPC, 0);
-        InterlockedExchange(&g_AudioNotifyPeriodUs, 0L);
-        ResetAudioNotifyEvents();
         if (Buffer)
                 Buffer->Stop();
 }
@@ -1830,27 +1384,17 @@ void    SoundON (void)
         isEnabled = TRUE;
         InterlockedExchange(&g_AudioPlayPending, 1L);
         InterlockedExchange(&g_AudioPrimeSlots, 0L);
-        InterlockedExchange(&g_AudioPlayStarted, 0L);
-        g_AudioPlayStartQPC.QuadPart = 0;
-        InterlockedExchange(&g_AudioNotifyPlaySlot, 0L);
-        InterlockedExchange(&g_AudioNotifySignals, 0L);
-        InterlockedExchange64(&g_AudioLastNotifyQPC, 0);
-        InterlockedExchange(&g_AudioNotifyPeriodUs, 0L);
-        ResetAudioNotifyEvents();
-        QueryPerformanceFrequency(&g_AudioQPCFreq);
         next_pos = 0;
-        // Establish the correct playback rate while the buffer is stopped.
-        // Doing this before Play() avoids changing the DirectSound rate under
-        // active playback on the cold-start path.
-        double producerHz = GetEffectiveProducerSampleRate();
-        DWORD startFreq = (DWORD)(producerHz + 0.5);
-        if (MonitorSync::IsEnabled())
-        {
-                double targetHz = MonitorSync::GetTargetHz();
-                double nesHz = MonitorSync::GetNESHz();
-                if (targetHz > 0.0 && nesHz > 0.0)
-                        startFreq = (DWORD)(producerHz * (targetHz / nesHz) + 0.5);
-        }
+        // Establish the playback rate while the buffer is stopped.
+        // With MMR the whole emulator clock is slowed by targetHz/NESHz, so
+        // the nominal 44100-Hz APU stream must be consumed at the same ratio.
+        // This value is applied only at a SoundOFF/SoundON transition; there
+        // is no runtime SetFrequency worker anymore.
+        double targetHz = MonitorSync::GetTargetHz();
+        double nesHz = MonitorSync::GetNESHz();
+        DWORD startFreq = FREQ;
+        if (MonitorSync::IsEnabled() && targetHz > 0.0 && nesHz > 0.0)
+                startFreq = (DWORD)((double)FREQ * (targetHz / nesHz) + 0.5);
         if (startFreq < 100) startFreq = 100;
         if (startFreq > 100000) startFreq = 100000;
         Try(Buffer->SetFrequency(startFreq), Lang::GetString(LANG_ERR_APU_BUFFER));
@@ -2217,73 +1761,38 @@ static double GetEffectiveProducerSampleRate()
         return ((double)buflen * (double)MHz) / (double)slotCycles;
 }
 
-// Dynamic Rate Control.
-// Called once per rendered frame while Match Monitor Rate is enabled.
+// P93: playback-rate changes are applied only by RestartForMonitorSync().
 //
-// P90: MMR owns the slot cadence, so the old Layer-2 buffer-fill feedback
-// controller has been removed. The DirectSound hardware write cursor is not
-// the emulator's queued-audio length; using it for feedback could repeatedly
-// move the playback frequency and create audible artifacts. The remaining
-// adjustment is deterministic: effective producer sample rate *
- // (monitor-target Hz / NES frame Hz).
-//
-// Total deviation from FREQ remains capped at +/-5%.
-//
+void    RestartForMonitorSync (void)
+{
+#ifndef NSFPLAYER
+        // UI thread: only post an atomic request. The actual SoundOFF/SoundON
+        // transition is performed by UpdateDRC() on the NES thread after the
+        // current frame's SwapBuffers, so DirectSound is never manipulated
+        // concurrently with APU::Run from the menu thread.
+        InterlockedExchange(&g_AudioRestartPending, 1L);
+#endif /* !NSFPLAYER */
+}
+
 void    UpdateDRC (void)
 {
 #ifndef NSFPLAYER
+        // P93: no runtime DirectSound frequency feedback/control. The only
+        // allowed rate transition is the explicit MMR toggle request posted
+        // by RestartForMonitorSync(). UpdateDRC already runs after the frame's
+        // SwapBuffers, so the one-time SoundOFF/SoundON transition cannot race
+        // the APU producer and does not sit inside CPU/PPU execution.
+        LONG restart = InterlockedExchange(&g_AudioRestartPending, 0L);
+        if (restart && Buffer && isEnabled)
+        {
+                SoundOFF();
+                SoundON();
+                return;
+        }
         if (!Buffer || !isEnabled)
                 return;
-
-        // P88: MMR owns the cadence of NES video frames. Audio slots are
-        // produced from the same NES master clock, so when the frame rate is
-        // slowed from 60.0988 Hz to a 60.000 Hz display, the generated audio
-        // sample rate slows by the same ratio. The correct DirectSound target
-        // is therefore deterministic:
-        //
-        //     audio_hz = effective_producer_hz * (target_hz / NES_native_hz)
-        //
-        // The old Layer-2 DRC inferred emulator queue fill from the DirectSound
-        // hardware write cursor minus play cursor. That is not the amount of
-        // audio queued by the emulator. The feedback loop could keep posting
-        // SetFrequency() changes even while the software producer/consumer
-        // cadence was already correct. Because SetFrequency crosses into the
-        // Windows audio engine, those repeated rate changes were a plausible
-        // source of audible crackle.
-        //
-        // P87 removes that fill-feedback loop. MMR now determines the audio
-        // rate from the same target clock that determines PaceSlot(). The
-        // actual SetFrequency call remains deferred to AudioCtrlTick(), so
-        // the NES thread still never enters audiodg.exe.
-        double producerHz = GetEffectiveProducerSampleRate();
-        double newFreqD = producerHz;
-        if (MonitorSync::IsEnabled())
-        {
-                double targetHz = MonitorSync::GetTargetHz();
-                double nesHz    = MonitorSync::GetNESHz();
-                if (nesHz > 0.0 && targetHz > 0.0)
-                        newFreqD = producerHz * (targetHz / nesHz);
-        }
-
-        // Keep the existing hard safety envelope.
-        double lo = (double)FREQ * (1.0 - drc_max_adjust);
-        double hi = (double)FREQ * (1.0 + drc_max_adjust);
-        if (newFreqD < lo) newFreqD = lo;
-        if (newFreqD > hi) newFreqD = hi;
-
-        DWORD newFreq = (DWORD)(newFreqD + 0.5);
-
-        // Only post a change when the deterministic MMR target actually moved.
-        // The ±5 Hz dead zone avoids needless IPC calls for insignificant
-        // rounding/noise in the measured monitor rate.
-        if (newFreq != drc_play_freq &&
-            (newFreq > drc_play_freq + 5 || newFreq + 5 < drc_play_freq))
-        {
-                drc_play_freq = newFreq;
-                InterlockedExchange(&g_DRCApplyFreq, (LONG)newFreq);
-                if (g_AudioCtrlWakeEvent)
-                        SetEvent(g_AudioCtrlWakeEvent);
-        }
+        if (!MonitorSync::IsEnabled())
+                drc_play_freq = FREQ;
 #endif /* !NSFPLAYER */
 }
 
@@ -2297,16 +1806,9 @@ void    UpdateDRC (void)
 void    ResetDRC (void)
 {
 #ifndef NSFPLAYER
-        if (!Buffer || !isEnabled)
-                return;
         drc_play_freq = FREQ;
-        // Post the reset frequency for deferred application by AudioCtrlTick.
-        // ResetDRC itself may be called from MonitorSync::Enable(FALSE) on the
-        // UI thread; calling SetFrequency directly there would be an IPC call
-        // into audiodg.exe from a thread that has no business stalling there.
-        InterlockedExchange(&g_PendingFreq, (LONG)FREQ);
-        if (g_AudioCtrlWakeEvent)
-                SetEvent(g_AudioCtrlWakeEvent);
+        InterlockedExchange(&g_DRCApplyFreq, -1L);
+        InterlockedExchange(&g_PendingFreq, -1L);
 #endif /* !NSFPLAYER */
 }
 
@@ -2347,66 +1849,18 @@ void    Run (void)
                 // ============================================================
                 if (isEnabled && Buffer && GFX::MatchMonitorRate)
                 {
-                        LARGE_INTEGER p73PaceEnter = {0}, p73PaceWake = {0};
-                        LARGE_INTEGER p73SafetyBegin = {0}, p73SafetyEnd = {0};
-                        ULONGLONG p80PaceWakeCycles = 0;
-                        // P88: MMR is now frame-driven. The display cadence is
-                        // paced once per NES frame in GFX::DrawScreen, not when
-                        // the APU happens to cross its 735-sample slot boundary.
-                        // The audio slot writer therefore performs NO display
-                        // pacing here. This is the key separation between
-                        // video timing and DirectSound buffering.
-                        QueryPerformanceCounter(&p73PaceEnter);
-                        p73PaceWake = p73PaceEnter;
-                        QueryThreadCycleTime(GetCurrentThread(), &p80PaceWakeCycles);
-                        LONG p73SafetyLoops = 0;
-
-                        // Keep the cached cursor only as a safety check. If the
-                        // buffer is ever reported critically full, use a short
-                        // real-time sleep rather than consuming another monitor
-                        // cadence slot. Under normal matched-rate operation this
-                        // path is not entered (and the current logs show
-                        // safetyLoops=0 throughout the steady-state window).
-                        LONG pendingPlay = InterlockedExchangeAdd(&g_AudioPlayPending, 0L);
-                        if (!pendingPlay && InterlockedExchangeAdd(&g_AudioPlayStarted, 0L))
-                        {
-                                // P91: prefer DirectSound position notifications
-                                // as the authoritative consumer slot. QPC remains
-                                // the fallback only if notifications are unavailable.
-                                int safetyLoops = 0;
-                                QueryPerformanceCounter(&p73SafetyBegin);
-                                while (safetyLoops < 2)
-                                {
-                                        unsigned long playSlot = GetAudioConsumerSlot();
-                                        int lead = AudioLeadSlots(playSlot, next_pos);
-                                        if (lead >= 2)
-                                                break;
-
-                                        Sleep(1);
-                                        ++safetyLoops;
-                                }
-                                p73SafetyLoops = safetyLoops;
-                                if (safetyLoops > 0)
-                                        InterlockedExchangeAdd(&g_AudioSafetyWaits, safetyLoops);
-                                QueryPerformanceCounter(&p73SafetyEnd);
-                        }
-
-                        {
-                                FILETIME c={0},e={0},k={0},u={0};
-                                LONGLONG cpuWake100=0;
-                                if (GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u))
-                                {
-                                        ULARGE_INTEGER a,b;
-                                        a.LowPart=k.dwLowDateTime; a.HighPart=k.dwHighDateTime;
-                                        b.LowPart=u.dwLowDateTime; b.HighPart=u.dwHighDateTime;
-                                        cpuWake100=(LONGLONG)(a.QuadPart+b.QuadPart);
-                                }
-                                GFX::SetMMRProducerTrace(
-                                        p73RunEnter.QuadPart, p73PaceEnter.QuadPart, p73PaceWake.QuadPart,
-                                        cpuWake100, p80PaceWakeCycles, p73SafetyBegin.QuadPart, p73SafetyEnd.QuadPart,
-                                        p73SafetyLoops, 0);
-                        }
-
+                        LARGE_INTEGER p73Run = {0};
+                        QueryPerformanceCounter(&p73Run);
+                        // P93: producer cadence is already owned by
+                        // GFX::DrawScreen()/MonitorSync::PaceFrame().  The
+                        // DirectSound ring is deliberately written without
+                        // polling, notifications, QPC cursor prediction, or
+                        // Sleep-based safety waits.  Four primed slots provide
+                        // the initial headroom; equal producer/consumer clocks
+                        // preserve the ring phase thereafter.
+                        GFX::SetMMRProducerTrace(
+                                p73Run.QuadPart, p73Run.QuadPart, p73Run.QuadPart,
+                                0, 0, 0, 0, 0);
                         goto write_slot;
                 }
 
@@ -2467,10 +1921,6 @@ void    Run (void)
                                 HRESULT playHr = Buffer->Play(0, 0, DSBPLAY_LOOPING);
                                 if (SUCCEEDED(playHr))
                                 {
-                                        QueryPerformanceCounter(&g_AudioPlayStartQPC);
-                                        InterlockedExchange64(&g_AudioLastNotifyQPC, g_AudioPlayStartQPC.QuadPart);
-                                        InterlockedExchange(&g_AudioNotifyPlaySlot, 0L);
-                                        InterlockedExchange(&g_AudioPlayStarted, 1L);
                                         InterlockedExchange(&g_AudioPlayPending, 0L);
                                         InterlockedIncrement(&g_AudioPlayStarts);
                                 }

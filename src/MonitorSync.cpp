@@ -623,14 +623,8 @@ void Enable(BOOL on)
         // HasDXGIVBlank() returns true only after this succeeds.
         StartVBlankThread();
 
-        // P30: start the audio-control worker thread. It owns all
-        // GetCurrentPosition/SetFrequency IPC traffic into audiodg.exe
-        // for as long as MMR is active, so UpdateDRC (called every frame
-        // while MMR is on -- see GFX::DrawScreen) never has to make that
-        // call itself. See APU.cpp for the full rationale.
-        APU::StartAudioCtrlThread();
-
         ResetState();
+        APU::RestartForMonitorSync();
 
         // P47: reset DwmFlush warmup/arm state on every MMR enable, not
         // just on fullscreen exit (GFX::Stop). Without this a cold start
@@ -654,14 +648,11 @@ void Enable(BOOL on)
         g_PaceEpochQPC.QuadPart = 0;
         g_PaceFrameIndex = 0;
         StopVBlankThread();
-        // P92: stop the audio-control worker BEFORE posting any DirectSound
-        // frequency reset. NES::Stop() has already called APU::SoundOFF(), so
-        // the buffer is stopped here and the normal-mode SoundON() path will
-        // establish FREQ again when audio resumes. Posting SetFrequency just
-        // before shutdown created a race where the worker could still be inside
-        // audiodg.exe while the toggle was tearing down the MMR/render state.
-        APU::StopAudioCtrlThread();
+        // P93: audio rate changes are performed by a single explicit
+        // SoundOFF/SoundON transition. There is no background audio-control
+        // worker to wait for or race with during MMR shutdown.
         APU::ResetDRC();
+        APU::RestartForMonitorSync();
     }
 }
 

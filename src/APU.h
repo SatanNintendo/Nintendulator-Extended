@@ -51,6 +51,7 @@ void    Run             (void);
 void    SetRegion       (void);
 void    UpdateDRC       (void);
 void    ResetDRC        (void);
+void    RestartForMonitorSync (void); // posts one safe audio restart at frame end
 
 #ifndef NSFPLAYER
 // Tell the APU that the monitor sync module needs to be informed of the
@@ -59,7 +60,7 @@ void    ResetDRC        (void);
 // NSFPLAYER build does not use MonitorSync, so the function is absent there.
 void    NotifyMonitorSyncRegion (void);
 
-// P90 diagnostic counters for MMR/DirectSound startup and steady state.
+// MMR/DirectSound diagnostic counters.
 long    GetAudioWorkerPolls (void);
 long    GetAudioSetFreqCalls (void);
 long    GetAudioPlayStarts (void);
@@ -72,14 +73,7 @@ long    GetAudioNotifySignals(void);
 long    GetAudioNotifyPlaySlot(void);
 long    GetAudioNotifyPeriodUs(void);
 
-// P30/P90: dedicated audio-control background thread.
-//
-// Starts/stops a low-priority event-driven worker that owns deferred
-// IDirectSoundBuffer::SetFrequency traffic into audiodg.exe. The MMR
-// steady-state path intentionally does NOT poll GetCurrentPosition;
-// it uses a QPC-predicted consumer cursor instead. Called from
-// MonitorSync::Enable(TRUE/FALSE). Safe to call before the DirectSound
-// buffer exists; safe to stop even when the thread was never started.
+// Retained as no-op compatibility entry points for older callers.
 void    StartAudioCtrlThread (void);
 void    StopAudioCtrlThread  (void);
 #endif  /* !NSFPLAYER */
