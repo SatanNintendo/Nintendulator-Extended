@@ -654,11 +654,14 @@ void Enable(BOOL on)
         g_PaceEpochQPC.QuadPart = 0;
         g_PaceFrameIndex = 0;
         StopVBlankThread();
-        APU::ResetDRC();
-        // Stop the P30 worker after ResetDRC() has posted its frequency-
-        // reset request (g_PendingFreq) so the worker gets one more tick
-        // to apply it before exiting.
+        // P92: stop the audio-control worker BEFORE posting any DirectSound
+        // frequency reset. NES::Stop() has already called APU::SoundOFF(), so
+        // the buffer is stopped here and the normal-mode SoundON() path will
+        // establish FREQ again when audio resumes. Posting SetFrequency just
+        // before shutdown created a race where the worker could still be inside
+        // audiodg.exe while the toggle was tearing down the MMR/render state.
         APU::StopAudioCtrlThread();
+        APU::ResetDRC();
     }
 }
 

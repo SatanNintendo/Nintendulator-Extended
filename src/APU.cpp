@@ -170,6 +170,7 @@ static volatile LONG     g_AudioPlayStarted = 0L;
 // without recurring GetCurrentPosition IPC and without assuming the audio
 // engine clock is perfectly locked to QPC.
 static HANDLE             g_AudioNotifyEvents[FRAMEBUF] = {0};
+static HANDLE             g_AudioCtrlStopEvent = NULL;
 static volatile LONG      g_AudioNotifyActive = 0L;
 static volatile LONG      g_AudioNotifyPlaySlot = 0L;
 static volatile LONG      g_AudioNotifySignals = 0L;
@@ -390,7 +391,11 @@ static DWORD WINAPI AudioCtrlThreadProc(void*)
 
         while (!InterlockedExchangeAdd(&g_AudioCtrlStop, 0L))
         {
-                if (!g_AudioCtrlWakeEvent || !g_AudioNotifyEvents[0])
+                // P92: the stop event is a manual-reset event and occupies
+                // index 0 so WaitForMultipleObjects always selects it before
+                // continuously-signalled audio-notify events. This makes
+                // shutdown deterministic even when DirectSound is looping.
+                if (!g_AudioCtrlStopEvent)
                 {
                         if (g_AudioCtrlWakeEvent)
                                 WaitForSingleObject(g_AudioCtrlWakeEvent, INFINITE);
@@ -399,26 +404,49 @@ static DWORD WINAPI AudioCtrlThreadProc(void*)
                         continue;
                 }
 
-                HANDLE waits[FRAMEBUF + 1];
-                waits[0] = g_AudioCtrlWakeEvent;
-                for (int i = 0; i < FRAMEBUF; ++i)
-                        waits[i + 1] = g_AudioNotifyEvents[i];
+                DWORD wr;
+                if (!g_AudioNotifyEvents[0])
+                {
+                        // The worker can be started before APU::PowerOn()/Start()
+                        // has created the DirectSound notification handles. Keep
+                        // the wait valid in that phase; never pass NULL handles
+                        // to WaitForMultipleObjects.
+                        HANDLE waits[2];
+                        waits[0] = g_AudioCtrlStopEvent;
+                        waits[1] = g_AudioCtrlWakeEvent;
+                        wr = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+                        if (wr == WAIT_OBJECT_0)
+                                break;
+                        if (InterlockedExchangeAdd(&g_AudioCtrlStop, 0L))
+                                break;
+                        if (wr == WAIT_OBJECT_0 + 1)
+                                AudioCtrlTick();
+                        continue;
+                }
 
-                DWORD wr = WaitForMultipleObjects(FRAMEBUF + 1, waits, FALSE, INFINITE);
+                HANDLE waits[FRAMEBUF + 2];
+                waits[0] = g_AudioCtrlStopEvent;
+                waits[1] = g_AudioCtrlWakeEvent;
+                for (int i = 0; i < FRAMEBUF; ++i)
+                        waits[i + 2] = g_AudioNotifyEvents[i];
+
+                wr = WaitForMultipleObjects(FRAMEBUF + 2, waits, FALSE, INFINITE);
+                if (wr == WAIT_OBJECT_0)
+                        break;
+
                 if (InterlockedExchangeAdd(&g_AudioCtrlStop, 0L))
                         break;
 
-                if (wr == WAIT_OBJECT_0)
+                if (wr == WAIT_OBJECT_0 + 1)
                 {
                         AudioCtrlTick();
                         continue;
                 }
 
-                if (wr >= WAIT_OBJECT_0 + 1 && wr < WAIT_OBJECT_0 + 1 + FRAMEBUF)
-                {
-                        OnAudioNotifySlot((int)(wr - (WAIT_OBJECT_0 + 1)));
-                }
+                if (wr >= WAIT_OBJECT_0 + 2 && wr < WAIT_OBJECT_0 + 2 + FRAMEBUF)
+                        OnAudioNotifySlot((int)(wr - (WAIT_OBJECT_0 + 2)));
         }
+        InterlockedExchange(&g_AudioCtrlReady, 0L);
         return 0;
 }
 
@@ -429,11 +457,28 @@ void StartAudioCtrlThread()
         InterlockedExchange(&g_AudioCtrlStop, 0L);
         InterlockedExchange(&g_AudioCtrlReady, 0L);
 
+        // Manual-reset stop event: once set, shutdown stays signalled until the
+        // thread has definitely left the wait loop.
+        g_AudioCtrlStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        if (!g_AudioCtrlStopEvent)
+                return;
+
         if (!g_AudioCtrlWakeEvent)
                 g_AudioCtrlWakeEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+        if (!g_AudioCtrlWakeEvent)
+        {
+                CloseHandle(g_AudioCtrlStopEvent);
+                g_AudioCtrlStopEvent = NULL;
+                return;
+        }
 
         g_AudioCtrlThread = CreateThread(NULL, 0, AudioCtrlThreadProc, NULL, 0, NULL);
-        if (!g_AudioCtrlThread) return;
+        if (!g_AudioCtrlThread)
+        {
+                CloseHandle(g_AudioCtrlStopEvent);
+                g_AudioCtrlStopEvent = NULL;
+                return;
+        }
 
         for (int i = 0; i < 100 && !InterlockedExchangeAdd(&g_AudioCtrlReady, 0L); i++)
                 Sleep(1);
@@ -444,14 +489,26 @@ void StopAudioCtrlThread()
         if (!g_AudioCtrlThread) return;
 
         InterlockedExchange(&g_AudioCtrlStop, 1L);
+        if (g_AudioCtrlStopEvent)
+                SetEvent(g_AudioCtrlStopEvent);
         if (g_AudioCtrlWakeEvent)
                 SetEvent(g_AudioCtrlWakeEvent);
 
-        WaitForSingleObject(g_AudioCtrlThread, 200);
+        // P92: do not close the thread handle after a short timeout. Doing so
+        // can leave the worker alive while its DirectSound notification handles
+        // or Buffer object are being torn down by the caller. The worker is
+        // guaranteed to leave WaitForMultipleObjects through the stop event;
+        // AudioCtrlTick is only posted by explicit frequency changes.
+        WaitForSingleObject(g_AudioCtrlThread, INFINITE);
         CloseHandle(g_AudioCtrlThread);
         g_AudioCtrlThread = NULL;
         InterlockedExchange(&g_AudioCtrlReady, 0L);
 
+        if (g_AudioCtrlStopEvent)
+        {
+                CloseHandle(g_AudioCtrlStopEvent);
+                g_AudioCtrlStopEvent = NULL;
+        }
         if (g_AudioCtrlWakeEvent)
         {
                 CloseHandle(g_AudioCtrlWakeEvent);
@@ -1629,7 +1686,7 @@ void    Start (void)
         // the legacy software mixer code path which adds latency and slightly
         // increases the probability of IPC stalls when audiodg.exe is busy.
         // Omitting it lets the driver choose the optimal path.
-        DSBD.dwFlags = DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_CTRLFREQUENCY;
+        DSBD.dwFlags = DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_CTRLFREQUENCY | DSBCAPS_CTRLPOSITIONNOTIFY;
         DSBD.dwBufferBytes = LockSize * FRAMEBUF;
         DSBD.lpwfxFormat = &WFX;
 
