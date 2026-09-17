@@ -43,14 +43,13 @@
 // DwmFlush is loaded dynamically so the binary stays compatible with
 // Windows XP/2003 where dwmapi.dll does not exist.
 //
-// P84: in DWM-composited OpenGL modes (windowed/borderless), Match Monitor
+// P85: in DWM-composited OpenGL modes (windowed/borderless), Match Monitor
 // Rate uses:
 //     wglSwapIntervalEXT(0) -> SwapBuffers() -> DwmFlush()
 //
-// SwapBuffers is deliberately non-blocking. DwmFlush is the presentation
-// backpressure point and its completion QPC is fed back to MonitorSync, so
-// emulator pacing can lock to an observed compositor phase instead of running
-// forever from a QPC-only fallback.
+// SwapBuffers is deliberately non-blocking. DwmFlush remains the render-thread
+// backpressure point, but its completion QPC is diagnostic-only. Emulator pacing
+// uses uniquely identified DWM composition timestamps (qpcCompose + cFrame).
 //
 // The DwmFlush wait lives on the dedicated render thread, which owns the GL
 // context. The emulation/audio thread therefore does not wait on the compositor.
@@ -1335,14 +1334,26 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                         // t2b = DwmFlush completion / presentation feedback.
                         int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
                         s_diagBuf[idx].t2b = flushQpc.QuadPart;
-                        MonitorSync::NotifyFramePresented(flushQpc.QuadPart);
+                        // P85: DwmFlush completion is NOT a display timestamp.
+                        // Do not feed it into PaceSlot(). DWM composition timing
+                        // is sampled below via qpcCompose + cFrame.
                 }
         }
 #endif
         if (MatchMonitorRate)
         {
                 int idxDwm = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
-                (void)DiagQueryDwmTiming(s_diagBuf[idxDwm]);
+                if (DiagQueryDwmTiming(s_diagBuf[idxDwm]) &&
+                    s_diagBuf[idxDwm].dwmFrame > 0 &&
+                    s_diagBuf[idxDwm].dwmCompose > 0)
+                {
+                        // P85: qpcCompose is tied to a concrete DWM composition
+                        // frame. NotifyDwmCompositionSample rejects duplicate
+                        // snapshots and does not require DwmFlush timing.
+                        MonitorSync::NotifyDwmCompositionSample(
+                                s_diagBuf[idxDwm].dwmCompose,
+                                s_diagBuf[idxDwm].dwmFrame);
+                }
         }
 
         if (MatchMonitorRate)
@@ -1350,8 +1361,8 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 LARGE_INTEGER qpc2; QueryPerformanceCounter(&qpc2);
                 int idx2 = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
 
-                // DwmFlush already supplied the presentation timestamp for the
-                // DWM path. Other presentation paths use the post-submit QPC.
+                // t2b is the DwmFlush completion time for diagnostics. It is NOT the
+                // presentation timestamp used by MonitorSync.
                 if (s_diagBuf[idx2].t2b == 0)
                         s_diagBuf[idx2].t2b = qpc2.QuadPart;
 
@@ -2018,12 +2029,12 @@ static bool DiagQueryDwmTiming(FrameTimingEntry &e)
         e.dwmFramesDropped = (ULONGLONG)ti.cFramesDropped;
         e.dwmValid = 1;
 
-        // P77: DWM timing remains diagnostic-only.  Do NOT feed qpcFrameDisplayed
-        // back into MonitorSync::NotifyFramePresented(). DwmGetCompositionTimingInfo
-        // is a sampled compositor snapshot, not a per-present callback, and P76
-        // showed 33ms / 0ms sampling pairs after using it as the pacing feedback
-        // source. Keep the presentation clock on its existing QPC fallback path
-        // so this diagnostic query cannot change pacing behavior.
+        // P85: qpcCompose is still a sampled snapshot, so it is not safe to
+        // treat every call as a new presentation. GL_DrawFrame uses the DWM
+        // cFrame id together with qpcCompose; MonitorSync rejects duplicate
+        // snapshots and only locks after three consecutive one-frame samples.
+        // qpcFrameDisplayed remains diagnostic-only because it can legitimately
+        // repeat when the sampled DWM state is unchanged.
         return true;
 }
 
@@ -2419,16 +2430,30 @@ static void GL_DrawFrame(void)
                                         QueryPerformanceCounter(&qpc);
                                         int idx = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
                                         s_diagBuf[idx].t2 = qpc.QuadPart;
-                                        MonitorSync::NotifyFramePresented(qpc.QuadPart);
+                                        // P85: the DwmFlush return timestamp is
+                                        // diagnostic-only; pacing uses DWM timing.
                                 }
                         }
                 }
         }
 #endif // USE_DWMFLUSH
 
-        // Submit the rendered frame exactly once. The vblank wait and
-        // optional DwmFlush presentation feedback are handled by the
-        // single SwapBuffers() path above.
+        if (MatchMonitorRate)
+        {
+                int idxDwm = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+                if (DiagQueryDwmTiming(s_diagBuf[idxDwm]) &&
+                    s_diagBuf[idxDwm].dwmFrame > 0 &&
+                    s_diagBuf[idxDwm].dwmCompose > 0)
+                {
+                        MonitorSync::NotifyDwmCompositionSample(
+                                s_diagBuf[idxDwm].dwmCompose,
+                                s_diagBuf[idxDwm].dwmFrame);
+                }
+        }
+
+        // Submit the rendered frame exactly once. DwmFlush backpressure, when
+        // enabled, is handled on the render thread; pacing feedback comes
+        // separately from DWM composition timing.
 
 }
 

@@ -381,6 +381,11 @@ static volatile LONGLONG g_PresentationPeriodQPC      = 0;
 static volatile LONG     g_PresentationClockLocked   = FALSE;
 static volatile LONG     g_PresentationHzMilli       = 0;
 static volatile LONG     g_PresentationIntervalErrUs = 0;
+// P85: DWM composition samples are snapshots, so track the DWM frame id
+// separately. This rejects duplicate samples and prevents a 0ms/16ms pair
+// from being interpreted as a real presentation cadence.
+static volatile ULONGLONG g_LastDwmCompositionFrame = 0;
+static volatile LONG       g_PresentationSampleStreak = 0;
 
 // ------------------------------------------------------------------
 // Deferred vsync interval (written by Enable/UI thread, applied by
@@ -578,6 +583,8 @@ void OnDisplayChange()
     InterlockedExchange(&g_PresentationClockLocked, FALSE);
     InterlockedExchange(&g_PresentationHzMilli, 0);
     InterlockedExchange(&g_PresentationIntervalErrUs, 0);
+    InterlockedExchange64((volatile LONGLONG*)&g_LastDwmCompositionFrame, 0);
+    InterlockedExchange(&g_PresentationSampleStreak, 0);
     InterlockedExchange64(&g_LastPaceTargetQPC, 0);
     InterlockedExchange64(&g_LastPaceWakeQPC, 0);
     InterlockedExchange(&g_LastPaceSource, 0);
@@ -753,6 +760,8 @@ void ResetState()
     InterlockedExchange(&g_PresentationClockLocked, FALSE);
     InterlockedExchange(&g_PresentationHzMilli, 0);
     InterlockedExchange(&g_PresentationIntervalErrUs, 0);
+    InterlockedExchange64((volatile LONGLONG*)&g_LastDwmCompositionFrame, 0);
+    InterlockedExchange(&g_PresentationSampleStreak, 0);
     InterlockedExchange64(&g_LastPaceTargetQPC, 0);
     InterlockedExchange64(&g_LastPaceWakeQPC, 0);
     InterlockedExchange(&g_LastPaceSource, 0);
@@ -973,6 +982,9 @@ bool WasLastPacePresentationAnchored()
 
 void NotifyFramePresented(LONGLONG qpcPresented)
 {
+    // Legacy API retained for non-DWM callers. P85 intentionally no longer
+    // uses the return time of DwmFlush() here: that timestamp is a submit/
+    // flush-completion point, not a vblank/composition timestamp.
     if (qpcPresented <= 0 || g_QPCFreq.QuadPart <= 0)
         return;
 
@@ -982,20 +994,17 @@ void NotifyFramePresented(LONGLONG qpcPresented)
     if (previous <= 0 || qpcPresented <= previous)
     {
         InterlockedExchange(&g_PresentationClockLocked, FALSE);
+        InterlockedExchange(&g_PresentationSampleStreak, 0);
         return;
     }
 
-    LONGLONG delta = qpcPresented - previous;
     const double targetHz = (GetTargetHz() > 0.0) ? GetTargetHz() : 60.0;
     const LONGLONG nominal =
             (LONGLONG)((double)g_QPCFreq.QuadPart / targetHz + 0.5);
-
     if (nominal <= 0)
         return;
 
-    // Accept only intervals reasonably close to one refresh. This deliberately
-    // rejects half-refresh / double-refresh samples as potential queue or DWM
-    // anomalies rather than allowing them to corrupt the presentation period.
+    LONGLONG delta = qpcPresented - previous;
     if (delta >= (nominal * 3) / 4 && delta <= (nominal * 5) / 4)
     {
         LONGLONG oldPeriod =
@@ -1003,8 +1012,6 @@ void NotifyFramePresented(LONGLONG qpcPresented)
         if (oldPeriod <= 0)
             oldPeriod = delta;
 
-        // Slow 1/8th-order filter: follow genuine refresh-rate changes while
-        // preventing one noisy interval from moving the phase by a whole ms.
         LONGLONG filtered = oldPeriod + (delta - oldPeriod) / 8;
         if (filtered <= 0)
             filtered = delta;
@@ -1017,20 +1024,93 @@ void NotifyFramePresented(LONGLONG qpcPresented)
         LONG hzMilli = (LONG)(((double)g_QPCFreq.QuadPart /
                                (double)filtered) * 1000.0 + 0.5);
         InterlockedExchange(&g_PresentationHzMilli, hzMilli);
-
-        // One sane interval after a stall is enough to relock. This keeps the
-        // display as the phase master while the fallback protects us from
-        // transient 2-3-vblank DWM maintenance stalls.
-        InterlockedExchange(&g_PresentationClockLocked, TRUE);
     }
     else
     {
-        // Do not let a maintenance stall become the new frame period.
         InterlockedExchange(&g_PresentationClockLocked, FALSE);
+        InterlockedExchange(&g_PresentationSampleStreak, 0);
         InterlockedExchange(&g_PresentationIntervalErrUs,
                             (LONG)(((delta - nominal) * 1000000LL) /
                                    g_QPCFreq.QuadPart));
     }
+}
+
+void NotifyDwmCompositionSample(LONGLONG qpcCompose, ULONGLONG dwmFrame)
+{
+    if (qpcCompose <= 0 || dwmFrame == 0 || g_QPCFreq.QuadPart <= 0)
+        return;
+
+    ULONGLONG previousFrame =
+            (ULONGLONG)InterlockedExchange64(
+                    (volatile LONGLONG*)&g_LastDwmCompositionFrame,
+                    (LONGLONG)dwmFrame);
+
+    // DwmGetCompositionTimingInfo() returns a snapshot. The same composition
+    // frame can therefore be observed more than once. Never turn duplicate
+    // snapshots into artificial 0ms/16ms presentation samples.
+    if (previousFrame == dwmFrame)
+        return;
+
+    LONGLONG previousQpc =
+            InterlockedExchange64(&g_LastPresentationQPC, qpcCompose);
+
+    if (previousQpc <= 0 || qpcCompose <= previousQpc)
+    {
+        InterlockedExchange(&g_PresentationClockLocked, FALSE);
+        InterlockedExchange(&g_PresentationSampleStreak, 0);
+        return;
+    }
+
+    ULONGLONG frameDelta = dwmFrame - previousFrame;
+    const double targetHz = (GetTargetHz() > 0.0) ? GetTargetHz() : 60.0;
+    const LONGLONG nominal =
+            (LONGLONG)((double)g_QPCFreq.QuadPart / targetHz + 0.5);
+    if (nominal <= 0)
+        return;
+
+    LONGLONG delta = qpcCompose - previousQpc;
+
+    // Only a consecutive one-composition-per-refresh stream is good enough
+    // to become the phase master. A skipped composition resets the startup
+    // qualification instead of promoting a 33ms interval into the clock.
+    if (frameDelta != 1 ||
+        delta < (nominal * 3) / 4 || delta > (nominal * 5) / 4)
+    {
+        InterlockedExchange(&g_PresentationClockLocked, FALSE);
+        InterlockedExchange(&g_PresentationSampleStreak, 0);
+        InterlockedExchange(&g_PresentationIntervalErrUs,
+                            (LONG)(((delta - nominal) * 1000000LL) /
+                                   g_QPCFreq.QuadPart));
+        return;
+    }
+
+    LONGLONG oldPeriod =
+            InterlockedExchangeAdd64(&g_PresentationPeriodQPC, 0);
+    if (oldPeriod <= 0)
+        oldPeriod = delta;
+
+    // Slow filter: keep the actual DWM composition period as the phase master
+    // without allowing one noisy sample to move the schedule by a full ms.
+    LONGLONG filtered = oldPeriod + (delta - oldPeriod) / 8;
+    if (filtered <= 0)
+        filtered = delta;
+    InterlockedExchange64(&g_PresentationPeriodQPC, filtered);
+
+    LONG errUs = (LONG)(((delta - nominal) * 1000000LL) /
+                        g_QPCFreq.QuadPart);
+    InterlockedExchange(&g_PresentationIntervalErrUs, errUs);
+
+    LONG hzMilli = (LONG)(((double)g_QPCFreq.QuadPart /
+                           (double)filtered) * 1000.0 + 0.5);
+    InterlockedExchange(&g_PresentationHzMilli, hzMilli);
+
+    LONG streak = InterlockedIncrement(&g_PresentationSampleStreak);
+    // P85: require three consecutive unique DWM composition samples before
+    // PaceSlot() is allowed to leave the deterministic QPC startup schedule.
+    // This removes the cold-start fallback/anchor toggling that could make
+    // the first seconds of a windowed ROM run much too fast.
+    if (streak >= 3)
+        InterlockedExchange(&g_PresentationClockLocked, TRUE);
 }
 
 bool HasPresentationClock()

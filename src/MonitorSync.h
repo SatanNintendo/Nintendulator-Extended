@@ -192,11 +192,14 @@ namespace MonitorSync
         LONGLONG GetLastPaceWakeQPC ();
         bool     WasLastPacePresentationAnchored ();
 
-        // Presentation feedback API used by the diagnostic/header path and
-        // by the optional DwmFlush presentation timestamp. These are
-        // observational helpers; they do not alter pacing decisions except
-        // for the already-existing presentation-anchor logic in PaceSlot().
+        // Presentation feedback API used by the timing/header path. The DWM sample
+        // API intentionally alters the existing presentation-anchor state in
+        // PaceSlot() only after the DWM sample qualification succeeds.
         void    NotifyFramePresented (LONGLONG qpcPresented);
+        // P85: feed a uniquely identified DWM composition sample into the
+        // presentation clock. The DWM frame id prevents duplicate sampled
+        // snapshots from being mistaken for new presentation timestamps.
+        void    NotifyDwmCompositionSample (LONGLONG qpcCompose, ULONGLONG dwmFrame);
         bool    HasPresentationClock ();
         double  GetPresentationHz ();
         double  GetPresentationIntervalErrorMs ();
