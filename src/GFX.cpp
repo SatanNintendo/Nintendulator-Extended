@@ -1585,11 +1585,12 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 (long)InterlockedExchangeAdd(&s_FQSkippedFrames, 0));
         _ftprintf(f, _T("PBO streaming: ready=%d count=%d\n"),
                 s_PBOReady ? 1 : 0, PBO_COUNT);
-        _ftprintf(f, _T("Audio MMR state: workerPolls=%ld setFreq=%ld playStarts=%ld playPending=%ld currentFreq=%ld safetyWaits=%ld\n"),
+        _ftprintf(f, _T("Audio MMR state: workerPolls=%ld setFreq=%ld playStarts=%ld playPending=%ld primeSlots=%ld currentFreq=%ld safetyWaits=%ld\n"),
                 APU::GetAudioWorkerPolls(),
                 APU::GetAudioSetFreqCalls(),
                 APU::GetAudioPlayStarts(),
                 APU::GetAudioPlayPending(),
+                APU::GetAudioPrimeSlots(),
                 APU::GetAudioCurrentFreq(),
                 APU::GetAudioSafetyWaits());
         _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | paceEnter | paceWait | pace->produce | postPaceCPU | postPaceWall | postPaceCycles | buildWall | buildCPU | buildCycles | swapCPU | swapCycles | pboOrphan | pboMap | pboCopy | pboUnmap | pboSubmit | safetyMs | safetyLoops | traceSeq | prodGap | renderGap | consume->present | presentInterval | presentErr | fqP2C | fqPcs | fqCcs | fqSched | fqCS2 | fqPHold | fqCHold | fqSigWait | render2t0 | submit2dwm | dwmDispInt | dwmFrameStep | dwmMissStep | dwmDropStep | dwmLateStep | dwmLate | dwmSrc | dwmHr | dwmFrame | dwmRefresh | dwmVBlankInt | dwmComposeInt | dwmLateCount | dwmOutstanding | dwmUnique | dwmAvail | dwmMiss | dwmDrop | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
@@ -3352,7 +3353,11 @@ void    DrawScreen (void)
                         0);
         }
 
-        if ((++FPSCnt > FSkip) || forceNoSkip)
+        // When MMR is active it deliberately overrides presentation frameskip.
+        // PaceFrame() above is therefore consumed exactly once for every
+        // frame that reaches the render queue. The saved FSkip setting is left
+        // untouched and resumes its normal meaning when MMR is disabled.
+        if (MatchMonitorRate || (++FPSCnt > FSkip) || forceNoSkip)
         {
                 // P54 (Stage 2): two-threaded path. When the render thread is
                 // active (MMR on), the emulation thread does NOT call
@@ -3522,7 +3527,11 @@ void    ForceNoSkip (BOOL enable)
 
 BOOL    NeedSkip (void)
 {
-        if (forceNoSkip)
+        // MMR owns presentation cadence. While it is active every emulated
+        // NES frame must reach the render path; otherwise a user-selected
+        // frameskip value would consume a pacing slot without producing a
+        // displayed frame, effectively turning 60 Hz MMR into 30/20/15 Hz.
+        if (forceNoSkip || MatchMonitorRate)
                 return FALSE;
         return FPSCnt < FSkip;
 }

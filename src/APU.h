@@ -66,6 +66,7 @@ long    GetAudioPlayStarts (void);
 long    GetAudioSafetyWaits (void);
 long    GetAudioCurrentFreq (void);
 long    GetAudioPlayPending (void);
+long    GetAudioPrimeSlots (void);
 
 // P30: dedicated audio-control background thread.
 //

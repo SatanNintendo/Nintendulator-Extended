@@ -201,6 +201,14 @@ static volatile LONG     g_AudioPlayStarts = 0L;
 static volatile LONG     g_AudioSafetyWaits = 0L;
 static volatile LONG     g_AudioCurrentFreq = FREQ;
 
+// P89: keep a small, deterministic audio lead before starting DirectSound.
+// With MMR the producer cadence is intentionally tied to the monitor, so the
+// buffer does not need an adaptive fill controller just to start playback.
+// Three complete slots (~50 ms at NTSC/60 Hz) give audiodg/WASAPI enough lead
+// to absorb normal scheduler jitter without altering any emulated APU timing.
+#define AUDIO_PRIME_SLOTS 3
+static volatile LONG     g_AudioPrimeSlots = 0L;
+
 // P88: do not start DirectSound playback until the first complete audio slot
 // has been written. Starting the secondary buffer immediately after zeroing it
 // lets the play cursor race the first Lock/Unlock on a cold start. On machines
@@ -1328,6 +1336,10 @@ long GetAudioPlayPending(void)
 {
         return (long)InterlockedExchangeAdd(&g_AudioPlayPending, 0L);
 }
+long GetAudioPrimeSlots(void)
+{
+        return (long)InterlockedExchangeAdd(&g_AudioPrimeSlots, 0L);
+}
 #endif
 
 // Forward the current NES region to the MonitorSync module.
@@ -1350,6 +1362,7 @@ void    Init (void)
         buffer          = nullptr;
         isEnabled       = FALSE;
         InterlockedExchange(&g_AudioPlayPending, 0L);
+        InterlockedExchange(&g_AudioPrimeSlots, 0L);
 
         // P30: critical section guarding the Buffer pointer against the
         // audio-control worker thread. Initialised once here; deleted in
@@ -1550,6 +1563,7 @@ void    SoundOFF (void)
                 return;
         isEnabled = FALSE;
         InterlockedExchange(&g_AudioPlayPending, 0L);
+        InterlockedExchange(&g_AudioPrimeSlots, 0L);
         if (Buffer)
                 Buffer->Stop();
 }
@@ -1583,6 +1597,7 @@ void    SoundON (void)
         // non-MMR operation remains at the native 44100 Hz rate.
         isEnabled = TRUE;
         InterlockedExchange(&g_AudioPlayPending, 1L);
+        InterlockedExchange(&g_AudioPrimeSlots, 0L);
         next_pos = 0;
         // P88: establish the correct playback rate while the buffer is still
         // stopped. For MMR this is targetHz/NESHz; for normal operation it is
@@ -2092,8 +2107,15 @@ void    Run (void)
                         // cadence slot. Under normal matched-rate operation this
                         // path is not entered (and the current logs show
                         // safetyLoops=0 throughout the steady-state window).
+                        LONG pendingPlay = InterlockedExchangeAdd(&g_AudioPlayPending, 0L);
                         LONG cacheAge = InterlockedExchangeAdd(&g_DSCacheAge, 1L);
-                        if (cacheAge <= 4)
+                        // The secondary buffer is stopped while the initial
+                        // prime slots are being written, so cursor-based
+                        // safety checks are meaningless here. P88 showed a
+                        // high cumulative safetyWait count during startup/re-entry;
+                        // the deterministic prime phase removes that wait path
+                        // while the buffer is stopped.
+                        if (!pendingPlay && cacheAge <= 4)
                         {
                                 unsigned long sr = (unsigned long)InterlockedExchangeAdd(&g_DSCacheRpos, 0L);
                                 unsigned long sw = (unsigned long)InterlockedExchangeAdd(&g_DSCacheWpos, 0L);
@@ -2180,14 +2202,23 @@ void    Run (void)
                         memcpy(bufPtr, buffer, bufBytes);
                         Try(Buffer->Unlock(bufPtr, bufBytes, NULL, 0), Lang::GetString(LANG_ERR_APU_BUFFER));
 
-                        // P88: start playback only after a complete slot has
-                        // been written. Until this point the DirectSound play
-                        // cursor is stationary at zero, so slot 0 can never be
-                        // overwritten underneath active playback.
-                        if (InterlockedExchange(&g_AudioPlayPending, 0L) != 0)
+                        // P89: prime several complete slots before starting
+                        // playback. One slot (P88) left only ~16.7 ms of audio
+                        // lead, which is too small to make cold-start and
+                        // fullscreen re-entry robust against ordinary Windows
+                        // scheduler/audiodg jitter. The buffer is stopped during
+                        // this phase, so all three writes are safe regardless of
+                        // the DirectSound play cursor.
+                        LONG primed = InterlockedIncrement(&g_AudioPrimeSlots);
+                        LONG pendingPlayNow = InterlockedExchangeAdd(&g_AudioPlayPending, 0L);
+                        if (pendingPlayNow && primed >= AUDIO_PRIME_SLOTS)
                         {
-                                Try(Buffer->Play(0, 0, DSBPLAY_LOOPING), Lang::GetString(LANG_ERR_APU_BUFFER));
-                                InterlockedIncrement(&g_AudioPlayStarts);
+                                HRESULT playHr = Buffer->Play(0, 0, DSBPLAY_LOOPING);
+                                if (SUCCEEDED(playHr))
+                                {
+                                        InterlockedExchange(&g_AudioPlayPending, 0L);
+                                        InterlockedIncrement(&g_AudioPlayStarts);
+                                }
                         }
 
                         next_pos = (next_pos + 1) % FRAMEBUF;
