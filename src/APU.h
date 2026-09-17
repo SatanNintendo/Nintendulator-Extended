@@ -59,7 +59,7 @@ void    ResetDRC        (void);
 // NSFPLAYER build does not use MonitorSync, so the function is absent there.
 void    NotifyMonitorSyncRegion (void);
 
-// P88 diagnostic counters for MMR/DirectSound startup and steady state.
+// P90 diagnostic counters for MMR/DirectSound startup and steady state.
 long    GetAudioWorkerPolls (void);
 long    GetAudioSetFreqCalls (void);
 long    GetAudioPlayStarts (void);
@@ -68,15 +68,14 @@ long    GetAudioCurrentFreq (void);
 long    GetAudioPlayPending (void);
 long    GetAudioPrimeSlots (void);
 
-// P30: dedicated audio-control background thread.
+// P30/P90: dedicated audio-control background thread.
 //
-// Starts/stops a low-priority worker thread that owns 100% of the
-// IDirectSoundBuffer::GetCurrentPosition / SetFrequency IPC traffic
-// into audiodg.exe. Called from MonitorSync::Enable(TRUE/FALSE), the
-// same lifecycle point that starts/stops the P28 vblank-poller thread.
-// Safe to call even if the DirectSound buffer does not exist yet (the
-// worker simply skips its work for that tick); safe to call StopAudioCtrlThread
-// even if the thread was never started.
+// Starts/stops a low-priority event-driven worker that owns deferred
+// IDirectSoundBuffer::SetFrequency traffic into audiodg.exe. The MMR
+// steady-state path intentionally does NOT poll GetCurrentPosition;
+// it uses a QPC-predicted consumer cursor instead. Called from
+// MonitorSync::Enable(TRUE/FALSE). Safe to call before the DirectSound
+// buffer exists; safe to stop even when the thread was never started.
 void    StartAudioCtrlThread (void);
 void    StopAudioCtrlThread  (void);
 #endif  /* !NSFPLAYER */
