@@ -76,21 +76,9 @@ const unsigned int      LOCK_SIZE = FREQ * (BITS / 8);
 
 static DWORD            drc_play_freq   = FREQ;  // current DirectSound playback frequency
 
-// Deferred DirectSound SetFrequency reset, used by ResetDRC().
-// IDirectSoundBuffer::SetFrequency is an IPC call into audiodg.exe (the
-// Windows Audio Engine). The Audio Engine runs its own periodic service
-// cycle; if SetFrequency arrives at the wrong moment in that cycle the
-// call can block. Calling SetFrequency directly from ResetDRC would be
-// unsafe because ResetDRC can be invoked from the UI thread (via
-// MonitorSync::Enable(FALSE) on MMR toggle-off). Instead, ResetDRC posts
-// the reset frequency here.
-//
-// P30/P87: frequency requests are consumed by the dedicated audio-control
-// background thread (AudioCtrlTick), never by the NES thread. P87 further
-// removes the per-frame buffer-fill feedback loop; g_DRCApplyFreq now carries
-// only the deterministic MMR target-rate changes.
-// -1 = no pending reset.
-static volatile LONG    g_PendingFreq   = -1L;
+// P94: no deferred DirectSound frequency request is kept here.  Rate changes
+// happen only during the explicit SoundOFF/SoundON transition requested by
+// RestartForMonitorSync(), on the NES thread at a safe frame boundary.
 
 // Cached DirectSound position for the legacy non-MMR path.
 //
@@ -1405,8 +1393,6 @@ void    SoundON (void)
         // path. The MMR path uses its QPC-predicted consumer cursor instead.
         InterlockedExchange(&g_DSCacheRpos, -1L);
         InterlockedExchange(&g_DSCacheWpos, -1L);
-        InterlockedExchange(&g_DSCacheRposBytes, -1L);
-        InterlockedExchange(&g_DSCacheWposBytes, -1L);
         InterlockedExchange(&g_DSCacheAge,  99L);
 }
 
@@ -1807,8 +1793,6 @@ void    ResetDRC (void)
 {
 #ifndef NSFPLAYER
         drc_play_freq = FREQ;
-        InterlockedExchange(&g_DRCApplyFreq, -1L);
-        InterlockedExchange(&g_PendingFreq, -1L);
 #endif /* !NSFPLAYER */
 }
 
@@ -1860,7 +1844,7 @@ void    Run (void)
                         // preserve the ring phase thereafter.
                         GFX::SetMMRProducerTrace(
                                 p73Run.QuadPart, p73Run.QuadPart, p73Run.QuadPart,
-                                0, 0, 0, 0, 0);
+                                0, 0, 0, 0, 0, 0);
                         goto write_slot;
                 }
 
@@ -1939,8 +1923,6 @@ void    Run (void)
                         // dropout symptom. UpdateDRC runs after SwapBuffers, when
                         // the CPU/PPU work for this frame is already complete, so
                         // the same stall costs nothing visible.
-                        // g_PendingFreq is now consumed at the start of UpdateDRC
-                        // (used only for the ResetDRC → FREQ reset path).
                 }
         }
 #define VolAdjust(pos, vol) ((volumes[vol] > 0) ? (((pos) * volumes[vol]) / 100) : 0)
