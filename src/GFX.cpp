@@ -587,6 +587,10 @@ static void ApplyPendingResize()
 }
 
 // ============================================================
+// P82: SwapBuffers is timed separately with thread CPU time and cycle count.
+// Diagnostic-only; it does not feed back into pacing.
+// ============================================================
+// ============================================================
 // Per-frame timing diagnostics (active when MatchMonitorRate is on).
 //
 // Each frame we record QPC timestamps across the emulation/render hand-off, GL,
@@ -679,6 +683,9 @@ struct FrameTimingEntry {
         LONGLONG buildStartQPC, buildEndQPC;
         LONGLONG buildStartCPU100ns, buildEndCPU100ns;
         ULONGLONG buildStartCycles, buildEndCycles;
+        // P82: diagnostic-only SwapBuffers thread CPU/cycle timing.
+        LONGLONG swapStartCPU100ns, swapEndCPU100ns;
+        ULONGLONG swapStartCycles, swapEndCycles;
         DWORD    frameNum;  // render/diagnostic sequence
 };
 static FrameTimingEntry s_diagBuf[DIAG_FRAMES];
@@ -738,6 +745,9 @@ struct FQ_Packet {
         LONGLONG      buildStartQPC, buildEndQPC;
         LONGLONG      buildStartCPU100ns, buildEndCPU100ns;
         ULONGLONG     buildStartCycles, buildEndCycles;
+        // P82: diagnostic-only SwapBuffers thread CPU/cycle timing.
+        LONGLONG      swapStartCPU100ns, swapEndCPU100ns;
+        ULONGLONG     swapStartCycles, swapEndCycles;
 };
 
 static FQ_Packet s_FQ_Buf[FQ_SLOTS];
@@ -1015,6 +1025,16 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 s_diagBuf[idx].mmrTraceSeq = packet ? packet->mmrTraceSeq : 0;
                 s_diagBuf[idx].prodCpuEnd100ns = packet ? packet->prodCpuEnd100ns : 0;
                 s_diagBuf[idx].prodCpuEndCycles = packet ? packet->prodCpuEndCycles : 0;
+                s_diagBuf[idx].buildStartQPC = packet ? packet->buildStartQPC : 0;
+                s_diagBuf[idx].buildEndQPC = packet ? packet->buildEndQPC : 0;
+                s_diagBuf[idx].buildStartCPU100ns = packet ? packet->buildStartCPU100ns : 0;
+                s_diagBuf[idx].buildEndCPU100ns = packet ? packet->buildEndCPU100ns : 0;
+                s_diagBuf[idx].buildStartCycles = packet ? packet->buildStartCycles : 0;
+                s_diagBuf[idx].buildEndCycles = packet ? packet->buildEndCycles : 0;
+                s_diagBuf[idx].swapStartCPU100ns = 0;
+                s_diagBuf[idx].swapEndCPU100ns = 0;
+                s_diagBuf[idx].swapStartCycles = 0;
+                s_diagBuf[idx].swapEndCycles = 0;
                 s_diagBuf[idx].emuFrame = packet ? packet->emuFrame : 0;
                 s_diagBuf[idx].fqSkipped = packet ? packet->fqSkipped : 0;
                 s_diagBuf[idx].fqDepth = packet ? packet->fqDepth : 0;
@@ -1155,7 +1175,22 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
         if (MatchMonitorRate)
                 MonitorSync::WaitForDXGIVBlank();
 
+        // P82: diagnostic-only measurement of time spent inside SwapBuffers.
+        // No pacing, sync mode, or swap behavior is changed.
+        int diagSwapIdxPre = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
+        if (MatchMonitorRate)
+        {
+                DiagGetThreadCpu100ns(&s_diagBuf[diagSwapIdxPre].swapStartCPU100ns);
+                QueryThreadCycleTime(GetCurrentThread(), &s_diagBuf[diagSwapIdxPre].swapStartCycles);
+        }
+
         SwapBuffers(hGLDC);
+
+        if (MatchMonitorRate)
+        {
+                DiagGetThreadCpu100ns(&s_diagBuf[diagSwapIdxPre].swapEndCPU100ns);
+                QueryThreadCycleTime(GetCurrentThread(), &s_diagBuf[diagSwapIdxPre].swapEndCycles);
+        }
 
         // P66: when DwmFlush is not used (verified GL-vsync path), the
         // return from SwapBuffers is the only presentation-side timing
@@ -1442,7 +1477,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         _ftprintf(f, _T("FrameQueue counters: overflow_drop=%ld, latest_wins_skip=%ld\n"),
                 (long)InterlockedExchangeAdd(&s_FQOverflowDrops, 0),
                 (long)InterlockedExchangeAdd(&s_FQSkippedFrames, 0));
-        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | paceEnter | paceWait | pace->produce | postPaceCPU | postPaceWall | postPaceCycles | buildWall | buildCPU | buildCycles | safetyMs | safetyLoops | traceSeq | prodGap | renderGap | consume->present | presentInterval | presentErr | fqP2C | fqPcs | fqCcs | fqSched | fqCS2 | fqPHold | fqCHold | fqSigWait | render2t0 | submit2dwm | dwmDispInt | dwmFrameStep | dwmMissStep | dwmDropStep | dwmLateStep | dwmLate | dwmSrc | dwmHr | dwmFrame | dwmRefresh | dwmVBlankInt | dwmComposeInt | dwmLateCount | dwmOutstanding | dwmUnique | dwmAvail | dwmMiss | dwmDrop | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
+        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | paceEnter | paceWait | pace->produce | postPaceCPU | postPaceWall | postPaceCycles | buildWall | buildCPU | buildCycles | swapCPU | swapCycles | safetyMs | safetyLoops | traceSeq | prodGap | renderGap | consume->present | presentInterval | presentErr | fqP2C | fqPcs | fqCcs | fqSched | fqCS2 | fqPHold | fqCHold | fqSigWait | render2t0 | submit2dwm | dwmDispInt | dwmFrameStep | dwmMissStep | dwmDropStep | dwmLateStep | dwmLate | dwmSrc | dwmHr | dwmFrame | dwmRefresh | dwmVBlankInt | dwmComposeInt | dwmLateCount | dwmOutstanding | dwmUnique | dwmAvail | dwmMiss | dwmDrop | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
 
         // P43 (session 20): t0->t4 only spans GL_DrawFrame+OnFrameEnd+
         // UpdateDRC -- the video-draw slice of a frame. It does NOT cover
@@ -1518,6 +1553,10 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                                     (e.buildEndCPU100ns - e.buildStartCPU100ns) / 10000.0 : 0.0;
                 ULONGLONG buildCycles = (e.buildEndCycles > e.buildStartCycles) ?
                                         (e.buildEndCycles - e.buildStartCycles) : 0;
+                double swapCpuMs = (e.swapEndCPU100ns >= e.swapStartCPU100ns && e.swapStartCPU100ns > 0) ?
+                                    (e.swapEndCPU100ns - e.swapStartCPU100ns) / 10000.0 : 0.0;
+                ULONGLONG swapCycles = (e.swapEndCycles > e.swapStartCycles) ?
+                                       (e.swapEndCycles - e.swapStartCycles) : 0;
                 double safetyMs = (e.mmrSafetyEndQPC > 0 && e.mmrSafetyBeginQPC > 0 && e.mmrSafetyEndQPC >= e.mmrSafetyBeginQPC) ?
                                   (e.mmrSafetyEndQPC - e.mmrSafetyBeginQPC) * 1000.0 / freq : 0.0;
                 double dprodGap = (havePrevTProd && e.tProd > prevTProd) ?
@@ -1592,7 +1631,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 bool presentStalled = (dpresent > 0.0 && fabs(presentErr) > 2.0);
 
                 _ftprintf(f,
-                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  paceEnter=%6.2f  paceWait=%6.2f  pace->prod=%6.2f  postPaceCPU=%6.2f  postPaceWall=%6.2f  postPaceCycles=%I64u  buildWall=%6.2f  buildCPU=%6.2f  buildCycles=%I64u  safetyMs=%6.2f  safetyLoops=%d  traceSeq=%I64d  prodGap=%7.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fqP2C=%6.2f  fqPcs=%5.2f  fqCcs=%5.2f  fqSched=%6.2f  fqCS2=%5.2f  fqPHold=%5.2f  fqCHold=%5.2f  fqSigWait=%6.2f  render2t0=%6.2f  submit2dwm=%7.2f  dwmDisp=%7.2f  dwmFrameStep=%2lld  dwmMissStep=%2lld  dwmDropStep=%2lld  dwmLateStep=%2lld  dwmLate=%d  dwmSrc=%d  dwmHr=0x%08lX  dwmFrame=%I64u  dwmRefresh=%I64u  dwmVBlankInt=%7.2f  dwmComposeInt=%7.2f  dwmLateCount=%I64u  dwmOutstanding=%I64u  dwmUnique=%I64u  dwmAvail=%I64u  dwmMiss=%I64u  dwmDrop=%I64u  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
+                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  paceEnter=%6.2f  paceWait=%6.2f  pace->prod=%6.2f  postPaceCPU=%6.2f  postPaceWall=%6.2f  postPaceCycles=%I64u  buildWall=%6.2f  buildCPU=%6.2f  buildCycles=%I64u  swapCPU=%6.2f  swapCycles=%I64u  safetyMs=%6.2f  safetyLoops=%d  traceSeq=%I64d  prodGap=%7.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fqP2C=%6.2f  fqPcs=%5.2f  fqCcs=%5.2f  fqSched=%6.2f  fqCS2=%5.2f  fqPHold=%5.2f  fqCHold=%5.2f  fqSigWait=%6.2f  render2t0=%6.2f  submit2dwm=%7.2f  dwmDisp=%7.2f  dwmFrameStep=%2lld  dwmMissStep=%2lld  dwmDropStep=%2lld  dwmLateStep=%2lld  dwmLate=%d  dwmSrc=%d  dwmHr=0x%08lX  dwmFrame=%I64u  dwmRefresh=%I64u  dwmVBlankInt=%7.2f  dwmComposeInt=%7.2f  dwmLateCount=%I64u  dwmOutstanding=%I64u  dwmUnique=%I64u  dwmAvail=%I64u  dwmMiss=%I64u  dwmDrop=%I64u  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
                         e.frameNum,
                         (unsigned __int64)e.emuFrame,
                         dprod,
@@ -1607,6 +1646,8 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                         buildWallMs,
                         buildCpuMs,
                         buildCycles,
+                        swapCpuMs,
+                        swapCycles,
                         safetyMs,
                         (int)e.mmrSafetyLoops,
                         (long long)e.mmrTraceSeq,
