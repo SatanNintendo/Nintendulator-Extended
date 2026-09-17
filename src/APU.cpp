@@ -60,7 +60,6 @@ unsigned long           MHz;
 // buffer and have equal headroom in both directions before starving or
 // overflowing. The extra buffer capacity absorbs longer scheduler hiccups
 // (up to ~50ms) without the wait-loop ever being entered.
-static double           drc_target_fill = 0.42;
 static const double     drc_max_adjust  = 0.05;
 
 #define FREQ            44100
@@ -86,12 +85,10 @@ static DWORD            drc_play_freq   = FREQ;  // current DirectSound playback
 // MonitorSync::Enable(FALSE) on MMR toggle-off). Instead, ResetDRC posts
 // the reset frequency here.
 //
-// P30: this is now consumed by the dedicated audio-control background
-// thread (AudioCtrlTick), not by UpdateDRC. UpdateDRC's own per-frame
-// frequency adjustments (Layer 1 + Layer 2) are posted through the
-// separate g_DRCApplyFreq atomic, also consumed by that same thread.
-// Neither call ever touches the NES thread anymore -- see the P30 block
-// comment near g_DSCacheRposBytes for the full history and rationale.
+// P30/P87: frequency requests are consumed by the dedicated audio-control
+// background thread (AudioCtrlTick), never by the NES thread. P87 further
+// removes the per-frame buffer-fill feedback loop; g_DRCApplyFreq now carries
+// only the deterministic MMR target-rate changes.
 // -1 = no pending reset.
 static volatile LONG    g_PendingFreq   = -1L;
 
@@ -171,10 +168,9 @@ static volatile LONG    g_DSCacheAge    = 99L;  // frames since last cache updat
 //     - Applies any pending SetFrequency request: either a full reset
 //       (g_PendingFreq, posted by ResetDRC) or a DRC-computed target
 //       (g_DRCApplyFreq, posted by UpdateDRC).
-//   UpdateDRC() becomes pure CPU-bound math: it reads the caches, computes
-//   the Layer 1 + Layer 2 target, and posts the result -- it never calls
-//   into audiodg.exe itself, so a stall on the worker thread has zero
-//   effect on frame pacing.
+//   UpdateDRC() is pure CPU-bound target calculation and posts a deterministic
+//   target-rate change; it never calls into audiodg.exe itself, so a stall on
+//   the worker thread has zero effect on frame pacing.
 //
 // THREAD SAFETY:
 //   The worker touches the COM `Buffer` pointer, which the NES thread
@@ -1516,6 +1512,14 @@ void    SoundON (void)
         Try(Buffer->Lock(0, 0, &bufPtr, &bufBytes, NULL, 0, DSBLOCK_ENTIREBUFFER), Lang::GetString(LANG_ERR_APU_BUFFER));
         ZeroMemory(bufPtr, bufBytes);
         Try(Buffer->Unlock(bufPtr, bufBytes, NULL, 0), Lang::GetString(LANG_ERR_APU_BUFFER));
+        // Explicitly align both playback phase and sample rate before the
+        // buffer starts looping. After SoundOFF(), DirectSound does not need
+        // to resume at slot zero; zeroing the buffer alone therefore does not
+        // guarantee producer/consumer phase alignment. Fullscreen toggling
+        // calls SoundOFF/SoundON and was observed to cure the crackle, so make
+        // that recovery deterministic rather than driver-position dependent.
+        Try(Buffer->SetCurrentPosition(0), Lang::GetString(LANG_ERR_APU_BUFFER));
+        Try(Buffer->SetFrequency(FREQ), Lang::GetString(LANG_ERR_APU_BUFFER));
         isEnabled = TRUE;
         Try(Buffer->Play(0, 0, DSBPLAY_LOOPING), Lang::GetString(LANG_ERR_APU_BUFFER));
         next_pos = 0;
@@ -1530,8 +1534,6 @@ void    SoundON (void)
         InterlockedExchange(&g_DSCacheRposBytes, -1L);
         InterlockedExchange(&g_DSCacheWposBytes, -1L);
         InterlockedExchange(&g_DSCacheAge,  99L);
-        if (Buffer)
-                Buffer->SetFrequency(FREQ);
 }
 
 INT_PTR CALLBACK        VolumeConfigProc (HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -1864,24 +1866,15 @@ BOOL    sample_ok = FALSE;
 int sampcycles = 0, samppos = 0;
 
 // Dynamic Rate Control.
-// Called every ~20 frames from GFX::Update when Match Monitor Rate is enabled.
+// Called once per rendered frame while Match Monitor Rate is enabled.
 //
-// Two layers of correction are applied:
+// P87: MMR owns the slot cadence, so the old Layer-2 buffer-fill feedback
+// controller has been removed. The DirectSound hardware write cursor is not
+// the emulator's queued-audio length; using it for feedback could repeatedly
+// move the playback frequency and create audible artifacts. The remaining
+// adjustment is deterministic: FREQ * (monitor-target Hz / NES frame Hz).
 //
-//   1. Base target frequency = FREQ * (monitor_hz / nes_hz).
-//      When the monitor's refresh rate differs from the NES native rate
-//      (e.g. 60.000 Hz monitor vs 60.0988 Hz NES), the DirectSound
-//      playback rate has to be shifted by the same ratio so the audio
-//      buffer stays balanced while OpenGL vsync throttles the emulator
-//      to the monitor rate. This eliminates the ~10-second micro-stutter
-//      caused by the previous rate mismatch.
-//
-//   2. Fine correction based on the DirectSound buffer fill ratio.
-//      Even with the correct base target, transient drift (driver
-//      jitter, frame-to-frame timing variance) will accumulate. A small
-//      proportional correction keeps the buffer centred at 50%.
-//
-// Total deviation from FREQ is capped at ±5%, which is inaudible.
+// Total deviation from FREQ remains capped at +/-5%.
 //
 void    UpdateDRC (void)
 {
@@ -1889,81 +1882,34 @@ void    UpdateDRC (void)
         if (!Buffer || !isEnabled)
                 return;
 
-        // P30: UpdateDRC no longer touches audiodg.exe at all. It used to
-        // call GetCurrentPosition() and, most frames, SetFrequency() —
-        // both IPC calls — directly from here, on the NES thread, every
-        // single frame. That was the last unconditional per-frame IPC
-        // call left on the frame-critical path (see the P30 block comment
-        // near g_DSCacheRposBytes for the full analysis). Both calls are
-        // now owned by a dedicated background thread (AudioCtrlThreadProc);
-        // this function only reads the caches it publishes and, if a new
-        // target frequency is needed, posts it to g_DRCApplyFreq for that
-        // thread to apply. UpdateDRC is therefore pure CPU-bound math with
-        // no possibility of stalling the NES thread.
+        // P87: MMR owns the cadence of fixed-size audio slots. Once that
+        // cadence is locked to the monitor target, the correct DirectSound
+        // playback rate is deterministic:
         //
-        // Note the frequency-reset path (ResetDRC -> g_PendingFreq) is
-        // ALSO now applied by the background thread, not here -- see
-        // AudioCtrlTick. drc_play_freq itself is still only ever written
-        // from the NES thread (ResetDRC/UpdateDRC/SoundON), preserving the
-        // original single-writer invariant.
-
-        // Cache freshness gate. g_DSCacheAge is incremented on every
-        // APU::Run pre-check (P27) and reset to 0 each time the worker
-        // thread refreshes the cache (~every 8ms). A value this stale
-        // only happens for the first frame or two after MMR is enabled,
-        // before the worker thread has had a chance to run once — skip
-        // this frame's correction rather than compute against garbage.
-        LONG cacheAge = InterlockedExchangeAdd(&g_DSCacheAge, 0L);
-        if (cacheAge > 8)
-                return;
-
-        unsigned long rpos = (unsigned long)(LONG)InterlockedExchangeAdd(&g_DSCacheRposBytes, 0L);
-        unsigned long wpos = (unsigned long)(LONG)InterlockedExchangeAdd(&g_DSCacheWposBytes, 0L);
-
-        // ----- Layer 1: monitor-rate-aware base target -----
-        // MMR now paces the emulator/audio-slot cadence directly to the same
-        // target clock used by the render path. Therefore the base audio rate
-        // must NOT depend on whether GL vsync happened to report itself as
-        // active: DwmFlush, a software timer, or a driver with non-standard
-        // swap-control behaviour are all valid ways to reach the same target.
-        double baseFreq = (double)FREQ;
+        //     audio_hz = FREQ * (target_hz / NES_frame_hz)
+        //
+        // The previous Layer-2 DRC inferred emulator queue fill from the
+        // DirectSound hardware write cursor minus play cursor. That is not
+        // the amount of audio queued by the emulator. The feedback loop could
+        // therefore keep posting SetFrequency() changes even while the
+        // software producer/consumer cadence was already correct. Because
+        // SetFrequency crosses into the Windows audio engine, those repeated
+        // rate changes are a plausible source of audible crackle.
+        //
+        // P87 removes that fill-feedback loop. MMR now determines the audio
+        // rate from the same target clock that determines PaceSlot(). The
+        // actual SetFrequency call remains deferred to AudioCtrlTick(), so
+        // the NES thread still never enters audiodg.exe.
+        double newFreqD = (double)FREQ;
         if (MonitorSync::IsEnabled())
         {
                 double targetHz = MonitorSync::GetTargetHz();
                 double frameHz  = MonitorSync::GetFrameHz();
                 if (frameHz > 0.0 && targetHz > 0.0)
-                        baseFreq = (double)FREQ * (targetHz / frameHz);
+                        newFreqD = (double)FREQ * (targetHz / frameHz);
         }
 
-        // ----- Layer 2: buffer-fill fine correction -----
-        DWORD totalSize = LockSize * FRAMEBUF;
-        if (totalSize == 0)
-                return;
-
-        long fill;
-        if (wpos >= rpos)
-                fill = (long)(wpos - rpos);
-        else
-                fill = (long)(totalSize - rpos + wpos);
-
-        double fillRatio = (double)fill / (double)totalSize;
-        double error = fillRatio - drc_target_fill;
-
-        // UpdateDRC is called every frame. The correction coefficient
-        // (0.0025/frame) gives the same convergence speed as the original
-        // 0.05/20-frame scheme, but without the 330ms lag that allowed the
-        // buffer to drift far before the correction kicked in. The
-        // per-frame ±0.5% cap prevents any single bad fill reading from
-        // making an audible step change.
-        double adjustment = error * 0.0025;
-        if (adjustment >  0.005) adjustment =  0.005;
-        if (adjustment < -0.005) adjustment = -0.005;
-
-        double newFreqD = baseFreq * (1.0 + adjustment);
-
-        // Hard cap: never let the playback rate deviate from the standard
-        // FREQ by more than the original ±5% window. This protects against
-        // a runaway measurement feeding back into an extreme correction.
+        // Keep the existing hard safety envelope.
         double lo = (double)FREQ * (1.0 - drc_max_adjust);
         double hi = (double)FREQ * (1.0 + drc_max_adjust);
         if (newFreqD < lo) newFreqD = lo;
@@ -1971,16 +1917,9 @@ void    UpdateDRC (void)
 
         DWORD newFreq = (DWORD)(newFreqD + 0.5);
 
-        // Post the target for the background thread to apply, instead of
-        // calling Buffer->SetFrequency() here. drc_play_freq is updated
-        // immediately (it's just an int, not an IPC call) so the dead-zone
-        // comparison below stays correct frame to frame even though the
-        // actual hardware call may lag by up to one worker tick (~8ms).
-        //
-        // The dead zone is ±5 Hz (±0.011% around 44100 Hz, inaudible,
-        // easily absorbed by the ±0.5%/frame Layer 2 correction) --
-        // unchanged from the P24 rationale: fewer SetFrequency calls,
-        // fewer chances to land on a bad phase of audiodg's service cycle.
+        // Only post a change when the deterministic MMR target actually moved.
+        // The ±5 Hz dead zone avoids needless IPC calls for insignificant
+        // rounding/noise in the measured monitor rate.
         if (newFreq != drc_play_freq &&
             (newFreq > drc_play_freq + 5 || newFreq + 5 < drc_play_freq))
         {
@@ -2003,12 +1942,9 @@ void    ResetDRC (void)
         if (!Buffer || !isEnabled)
                 return;
         drc_play_freq = FREQ;
-        // Post the reset frequency for deferred application. The actual
-        // SetFrequency call is performed at the START of the next UpdateDRC
-        // invocation (which runs on the NES thread, post-vblank — safe to
-        // call into audiodg.exe from there). ResetDRC itself may be called
-        // from MonitorSync::Enable(FALSE) on the UI thread; calling
-        // SetFrequency directly from the UI thread would be an IPC call
+        // Post the reset frequency for deferred application by AudioCtrlTick.
+        // ResetDRC itself may be called from MonitorSync::Enable(FALSE) on the
+        // UI thread; calling SetFrequency directly there would be an IPC call
         // into audiodg.exe from a thread that has no business stalling there.
         InterlockedExchange(&g_PendingFreq, (LONG)FREQ);
 #endif /* !NSFPLAYER */
