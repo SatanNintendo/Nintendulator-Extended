@@ -76,13 +76,15 @@ const unsigned int      LOCK_SIZE = FREQ * (BITS / 8);
 
 static DWORD            drc_play_freq   = FREQ;  // current DirectSound playback frequency
 
-// P102: throttled ring-phase feedback state (see UpdateDRC).
-// drc_base_freq is the playback rate established by the last SoundON();
-// the feedback controller is only allowed to trim the current rate by
-// a small, inaudible amount around this base, so the deterministic P95
-// rate selection remains authoritative.
-static DWORD            drc_base_freq   = FREQ;
-static long             drc_feedback_check_count = 0;
+// P103: original-discipline rate state (see SoundON / UpdateDRC).
+// drc_applied_freq is the playback rate established by the last SoundON()
+// (or by the single post-lock refinement in UpdateDRC). There is no
+// runtime feedback controller anymore: the frequency is never trimmed
+// while the emulator is running, exactly like the original Nintendulator
+// never touches a playing buffer.
+static DWORD            drc_applied_freq = FREQ;
+static long             drc_frames_since_soundon = 0;
+static long             drc_rate_oneshot_state   = 0;
 
 // P94: no deferred DirectSound frequency request is kept here.  Rate changes
 // happen only during the explicit SoundOFF/SoundON transition requested by
@@ -129,30 +131,34 @@ static volatile LONG     g_AudioPlayPending = 0L;
 static volatile LONG     g_AudioRestartPending = 0L;
 
 // ------------------------------------------------------------------
-// P102: throttled ring-phase feedback parameters (see UpdateDRC).
-// One fill check every 32 frames (~0.53 s at 60 Hz, ~0.64 s at 50 Hz)
-// is enough to keep the write cursor centered in the 6-slot ring while
-// adding at most one GetCurrentPosition call per interval -- executed
-// at the post-SwapBuffers point the P90 notes explicitly blessed for
-// audio maintenance (never inside CPU/PPU execution).
+// P103: original Nintendulator audio discipline for MMR.
 //
-// The controller targets a 3-slot lead and only trims the playback
-// frequency when the measured lead leaves the 1.5..4.5 slot band. The
-// proportional gain (0.05% per slot of error, capped at +-0.3% total)
-// corresponds to a pitch shift of at most ~5 cents -- inaudible in game
-// audio -- while correcting drift at up to ~130 samples/second. If the
-// lead ever reaches the danger zone (< 0.7 or > 5.3 slots: the producer
-// stalled hard or a transition scrambled the phase), the write cursor
-// is snap-re-anchored 4 slots ahead of the play cursor instead.
+// The P102 throttled ring-phase feedback experiment is REMOVED (see the
+// post-mortem at the top of UpdateDRC). Ring safety is no longer enforced
+// by SetFrequency trims -- it is enforced by the ORIGINAL producer-side
+// slot gate in APU::Run (the same play/write-cursor check the legacy
+// non-MMR path has always used): the producer never overwrites a slot
+// DirectSound is about to mix, and simply waits instead. That single
+// mechanism makes overrun tears impossible and lets the ring re-lead
+// itself after an underrun, exactly as in the original emulator, without
+// touching the sound while it plays.
+//
+// The only rate adjustment that still exists is a ONE-SHOT refinement
+// in UpdateDRC(): when SoundON() ran before the presentation clock had
+// locked (a cold start), the frequency is corrected at most once, after
+// the clock and its filter have warmed up, at the post-SwapBuffers point
+// the P90 notes identified as safe for audio maintenance.
 // ------------------------------------------------------------------
-#define DRC_FEEDBACK_INTERVAL   32
-static const double     DRC_FILL_TARGET  = 3.0;   // desired lead, in slots
-static const double     DRC_FILL_MIN     = 1.5;   // trim when lead drops below
-static const double     DRC_FILL_MAX     = 4.5;   // trim when lead rises above
-static const double     DRC_FILL_SNAP_LO = 0.7;   // snap-reanchor below this
-static const double     DRC_FILL_SNAP_HI = (double)FRAMEBUF - 0.7; // or above this
-static const double     DRC_FILL_KP      = 0.0005; // freq trim per slot of error
-static const double     DRC_FREQ_TRIM_MAX = 0.003; // +-0.3% around SoundON base
+#define DRC_RATE_ONESHOT_DELAY_FRAMES  45    // ~0.75 s of clock/filter warmup
+#define DRC_RATE_ONESHOT_GIVEUP_FRAMES 900   // give up if never locked (~15 s)
+// The one-shot is latched, so the minimum-difference threshold only decides
+// whether to bother at all. 2 Hz (~0.005%) is above the converged filter
+// noise but still catches the common case (nominal 60.000 Hz monitor whose
+// real composition rate is 60.006 Hz -> 4 Hz at the audio rate, i.e. a
+// +4.4 samples/s producer-faster drift that would otherwise make the
+// emulation run that much behind the monitor and force a one-frame slip
+// every ~2.5 minutes).
+#define DRC_RATE_ONESHOT_MIN_DIFF      2     // Hz (~0.005%) before bothering
 
 // Forward declaration: SoundON() appears before the definition below.
 static double GetEffectiveProducerSampleRate();
@@ -1493,6 +1499,12 @@ static void AudioReanchorRing (void)
         // Restart the fade-in counter so the first slot written after
         // the re-anchor ramps in from silence instead of clicking.
         InterlockedExchange(&g_AudioPrimeSlots, 0L);
+        // P103: invalidate the cached DirectSound play/write slots --
+        // they predate the pause and must not be trusted by the slot
+        // gate until UpdateDRC() refreshes them with live values.
+        InterlockedExchange(&g_DSCacheRpos, -1L);
+        InterlockedExchange(&g_DSCacheWpos, -1L);
+        InterlockedExchange(&g_DSCacheAge,  99L);
 }
 
 void    SoftPause (void)
@@ -1590,10 +1602,37 @@ void    SoundON (void)
         double targetHz = MonitorSync::GetTargetHz();
         double nesHz = MonitorSync::GetNESHz();
         DWORD startFreq = FREQ;
+        int   startFromMeasured = 0;
         if (GFX::MatchMonitorRate && targetHz > 0.0 && nesHz > 0.0)
         {
                 double nativeProducerHz = GetEffectiveProducerSampleRate();
-                double mmrProducerHz = nativeProducerHz * (targetHz / nesHz);
+                double cadenceHz = targetHz;
+                // P103: prefer the live presentation-clock rate. PaceSlot()
+                // re-anchors the producer to fresh DWM composition
+                // timestamps, so the ring is really filled at the MEASURED
+                // composition rate, not at the nominal monitor label (the
+                // 2026-09-18 post-P102 log: nominal target 60.000 Hz vs
+                // presentation clock 60.006 Hz). Deriving the consumer
+                // frequency from the same measured rate removes the
+                // producer-faster drift a nominal-only value leaves
+                // behind; the residual error is absorbed by the original
+                // producer slot gate in APU::Run instead of by pitch
+                // changes. When the clock has not locked yet (a cold
+                // start), fall back to the nominal target -- the one-shot
+                // refinement in UpdateDRC() corrects it at most once
+                // after the clock locks.
+                double presHz = MonitorSync::GetPresentationHz();
+                if (MonitorSync::HasPresentationClock() && presHz > 1.0)
+                {
+                        double diff = presHz - targetHz;
+                        if (diff < 0.0) diff = -diff;
+                        if (diff < 0.01 * targetHz)
+                        {
+                                cadenceHz = presHz;
+                                startFromMeasured = 1;
+                        }
+                }
+                double mmrProducerHz = nativeProducerHz * (cadenceHz / nesHz);
                 startFreq = (DWORD)(mmrProducerHz + 0.5);
         }
         if (startFreq < 100) startFreq = 100;
@@ -1605,19 +1644,22 @@ void    SoundON (void)
                 InterlockedExchange(&g_AudioCurrentFreq, (LONG)startFreq);
         }
         drc_play_freq = startFreq;
-        // P102: this is the playback rate the throttled feedback
-        // controller in UpdateDRC() trims around; also restart its
-        // check cadence so the first fill check happens a full interval
-        // after the fresh prime.
-        drc_base_freq = startFreq;
-        drc_feedback_check_count = 0;
+        // P103: no runtime feedback exists anymore; this is the one
+        // authoritative rate for the whole audio session. The single
+        // later refinement (the UpdateDRC one-shot) may replace it once,
+        // and only when SoundON ran before the presentation clock had
+        // locked.
+        drc_applied_freq = startFreq;
+        drc_frames_since_soundon = 0;
+        drc_rate_oneshot_state = startFromMeasured;
         // If the MMR restart request was posted before the DirectSound buffer
         // existed (the cold-start case), SoundON itself has now satisfied that
         // request. Do not perform an unnecessary second SoundOFF/SoundON on
         // the first rendered frame.
         InterlockedExchange(&g_AudioRestartPending, 0L);
-        // Invalidate the legacy DS-position cache used only by the non-MMR
-        // path. The MMR path does not consult the consumer cursor.
+        // Invalidate the cached DirectSound play/write slots (P103: the
+        // slot gate in APU::Run consults them while MMR is active;
+        // UpdateDRC() refreshes them once per frame from now on).
         InterlockedExchange(&g_DSCacheRpos, -1L);
         InterlockedExchange(&g_DSCacheWpos, -1L);
         InterlockedExchange(&g_DSCacheAge,  99L);
@@ -2011,92 +2053,102 @@ void    UpdateDRC (void)
         }
 
         // ============================================================
-        // P102: throttled ring-phase feedback.
+        // P103: original audio discipline for MMR (user-confirmed
+        // direction: behave like the P70 era / the original
+        // Nintendulator and stop touching the sound while it plays).
         //
-        // The P90+ MMR audio path is fully deterministic and fully
-        // open-loop: the producer writes slots blind and nothing ever
-        // verifies that the write cursor keeps a safe distance from the
-        // DirectSound play cursor. Two consequences were measured on the
-        // user's machine (Log 2026-09-18):
+        // P102 post-mortem (from the post-P102 test log:
+        // setFreq=15, currentFreq=44062 while the paced producer really
+        // fills the ring at ~44031 Hz): the throttled controller only
+        // acted when the measured lead left the 1.5..4.5 slot band and
+        // then LEFT the trimmed frequency applied while the lead moved
+        // back inside the band, so the lead kept traveling in the same
+        // direction until the opposite boundary -- a guaranteed
+        // full-band sawtooth with alternating +-0.1% consumer-rate
+        // errors and a period of roughly a minute or two. At the
+        // sawtooth extremes the true lead approached the play cursor,
+        // so slot writes landed on the region being mixed -> torn audio
+        // -> the sound "spoils by itself"; minutes later the controller
+        // (or a ring wrap) restored a healthy lead -> it "normalizes by
+        // itself". GetCurrentPosition's ~10 ms quantization (+-0.6
+        // slot) added extra SetFrequency churn and spurious snap
+        // re-anchors near the boundaries, and every SetFrequency is
+        // itself a resampler restart on some audio stacks.
         //
-        //   1. PaceSlot() re-anchors its target sequence to live DWM
-        //      composition timestamps every frame, so the producer
-        //      effectively runs at the REAL composition rate (measured
-        //      60.0108 fps, a 17/17/16 ms 3-frame beat), while the
-        //      consumer rate is fixed at SoundON time from the NOMINAL
-        //      reported target (44100 * 60.000/60.0988 = 44027 Hz).
-        //      That +9 samples/s mismatch makes the write cursor lap
-        //      the play cursor roughly every 8 minutes -> the periodic
-        //      "random" crackle.
-        //
-        //   2. Any producer stall (display transition, scheduler hiccup,
-        //      DWM maintenance) permanently shifts the ring phase, and
-        //      nothing ever pulls it back.
-        //
-        // This controller restores the pre-P90 self-healing property
-        // WITHOUT reintroducing per-frame audiodg IPC: one
-        // GetCurrentPosition per 32 frames (~0.5 s), executed here in
-        // UpdateDRC -- the post-SwapBuffers point the P90 notes
-        // explicitly identified as safe for audio maintenance. A
-        // periodic SetFrequency trim of at most +-0.3% (about 5 cents,
-        // inaudible) is applied only when the measured lead leaves the
-        // 1.5..4.5 slot band; in the 0.7..5.3 slot danger zone the write
-        // cursor is snap-re-anchored 4 slots ahead of the play cursor
-        // instead (see AudioReanchorRing). Steady state costs at most a
-        // couple of SetFrequency calls per minute and typically none
-        // once converged.
+        // What replaces it is deliberately boring:
+        //   1. refresh the legacy cursor-slot cache once per frame, so
+        //      the ORIGINAL producer slot gate in APU::Run can verify
+        //      ring safety with zero steady-state audiodg calls (the
+        //      cached check is skipped after three slot writes without
+        //      a refresh, falling back to a fresh read);
+        //   2. a ONE-SHOT refinement of the playback frequency once the
+        //      presentation clock has locked after a cold SoundON -- at
+        //      most a single SetFrequency per audio session, at this
+        //      post-SwapBuffers point the P90 notes blessed.
         // ============================================================
         if (!GFX::MatchMonitorRate || LockSize == 0)
                 return;
-        if (InterlockedExchangeAdd(&g_AudioPlayPending, 0L) != 0L)
-                return;         // still priming; the consumer is not running yet
 
-        if (++drc_feedback_check_count < DRC_FEEDBACK_INTERVAL)
-                return;
-        drc_feedback_check_count = 0;
-
-        DWORD playPos = 0;
-        if (FAILED(Buffer->GetCurrentPosition(&playPos, NULL)))
-                return;
-
-        DWORD slotBytes = (DWORD)LockSize;
-        DWORD ringBytes = slotBytes * FRAMEBUF;
-        if (ringBytes == 0 || playPos >= ringBytes)
-                return;
-
-        DWORD writePos = (DWORD)next_pos * slotBytes;
-        LONG fillBytes = (LONG)((writePos + ringBytes - playPos) % ringBytes);
-        double fillSlots = (double)fillBytes / (double)slotBytes;
-
-        if (fillSlots < DRC_FILL_SNAP_LO || fillSlots > DRC_FILL_SNAP_HI)
+        LONG playPending = InterlockedExchangeAdd(&g_AudioPlayPending, 0L);
+        if (playPending == 0L)
         {
-                // Danger zone: the cursors are about to collide (or the
-                // phase was scrambled by a stall). Repair immediately by
-                // re-anchoring the write cursor with a fresh lead.
-                AudioReanchorRing();
+                // Consumer is running: refresh the cached play/write
+                // SLOTS (the gate compares slot indices). This is one
+                // shared-memory read per frame at the safe point.
+                DWORD pr = 0, pw = 0;
+                if (SUCCEEDED(Buffer->GetCurrentPosition(&pr, &pw)) && LockSize > 0)
+                {
+                        InterlockedExchange(&g_DSCacheRpos, (LONG)(pr / (DWORD)LockSize));
+                        InterlockedExchange(&g_DSCacheWpos, (LONG)(pw / (DWORD)LockSize));
+                        InterlockedExchange(&g_DSCacheAge,  0L);
+                }
+        }
+
+        if (drc_rate_oneshot_state != 0)
+                return;         // already applied (or not needed)
+
+        drc_frames_since_soundon++;
+        if (drc_frames_since_soundon < DRC_RATE_ONESHOT_DELAY_FRAMES)
+                return;         // let the clock and its 1/8 filter warm up
+        if (playPending != 0L)
+                return;         // still priming; try again next frame
+        if (!MonitorSync::HasPresentationClock())
+        {
+                if (drc_frames_since_soundon >= DRC_RATE_ONESHOT_GIVEUP_FRAMES)
+                        drc_rate_oneshot_state = 1;      // never locked: keep nominal
                 return;
         }
 
-        if (fillSlots < DRC_FILL_MIN || fillSlots > DRC_FILL_MAX)
+        // Latch the one-shot first: whatever happens below, this audio
+        // session will never touch SetFrequency again.
+        drc_rate_oneshot_state = 1;
+
+        double targetHz = MonitorSync::GetTargetHz();
+        double nesHz = MonitorSync::GetNESHz();
+        double presHz = MonitorSync::GetPresentationHz();
+        if (targetHz <= 0.0 || nesHz <= 0.0 || presHz <= 1.0)
+                return;
+        double diffHz = presHz - targetHz;
+        if (diffHz < 0.0) diffHz = -diffHz;
+        if (diffHz >= 0.01 * targetHz)
+                return;         // implausible measurement: keep nominal
+
+        double nativeProducerHz = GetEffectiveProducerSampleRate();
+        DWORD wantFreq = (DWORD)(nativeProducerHz * (presHz / nesHz) + 0.5);
+        if (wantFreq < 100)   wantFreq = 100;
+        if (wantFreq > 100000) wantFreq = 100000;
+
+        long wantDiff = (long)wantFreq - (long)drc_applied_freq;
+        if (wantDiff < 0) wantDiff = -wantDiff;
+        if (wantDiff < DRC_RATE_ONESHOT_MIN_DIFF)
+                return;         // nominal was already close enough
+
+        if (SUCCEEDED(Buffer->SetFrequency(wantFreq)))
         {
-                double base = (drc_base_freq > 0) ? (double)drc_base_freq : (double)FREQ;
-                double want = base * (1.0 + DRC_FILL_KP * (fillSlots - DRC_FILL_TARGET));
-                double fmin = base * (1.0 - DRC_FREQ_TRIM_MAX);
-                double fmax = base * (1.0 + DRC_FREQ_TRIM_MAX);
-                if (want < fmin) want = fmin;
-                if (want > fmax) want = fmax;
-                DWORD newFreq = (DWORD)(want + 0.5);
-                if (newFreq < 100)   newFreq = 100;
-                if (newFreq > 100000) newFreq = 100000;
-                if ((LONG)newFreq != InterlockedExchangeAdd(&g_AudioCurrentFreq, 0L))
-                {
-                        if (SUCCEEDED(Buffer->SetFrequency(newFreq)))
-                        {
-                                InterlockedIncrement(&g_AudioSetFreqCalls);
-                                InterlockedExchange(&g_AudioCurrentFreq, (LONG)newFreq);
-                        }
-                }
-                drc_play_freq = newFreq;
+                InterlockedIncrement(&g_AudioSetFreqCalls);
+                InterlockedExchange(&g_AudioCurrentFreq, (LONG)wantFreq);
+                drc_play_freq = wantFreq;
+                drc_applied_freq = wantFreq;
         }
 #endif /* !NSFPLAYER */
 }
@@ -2150,35 +2202,62 @@ void    Run (void)
                 // 60.0988Hz-vs-monitor beat that forced the render queue to
                 // periodically drop/duplicate a frame.
                 //
-                // P90: the MMR path does not call GetCurrentPosition at all.
-                // The write-ahead check uses a QPC-predicted consumer slot,
-                // keeping audiodg.exe out of the steady-state NES thread.
+                // P103: this branch no longer bypasses the original slot
+                // gate. The play/write-cursor check is shared with the
+                // non-MMR path below (see the P103 comment inside the
+                // branch); the cursor cache it relies on is refreshed
+                // once per frame by UpdateDRC(), so audiodg still stays
+                // out of the steady-state NES thread.
                 // ============================================================
                 if (isEnabled && Buffer && GFX::MatchMonitorRate)
                 {
                         LARGE_INTEGER p73Run = {0};
                         QueryPerformanceCounter(&p73Run);
-                        // P93: producer cadence is already owned by
-                        // GFX::DrawScreen()/MonitorSync::PaceFrame().  The
-                        // DirectSound ring is deliberately written without
-                        // polling, notifications, QPC cursor prediction, or
-                        // Sleep-based safety waits.  Four primed slots provide
-                        // the initial headroom; equal producer/consumer clocks
-                        // preserve the ring phase thereafter.
+                        // P93: producer cadence is owned by
+                        // GFX::DrawScreen()/MonitorSync::PaceFrame().
                         GFX::SetMMRProducerTrace(
                                 p73Run.QuadPart, p73Run.QuadPart, p73Run.QuadPart,
                                 0, 0, 0, 0, 0, 0);
-                        goto write_slot;
+                        // P103: restore the ORIGINAL Nintendulator slot
+                        // gate for MMR as well. The P90+ design wrote the
+                        // ring blind ("equal producer/consumer clocks
+                        // preserve the ring phase thereafter") -- but the
+                        // producer follows the real DWM composition rate
+                        // while the consumer frequency was derived from the
+                        // nominal label, so the write cursor could slowly
+                        // lap the play cursor, and every transition or
+                        // scheduler hiccup left uncorrected phase damage
+                        // behind. Falling through to the original
+                        // play/write-cursor check below makes the producer
+                        // WAIT instead of overwriting the slot DirectSound
+                        // is about to mix, exactly like the legacy non-MMR
+                        // path: overrun tears become impossible, and
+                        // after an underrun the producer waits for the play
+                        // cursor to pass and then re-leads the ring by
+                        // itself. The cursor cache used by the check is
+                        // refreshed once per frame by UpdateDRC()
+                        // (post-SwapBuffers), so the steady-state cost is
+                        // zero audiodg calls; a fresh GetCurrentPosition
+                        // (and the Sleep(1) wait) happens only when the
+                        // cached check cannot prove the slot is free.
+                        if (InterlockedExchangeAdd(&g_AudioPlayPending, 0L) != 0L)
+                                goto write_slot;   // still priming: never block
                 }
 
                 // ============================================================
-                // ORIGINAL PATH (MMR disabled)
+                // ORIGINAL PATH (shared: MMR falls through from above,
+                // and MMR-disabled enters directly)
                 // ============================================================
                 if (isEnabled && Buffer)
                 {
                         LONG cacheAge = InterlockedExchangeAdd(&g_DSCacheAge, 1L);
                         if (cacheAge <= 2)
                         {
+                                // Cached play/write SLOTS (P103: the cache now
+                                // holds slot indices, matching this comparison;
+                                // it is refreshed once per frame by UpdateDRC()
+                                // while MMR is active, and stays permanently
+                                // stale -- and therefore unused -- otherwise).
                                 unsigned long sr = (unsigned long)InterlockedExchangeAdd(&g_DSCacheRpos, 0L);
                                 unsigned long sw = (unsigned long)InterlockedExchangeAdd(&g_DSCacheWpos, 0L);
                                 if (sw < sr) sw += FRAMEBUF;
