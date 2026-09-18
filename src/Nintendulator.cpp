@@ -36,6 +36,7 @@
 #include "HeaderEdit.h"
 #include "Theme.h"
 #include "MonitorSync.h"
+#include "Kaillera.h"
 #include <shlwapi.h>
 
 #pragma comment(lib, "shlwapi.lib")
@@ -207,6 +208,11 @@ int APIENTRY _tWinMain (HINSTANCE hInstance, HINSTANCE hPrevInstance, LPTSTR lpC
         // Re-apply menu enable/disable states after Lang::UpdateMenu,
         // which resets MF_GRAYED on all modified items
         NES::SyncMenuStates();
+
+        // Load the Kaillera client DLL (if present) and set the initial
+        // state of the Netplay menu items
+        Kaillera::Init();
+        Kaillera::UpdateMenus();
 
         UpdateTitlebar();
 
@@ -440,6 +446,8 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                                 _tcscpy(Path_ROM, FileName);
                                 Path_ROM[ofn.nFileOffset-1] = 0;
                                 Theme::Reapply();
+                                if (Kaillera::Active)
+                                        Kaillera::Disconnect();
                                 NES::Stop();
                                 NES::OpenFile(FileName);
                         }
@@ -448,6 +456,8 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         break;
                 }
                 case ID_FILE_CLOSE:
+                        if (Kaillera::Active)
+                                Kaillera::Disconnect();
                         NES::Stop();
                         NES::CloseFile();
                         break;
@@ -503,13 +513,19 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         NES::Start(FALSE);
                         break;
                 case ID_CPU_STEP:
+                        if (Kaillera::Guard())
+                                break;  // frame stepping would stall the whole netplay session
                         NES::Stop();    // need to stop first
                         NES::Start(TRUE);       // so the 'start' makes it through
                         break;
                 case ID_CPU_STOP:
+                        if (Kaillera::Active)
+                                Kaillera::Disconnect();
                         NES::Stop();
                         break;
                 case ID_CPU_SOFTRESET:
+                        if (Kaillera::Guard())
+                                break;  // a local-only reset would desync every client
                         NES::Pause(FALSE);
                         if (Movie::Mode)
                                 Movie::Stop();
@@ -518,6 +534,8 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                                 NES::Resume();
                         break;
                 case ID_CPU_HARDRESET:
+                        if (Kaillera::Guard())
+                                break;  // a local-only reset would desync every client
                         NES::Pause(FALSE);
                         if (Movie::Mode)
                                 Movie::Stop();
@@ -526,6 +544,8 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                                 NES::Resume();
                         break;
                 case ID_CPU_SAVESTATE:
+                        if (Kaillera::Guard())
+                                break;  // savestates are local-only - they would desync the session
                         if (running)
                                 NES::Pause(TRUE);
                         else    NES::SkipToVBlank();
@@ -533,6 +553,8 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         if (running)    NES::Resume();
                         break;
                 case ID_CPU_LOADSTATE:
+                        if (Kaillera::Guard())
+                                break;  // savestates are local-only - they would desync the session
                         NES::Pause(FALSE);
                         States::LoadState();
                         if (running)    NES::Resume();
@@ -552,6 +574,8 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         States::SetSlot(States::SelSlot);
                         break;
                 case ID_CPU_GAMEGENIE:
+                        if (Kaillera::Guard())
+                                break;  // Game Genie state is part of the synchronized emulation
                         NES::GameGenie = !NES::GameGenie;
                         if (NES::GameGenie)
                                 CheckMenuItem(hMenu, ID_CPU_GAMEGENIE, MF_CHECKED);
@@ -564,12 +588,16 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         else    CheckMenuItem(hMenu, ID_CPU_BADOPS, MF_UNCHECKED);
                         break;
                 case ID_CPU_FRAMESTEP_ENABLED:
+                        if (Kaillera::Guard())
+                                break;  // frame stepping would stall the whole netplay session
                         NES::FrameStep = !NES::FrameStep;
                         if (NES::FrameStep)
                                 CheckMenuItem(hMenu, ID_CPU_FRAMESTEP_ENABLED, MF_CHECKED);
                         else    CheckMenuItem(hMenu, ID_CPU_FRAMESTEP_ENABLED, MF_UNCHECKED);
                         break;
                 case ID_CPU_FRAMESTEP_STEP:
+                        if (Kaillera::Guard())
+                                break;
                         NES::GotStep = TRUE;
                         break;
                 case ID_PPU_FRAMESKIP_AUTO:
@@ -634,18 +662,14 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         else    CheckMenuItem(hMenu, ID_PPU_SIZE_ASPECT, MF_UNCHECKED);
                         break;
                 case ID_PPU_MODE_NTSC:
-                        NES::Stop();
-                        NES::SetRegion(NES::REGION_NTSC);
-                        if (running)    NES::Start(FALSE);
-                        break;
                 case ID_PPU_MODE_PAL:
-                        NES::Stop();
-                        NES::SetRegion(NES::REGION_PAL);
-                        if (running)    NES::Start(FALSE);
-                        break;
                 case ID_PPU_MODE_DENDY:
+                        // The TV mode is part of the synchronized emulation -
+                        // changing it locally would desync every client.
+                        if (Kaillera::Guard())
+                                break;
                         NES::Stop();
-                        NES::SetRegion(NES::REGION_DENDY);
+                        NES::SetRegion((wmId == ID_PPU_MODE_NTSC) ? NES::REGION_NTSC : ((wmId == ID_PPU_MODE_PAL) ? NES::REGION_PAL : NES::REGION_DENDY));
                         if (running)    NES::Start(FALSE);
                         break;
                 case ID_PPU_PALETTE:
@@ -842,6 +866,8 @@ case ID_SOUND_ENABLED:
                         APU::Config();
                         break;
                 case ID_INPUT_SETUP:
+                        if (Kaillera::Guard())
+                                break;  // controller types must stay identical on all clients
                         NES::Stop();
                         Controllers::OpenConfig();
                         if (running)    NES::Start(FALSE);
@@ -862,6 +888,8 @@ case ID_SOUND_ENABLED:
                         ShowWindow(hDebug, dbgVisible ? SW_SHOW : SW_HIDE);
                         break;
                 case ID_GAME:
+                        if (Kaillera::Guard())
+                                break;  // mapper config (e.g. FDS disk control) is local-only
                         NES::MapperConfig();
                         break;
                 case ID_MISC_STARTAVICAPTURE:
@@ -871,13 +899,26 @@ case ID_SOUND_ENABLED:
                         AVI::End();
                         break;
                 case ID_MISC_PLAYMOVIE:
+                        if (Kaillera::Guard())
+                                break;  // movies and netplay are mutually exclusive
                         Movie::Play();
                         break;
                 case ID_MISC_RECORDMOVIE:
+                        if (Kaillera::Guard())
+                                break;  // movies and netplay are mutually exclusive
                         Movie::Record();
                         break;
                 case ID_MISC_STOPMOVIE:
                         Movie::Stop();
+                        break;
+                case ID_NETPLAY_CONNECT:
+                        Kaillera::Connect();
+                        break;
+                case ID_NETPLAY_DISCONNECT:
+                        Kaillera::Disconnect();
+                        break;
+                case ID_NETPLAY_CHAT:
+                        Kaillera::Chat(hWnd);
                         break;
                 case ID_HELP_ABOUT:
                         DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
@@ -920,6 +961,8 @@ case ID_SOUND_ENABLED:
         case WM_DROPFILES:
                 DragQueryFile((HDROP)wParam, 0, FileName, MAX_PATH);
                 DragFinish((HDROP)wParam);
+                if (Kaillera::Active)
+                        Kaillera::Disconnect();
                 NES::Stop();
                 NES::OpenFile(FileName);
                 break;
@@ -994,6 +1037,26 @@ case WM_APP_SETTITLE:
 }
 break;
 
+case WM_APP_KAILLERA_STARTGAME:
+        // Posted by the Kaillera game callback: a game is starting.
+        Kaillera::OnStartGame();
+        break;
+
+case WM_APP_KAILLERA_ENDED:
+        // The netplay session ended (wParam = reason).
+        Kaillera::OnEnded(wParam);
+        break;
+
+case WM_APP_KAILLERA_CHAT:
+        // Chat line received (lParam = heap TCHAR[]; handler frees it).
+        Kaillera::OnChat(reinterpret_cast<TCHAR*>(lParam));
+        break;
+
+case WM_APP_KAILLERA_DROPPED:
+        // A player left the game (lParam = heap TCHAR[]; handler frees it).
+        Kaillera::OnDropped(reinterpret_cast<TCHAR*>(lParam));
+        break;
+
 case WM_EXITSIZEMOVE:
         // Moving the emulator between physical monitors does not necessarily
         // generate WM_DISPLAYCHANGE. Re-query once after a drag/resize so MMR
@@ -1014,6 +1077,8 @@ case WM_DISPLAYCHANGE:
         break;
 
 case WM_CLOSE:
+                if (Kaillera::Active)
+                        Kaillera::Disconnect();
                 NES::Stop();
                 // Cannot safely shutdown DirectDraw while in fullscreen mode,
                 // so defer it to the message loop
@@ -1022,6 +1087,7 @@ case WM_CLOSE:
                 else    NES::Destroy();
                 break;
         case WM_DESTROY:
+                Kaillera::Destroy();
                 PostQuitMessage(0);
                 break;
         case WM_SYSCOMMAND:

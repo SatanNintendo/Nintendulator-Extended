@@ -44,6 +44,9 @@
     <ClCompile Include="..\src\GFX.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\Kaillera.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\MapperInterface.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -173,6 +176,12 @@
       <Filter>Resource Files</Filter>
     </ClInclude>
     <ClInclude Include="..\src\HeaderEdit.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\Kaillera.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\kailleraclient.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\src\Lang.h">

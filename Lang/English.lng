@@ -500,3 +500,20 @@ MENU_MOVIE=&Movie
 MENU_MOVIE_RECORD_OLD=&Record...
 MENU_MOVIE_PLAY_OLD=&Play...
 MENU_MOVIE_STOP_OLD=&Stop
+
+# === Netplay (Kaillera) ===
+NETPLAY_TITLE=Kaillera Netplay
+NETPLAY_CHAT_TITLE=Kaillera Chat
+MENU_NETPLAY=&Netplay
+MENU_NETPLAY_CONNECT=&Connect...\tCtrl+K
+MENU_NETPLAY_DISCONNECT=&Disconnect
+MENU_NETPLAY_CHAT=&Chat...\tCtrl+T
+MSG_NETPLAY_DLL_MISSING=kailleraclient.dll not found!\n\nPlace the Kaillera client DLL into the emulator folder and restart the program.\nNote: the classic kailleraclient.dll is 32-bit only - for the 64-bit build a 64-bit client (kailleraclient64.dll) is required.
+MSG_NETPLAY_NEED_ROM=Load a ROM before connecting!
+MSG_NETPLAY_NSF=Netplay is not available for NSF files.
+MSG_NETPLAY_CONTROLLERS=Unsupported controller configuration for netplay!\n\nSupported setups:\n- Port 1: Standard Controller, Port 2: Standard Controller (up to 2 players)\n- Port 1: Four Score, Port 2: Four Score 2, all four sub-controllers set to Standard Controller (up to 4 players)\n\nThe expansion port must be left Unconnected.\nSet it up via Input > Setup... and try again.
+MSG_NETPLAY_NO_SLOT=Your player number does not fit the current controller configuration!\nPlayers 3-4 require the Four Score setup (Port 1: Four Score, Port 2: Four Score 2).
+MSG_NETPLAY_PLAYERS_LIMIT=Too many players for the current controller configuration!\nPlayers 3-4 require the Four Score setup (Port 1: Four Score, Port 2: Four Score 2).
+MSG_NETPLAY_CONN_LOST=Kaillera: connection lost - the netplay session has ended.
+MSG_NETPLAY_SETTINGS=The game host uses different emulator settings (PPU mode or Game Genie)!\nAll players must use the same PPU mode (NTSC/PAL/Hybrid) and the same Game Genie state. Match the host's settings and reconnect.
+MSG_NETPLAY_BLOCKED=This action is not available during a netplay session!\nDisconnect first (Netplay > Disconnect).

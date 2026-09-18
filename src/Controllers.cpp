@@ -38,6 +38,7 @@ static void LocalizeControllerDialog(HWND hDlg, LangStringID caption,
 }
 #include "Movie.h"
 #include "Controllers.h"
+#include "Kaillera.h"
 #include <commdlg.h>
 
 #pragma comment(lib, "dinput8.lib")
@@ -1070,9 +1071,20 @@ void    UpdateInput (void)
                 if ((MI) && (MI->Config))
                         Cmd = MI->Config(CFG_QUERY, 0);
         }
-        Port1->Frame(Movie::Mode);
-        Port2->Frame(Movie::Mode);
-        PortExp->Frame(Movie::Mode);
+        if (Kaillera::Active)
+        {
+                // Netplay session in progress: poll the local input, exchange
+                // it with the other players through kailleraModifyPlayValues()
+                // and inject the combined network input into the controller
+                // ports.  The emulation loop itself is not touched at all.
+                Kaillera::FrameInput();
+        }
+        else
+        {
+                Port1->Frame(Movie::Mode);
+                Port2->Frame(Movie::Mode);
+                PortExp->Frame(Movie::Mode);
+        }
         if ((Cmd) && (MI) && (MI->Config))
                 MI->Config(CFG_CMD, Cmd);
         if (Movie::Mode & MOV_RECORD)

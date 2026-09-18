@@ -80,6 +80,7 @@
     <ClCompile Include="..\src\Genie.cpp" />
     <ClCompile Include="..\src\GFX.cpp" />
     <ClCompile Include="..\src\HeaderEdit.cpp" />
+    <ClCompile Include="..\src\Kaillera.cpp" />
     <ClCompile Include="..\src\MapperInterface.cpp" />
     <ClCompile Include="..\src\Movie.cpp" />
     <ClCompile Include="..\src\MonitorSync.cpp" />
@@ -115,6 +116,8 @@
     <ClInclude Include="..\src\Genie.h" />
     <ClInclude Include="..\src\GFX.h" />
     <ClInclude Include="..\src\HeaderEdit.h" />
+    <ClInclude Include="..\src\Kaillera.h" />
+    <ClInclude Include="..\src\kailleraclient.h" />
     <ClInclude Include="..\src\MapperInterface.h" />
     <ClInclude Include="..\src\Movie.h" />
     <ClInclude Include="..\src\MonitorSync.h" />

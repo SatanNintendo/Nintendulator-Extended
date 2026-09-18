@@ -484,6 +484,23 @@ static const TCHAR *DefaultStrings[LANG_STRING_COUNT] =
     _T("Mostly supported"),
     _T("Fully supported!"),
 
+    // Netplay (Kaillera)
+    _T("Kaillera Netplay"),
+    _T("Kaillera Chat"),
+    _T("&Netplay"),
+    _T("&Connect...\tCtrl+K"),
+    _T("&Disconnect"),
+    _T("&Chat...\tCtrl+T"),
+    _T("kailleraclient.dll not found!\n\nPlace the Kaillera client DLL into the emulator folder and restart the program.\nNote: the classic kailleraclient.dll is 32-bit only - for the 64-bit build a 64-bit client (kailleraclient64.dll) is required."),
+    _T("Load a ROM before connecting!"),
+    _T("Netplay is not available for NSF files."),
+    _T("Unsupported controller configuration for netplay!\n\nSupported setups:\n- Port 1: Standard Controller, Port 2: Standard Controller (up to 2 players)\n- Port 1: Four Score, Port 2: Four Score 2, all four sub-controllers set to Standard Controller (up to 4 players)\n\nThe expansion port must be left Unconnected.\nSet it up via Input > Setup... and try again."),
+    _T("Your player number does not fit the current controller configuration!\nPlayers 3-4 require the Four Score setup (Port 1: Four Score, Port 2: Four Score 2)."),
+    _T("Too many players for the current controller configuration!\nPlayers 3-4 require the Four Score setup (Port 1: Four Score, Port 2: Four Score 2)."),
+    _T("Kaillera: connection lost - the netplay session has ended."),
+    _T("The game host uses different emulator settings (PPU mode or Game Genie)!\nAll players must use the same PPU mode (NTSC/PAL/Hybrid) and the same Game Genie state. Match the host's settings and reconnect."),
+    _T("This action is not available during a netplay session!\nDisconnect first (Netplay > Disconnect)."),
+
 };
 
 // ============================================================
@@ -993,6 +1010,24 @@ static const KeyMapping KeyMap[] =
     { L"COMPAT_PARTIAL",              LANG_COMPAT_PARTIAL              },
     { L"COMPAT_MOSTLY",              LANG_COMPAT_MOSTLY              },
     { L"COMPAT_FULL",                 LANG_COMPAT_FULL                 },
+
+    // Netplay (Kaillera)
+    { L"NETPLAY_TITLE",                 LANG_NETPLAY_TITLE              },
+    { L"NETPLAY_CHAT_TITLE",            LANG_NETPLAY_CHAT_TITLE         },
+    { L"MENU_NETPLAY",                  LANG_MENU_NETPLAY               },
+    { L"MENU_NETPLAY_CONNECT",          LANG_MENU_NETPLAY_CONNECT       },
+    { L"MENU_NETPLAY_DISCONNECT",       LANG_MENU_NETPLAY_DISCONNECT    },
+    { L"MENU_NETPLAY_CHAT",             LANG_MENU_NETPLAY_CHAT          },
+    { L"MSG_NETPLAY_DLL_MISSING",       LANG_MSG_NETPLAY_DLL_MISSING    },
+    { L"MSG_NETPLAY_NEED_ROM",          LANG_MSG_NETPLAY_NEED_ROM       },
+    { L"MSG_NETPLAY_NSF",               LANG_MSG_NETPLAY_NSF            },
+    { L"MSG_NETPLAY_CONTROLLERS",       LANG_MSG_NETPLAY_CONTROLLERS    },
+    { L"MSG_NETPLAY_NO_SLOT",           LANG_MSG_NETPLAY_NO_SLOT        },
+    { L"MSG_NETPLAY_PLAYERS_LIMIT",     LANG_MSG_NETPLAY_PLAYERS_LIMIT  },
+    { L"MSG_NETPLAY_CONN_LOST",         LANG_MSG_NETPLAY_CONN_LOST      },
+    { L"MSG_NETPLAY_SETTINGS",          LANG_MSG_NETPLAY_SETTINGS       },
+    { L"MSG_NETPLAY_BLOCKED",           LANG_MSG_NETPLAY_BLOCKED        },
+
     { NULL, LANG_STRING_COUNT }
 };
 
@@ -1147,8 +1182,9 @@ void Lang::UpdateMenu(HMENU hMenu)
     // Position 6 = Game — a single menu item (not a popup), preserve MF_GRAYED
     ModifyMenu(hMenu, ID_GAME, MF_BYCOMMAND | MF_STRING | GRAY_STATE(hMenu, ID_GAME), ID_GAME, GetString(LANG_MENU_GAME));
     ModifyMenu(hMenu, 7, MF_BYPOSITION | MF_STRING | MF_POPUP, (UINT_PTR)GetSubMenu(hMenu, 7), GetString(LANG_MENU_MISC));
-    ModifyMenu(hMenu, 8, MF_BYPOSITION | MF_STRING | MF_POPUP, (UINT_PTR)GetSubMenu(hMenu, 8), GetString(LANG_MENU_LANGUAGE));
-    ModifyMenu(hMenu, 9, MF_BYPOSITION | MF_STRING | MF_POPUP, (UINT_PTR)GetSubMenu(hMenu, 9), GetString(LANG_MENU_HELP));
+    ModifyMenu(hMenu, 8, MF_BYPOSITION | MF_STRING | MF_POPUP, (UINT_PTR)GetSubMenu(hMenu, 8), GetString(LANG_MENU_NETPLAY));
+    ModifyMenu(hMenu, 9, MF_BYPOSITION | MF_STRING | MF_POPUP, (UINT_PTR)GetSubMenu(hMenu, 9), GetString(LANG_MENU_LANGUAGE));
+    ModifyMenu(hMenu, 10, MF_BYPOSITION | MF_STRING | MF_POPUP, (UINT_PTR)GetSubMenu(hMenu, 10), GetString(LANG_MENU_HELP));
 
     // === File Submenu ===
     HMENU hFile = GetSubMenu(hMenu, 0);
@@ -1257,7 +1293,7 @@ void Lang::UpdateMenu(HMENU hMenu)
     // === Misc Submenu ===
     // GetSubMenu counts ALL items by position (including non-popup items like Game).
     // Position 6 = Game (not a popup, GetSubMenu returns NULL), so Misc is at position 7.
-    // Position 8 = Language, Position 9 = Help.
+    // Position 8 = Netplay, Position 9 = Language, Position 10 = Help.
     HMENU hMisc = GetSubMenu(hMenu, 7);
     ModifyMenu(hMisc, ID_MISC_STARTAVICAPTURE, MF_BYCOMMAND | MF_STRING | GRAY_STATE(hMisc, ID_MISC_STARTAVICAPTURE), ID_MISC_STARTAVICAPTURE, GetString(LANG_MENU_MISC_STARTAVI));
     ModifyMenu(hMisc, ID_MISC_STOPAVICAPTURE,  MF_BYCOMMAND | MF_STRING | GRAY_STATE(hMisc, ID_MISC_STOPAVICAPTURE),  ID_MISC_STOPAVICAPTURE,  GetString(LANG_MENU_MISC_STOPAVI));
@@ -1265,8 +1301,14 @@ void Lang::UpdateMenu(HMENU hMenu)
     ModifyMenu(hMisc, ID_MISC_RECORDMOVIE,     MF_BYCOMMAND | MF_STRING | GRAY_STATE(hMisc, ID_MISC_RECORDMOVIE),     ID_MISC_RECORDMOVIE,     GetString(LANG_MENU_MOVIE_RECORD));
     ModifyMenu(hMisc, ID_MISC_STOPMOVIE,       MF_BYCOMMAND | MF_STRING | GRAY_STATE(hMisc, ID_MISC_STOPMOVIE),       ID_MISC_STOPMOVIE,       GetString(LANG_MENU_MOVIE_STOP));
 
+    // === Netplay Submenu ===
+    HMENU hNetplay = GetSubMenu(hMenu, 8);
+    ModifyMenu(hNetplay, ID_NETPLAY_CONNECT,    MF_BYCOMMAND | MF_STRING | GRAY_STATE(hNetplay, ID_NETPLAY_CONNECT),    ID_NETPLAY_CONNECT,    GetString(LANG_MENU_NETPLAY_CONNECT));
+    ModifyMenu(hNetplay, ID_NETPLAY_DISCONNECT, MF_BYCOMMAND | MF_STRING | GRAY_STATE(hNetplay, ID_NETPLAY_DISCONNECT), ID_NETPLAY_DISCONNECT, GetString(LANG_MENU_NETPLAY_DISCONNECT));
+    ModifyMenu(hNetplay, ID_NETPLAY_CHAT,       MF_BYCOMMAND | MF_STRING | GRAY_STATE(hNetplay, ID_NETPLAY_CHAT),       ID_NETPLAY_CHAT,       GetString(LANG_MENU_NETPLAY_CHAT));
+
     // === Help Submenu ===
-    HMENU hHelp = GetSubMenu(hMenu, 9);
+    HMENU hHelp = GetSubMenu(hMenu, 10);
     ModifyMenu(hHelp, ID_HELP_ABOUT,       MF_BYCOMMAND | MF_STRING, ID_HELP_ABOUT,       GetString(LANG_MENU_HELP_ABOUT));
 
     #undef GRAY_STATE

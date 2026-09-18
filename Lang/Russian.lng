@@ -500,3 +500,20 @@ MENU_MOVIE=&Запись
 MENU_MOVIE_RECORD_OLD=&Записать...
 MENU_MOVIE_PLAY_OLD=&Воспроизвести...
 MENU_MOVIE_STOP_OLD=&Остановить
+
+# === Сетевая игра (Kaillera) ===
+NETPLAY_TITLE=Сетевая игра Kaillera
+NETPLAY_CHAT_TITLE=Чат Kaillera
+MENU_NETPLAY=С&етевая игра
+MENU_NETPLAY_CONNECT=&Подключиться...\tCtrl+K
+MENU_NETPLAY_DISCONNECT=&Отключиться
+MENU_NETPLAY_CHAT=&Чат...\tCtrl+T
+MSG_NETPLAY_DLL_MISSING=Файл kailleraclient.dll не найден!\n\nПоместите клиентскую DLL Kaillera в папку эмулятора и перезапустите программу.\nОбратите внимание: классическая kailleraclient.dll существует только в 32-битной версии — для 64-битной сборки нужен 64-битный клиент (kailleraclient64.dll).
+MSG_NETPLAY_NEED_ROM=Загрузите ROM перед подключением!
+MSG_NETPLAY_NSF=Сетевая игра недоступна для файлов NSF.
+MSG_NETPLAY_CONTROLLERS=Неподдерживаемая конфигурация контроллеров для сетевой игры!\n\nПоддерживаемые варианты:\n- Порт 1: Standard Controller, Порт 2: Standard Controller (до 2 игроков)\n- Порт 1: Four Score, Порт 2: Four Score 2, все четыре суб-контроллера — Standard Controller (до 4 игроков)\n\nПорт расширения должен быть Unconnected.\nНастройте через Ввод > Настройка... и попробуйте снова.
+MSG_NETPLAY_NO_SLOT=Ваш номер игрока не соответствует текущей конфигурации контроллеров!\nДля игроков 3-4 нужна конфигурация с Four Score (Порт 1: Four Score, Порт 2: Four Score 2).
+MSG_NETPLAY_PLAYERS_LIMIT=Слишком много игроков для текущей конфигурации контроллеров!\nДля игроков 3-4 нужна конфигурация с Four Score (Порт 1: Four Score, Порт 2: Four Score 2).
+MSG_NETPLAY_CONN_LOST=Kaillera: соединение потеряно — сетевая игра завершена.
+MSG_NETPLAY_SETTINGS=У хоста игры другие настройки эмулятора (режим PPU или Game Genie)!\nВсе игроки должны использовать одинаковый режим PPU (NTSC/PAL/Гибрид) и одинаковое состояние Game Genie. Настройтесь так же, как хост, и переподключитесь.
+MSG_NETPLAY_BLOCKED=Это действие недоступно во время сетевой игры!\nСначала отключитесь (Сетевая игра > Отключиться).
