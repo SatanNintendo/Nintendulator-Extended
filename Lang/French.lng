@@ -500,3 +500,22 @@ MENU_MOVIE=&Vidéo
 MENU_MOVIE_RECORD_OLD=&Enregistrer...
 MENU_MOVIE_PLAY_OLD=&Lire...
 MENU_MOVIE_STOP_OLD=&Arrêter
+
+# === Jeu en réseau (Kaillera) ===
+NETPLAY_TITLE=Jeu en réseau Kaillera
+NETPLAY_CHAT_TITLE=Chat Kaillera
+MENU_NETPLAY=Jeu en &réseau
+MENU_NETPLAY_CONNECT=Se &connecter...\tCtrl+K
+MENU_NETPLAY_DISCONNECT=&Déconnecter
+MENU_NETPLAY_CHAT=Cha&t...\tCtrl+T
+MSG_NETPLAY_DLL_MISSING=Client Kaillera (kailleraclient.dll) introuvable !\n\nPlacez la DLL client de Kaillera dans le dossier de l'émulateur, à côté du programme, puis redémarrez-le.\nVeuillez vérifier que la DLL correspond à cette version : il s'agit de l'émulateur %d bits, une kailleraclient.dll %d bits est donc requise. Le client 64 bits peut être téléchargé depuis le projet Open Kaillera (open-kaillera.github.io, client n02).
+MSG_NETPLAY_DLL_BITNESS=Le fichier kailleraclient.dll présent dans le dossier de l'émulateur ne peut pas être utilisé avec cette version !\n\nCet émulateur est une version %d bits et requiert donc une kailleraclient.dll %d bits - la DLL placée a été compilée pour une autre architecture.\nVeuillez vérifier que vous avez bien placé une version %d bits de kailleraclient.dll (par exemple le client n02 de open-kaillera.github.io), puis redémarrez le programme.
+MSG_NETPLAY_DLL_INVALID=Le fichier kailleraclient.dll présent dans le dossier de l'émulateur n'est pas un client Kaillera valide !\n\nVeuillez vérifier que vous avez placé une véritable DLL client de Kaillera correspondant à cette version (%d bits), puis redémarrez le programme.
+MSG_NETPLAY_NEED_ROM=Chargez une ROM avant de vous connecter !
+MSG_NETPLAY_NSF=Le jeu en réseau n'est pas disponible pour les fichiers NSF.
+MSG_NETPLAY_CONTROLLERS=Configuration des manettes non prise en charge pour le jeu en réseau !\n\nConfigurations prises en charge :\n- Port 1 : Contrôleur standard, Port 2 : Contrôleur standard (jusqu'à 2 joueurs)\n- Port 1 : Four Score, Port 2 : Four Score 2, les quatre sous-contrôleurs réglés sur Contrôleur standard (jusqu'à 4 joueurs)\n\nLe port d'extension doit rester Non connecté.\nConfigurez le tout via Entrée > Configuration... puis réessayez.
+MSG_NETPLAY_NO_SLOT=Votre numéro de joueur ne correspond pas à la configuration actuelle des manettes !\nLes joueurs 3-4 nécessitent la configuration Four Score (Port 1 : Four Score, Port 2 : Four Score 2).
+MSG_NETPLAY_PLAYERS_LIMIT=Trop de joueurs pour la configuration actuelle des manettes !\nLes joueurs 3-4 nécessitent la configuration Four Score (Port 1 : Four Score, Port 2 : Four Score 2).
+MSG_NETPLAY_CONN_LOST=Kaillera : connexion perdue - la session de jeu en réseau est terminée.
+MSG_NETPLAY_SETTINGS=L'hôte de la partie utilise des paramètres d'émulateur différents (mode PPU ou Game Genie) !\nTous les joueurs doivent utiliser le même mode PPU (NTSC/PAL/Hybride) et le même état de Game Genie. Alignez vos paramètres sur ceux de l'hôte et reconnectez-vous.
+MSG_NETPLAY_BLOCKED=Cette action n'est pas disponible pendant une session de jeu en réseau !\nDéconnectez-vous d'abord (Jeu en réseau > Déconnecter).

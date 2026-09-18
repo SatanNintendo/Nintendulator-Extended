@@ -500,3 +500,22 @@ MENU_MOVIE=&Film
 MENU_MOVIE_RECORD_OLD=&Aufnehmen...
 MENU_MOVIE_PLAY_OLD=&Abspielen...
 MENU_MOVIE_STOP_OLD=&Stoppen
+
+# === Netzwerkspiel (Kaillera) ===
+NETPLAY_TITLE=Kaillera-Netzwerkspiel
+NETPLAY_CHAT_TITLE=Kaillera-Chat
+MENU_NETPLAY=&Netzwerkspiel
+MENU_NETPLAY_CONNECT=&Verbinden...\tCtrl+K
+MENU_NETPLAY_DISCONNECT=&Trennen
+MENU_NETPLAY_CHAT=&Chat...\tCtrl+T
+MSG_NETPLAY_DLL_MISSING=Kaillera-Client (kailleraclient.dll) nicht gefunden!\n\nLegen Sie die Client-DLL von Kaillera in den Emulator-Ordner, neben das Programm, und starten Sie ihn anschliessend neu.\nBitte stellen Sie sicher, dass die DLL zu dieser Version passt: Dies ist der %d-Bit-Emulator, daher wird eine %d-Bit-kailleraclient.dll benötigt. Einen 64-Bit-Client können Sie beim Open-Kaillera-Projekt herunterladen (open-kaillera.github.io, Client n02).
+MSG_NETPLAY_DLL_BITNESS=Die kailleraclient.dll im Emulator-Ordner kann mit dieser Version nicht verwendet werden!\n\nDieser Emulator ist eine %d-Bit-Version und benötigt daher eine %d-Bit-kailleraclient.dll - die von Ihnen abgelegte DLL wurde für eine andere Architektur erstellt.\nBitte stellen Sie sicher, dass Sie wirklich eine %d-Bit-Version von kailleraclient.dll abgelegt haben (z. B. den Client n02 von open-kaillera.github.io), und starten Sie das Programm neu.
+MSG_NETPLAY_DLL_INVALID=Die kailleraclient.dll im Emulator-Ordner ist kein gültiger Kaillera-Client!\n\nBitte stellen Sie sicher, dass Sie eine echte Kaillera-Client-DLL abgelegt haben, die zu dieser Version passt (%d-Bit), und starten Sie das Programm neu.
+MSG_NETPLAY_NEED_ROM=Vor dem Verbinden muss ein ROM geladen werden!
+MSG_NETPLAY_NSF=Netzwerkspiel ist für NSF-Dateien nicht verfügbar.
+MSG_NETPLAY_CONTROLLERS=Nicht unterstützte Controller-Konfiguration für das Netzwerkspiel!\n\nUnterstützte Varianten:\n- Port 1: Standard-Controller, Port 2: Standard-Controller (bis zu 2 Spieler)\n- Port 1: Four Score, Port 2: Four Score 2, alle vier Sub-Controller auf Standard-Controller (bis zu 4 Spieler)\n\nDer Erweiterungsport muss auf Nicht verbunden bleiben.\nRichten Sie die Controller über Eingabe > Einrichtung... ein und versuchen Sie es erneut.
+MSG_NETPLAY_NO_SLOT=Ihre Spielernummer passt nicht zur aktuellen Controller-Konfiguration!\nFür Spieler 3-4 ist die Four-Score-Konfiguration erforderlich (Port 1: Four Score, Port 2: Four Score 2).
+MSG_NETPLAY_PLAYERS_LIMIT=Zu viele Spieler für die aktuelle Controller-Konfiguration!\nFür Spieler 3-4 ist die Four-Score-Konfiguration erforderlich (Port 1: Four Score, Port 2: Four Score 2).
+MSG_NETPLAY_CONN_LOST=Kaillera: Verbindung verloren - die Netzwerkspiel-Sitzung wurde beendet.
+MSG_NETPLAY_SETTINGS=Der Host der Partie verwendet andere Emulator-Einstellungen (PPU-Modus oder Game Genie)!\nAlle Spieler müssen denselben PPU-Modus (NTSC/PAL/Hybrid) und denselben Game-Genie-Zustand verwenden. Gleichen Sie Ihre Einstellungen mit denen des Hosts ab und verbinden Sie sich erneut.
+MSG_NETPLAY_BLOCKED=Diese Aktion ist während einer Netzwerkspiel-Sitzung nicht verfügbar!\nTrennen Sie zuerst die Verbindung (Netzwerkspiel > Trennen).

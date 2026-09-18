@@ -500,3 +500,22 @@ MENU_MOVIE=&ムービー
 MENU_MOVIE_RECORD_OLD=&記録...
 MENU_MOVIE_PLAY_OLD=&再生...
 MENU_MOVIE_STOP_OLD=&停止
+
+# === ネットプレイ (Kaillera) ===
+NETPLAY_TITLE=Kaillera ネットプレイ
+NETPLAY_CHAT_TITLE=Kailleraチャット
+MENU_NETPLAY=&ネットプレイ
+MENU_NETPLAY_CONNECT=接続(&C)...\tCtrl+K
+MENU_NETPLAY_DISCONNECT=切断(&D)
+MENU_NETPLAY_CHAT=チャット(&T)...\tCtrl+T
+MSG_NETPLAY_DLL_MISSING=Kailleraクライアント (kailleraclient.dll) が見つかりません！\n\nKailleraクライアントDLLを、プログラムと同じエミュレーターのフォルダーに置いて、再起動してください。\nDLLがこのビルドと一致していることを確認してください。これは%dビットのエミュレーターのため、%dビットのkailleraclient.dllが必要です。64ビットクライアントはOpen Kailleraプロジェクト (open-kaillera.github.io、n02クライアント) からダウンロードできます。
+MSG_NETPLAY_DLL_BITNESS=エミュレーターのフォルダーにあるkailleraclient.dllは、このビルドでは使用できません！\n\nこのエミュレーターは%dビットビルドのため、%dビットのkailleraclient.dllが必要です。置かれたDLLは別のアーキテクチャ用にビルドされています。\n本当に%dビット版のkailleraclient.dllを置いたかどうか確認してください (例: open-kaillera.github.ioのn02クライアント)。確認後、プログラムを再起動してください。
+MSG_NETPLAY_DLL_INVALID=エミュレーターのフォルダーにあるkailleraclient.dllは、有効なKailleraクライアントではありません！\n\nこのビルド (%dビット) に対応した正規のKailleraクライアントDLLを置いたことを確認し、プログラムを再起動してください。
+MSG_NETPLAY_NEED_ROM=接続する前にROMをロードしてください！
+MSG_NETPLAY_NSF=ネットプレイはNSFファイルでは利用できません。
+MSG_NETPLAY_CONTROLLERS=ネットプレイでサポートされていないコントローラー構成です！\n\n対応している構成:\n- ポート1: 標準コントローラー、ポート2: 標準コントローラー (最大2人)\n- ポート1: フォースコア、ポート2: フォースコア2、4つのサブコントローラーすべてを標準コントローラーに設定 (最大4人)\n\n拡張ポートは未接続のままにしてください。\n入力 > 設定... で構成してから、もう一度お試しください。
+MSG_NETPLAY_NO_SLOT=プレイヤー番号が現在のコントローラー構成と一致していません！\nプレイヤー3-4にはフォースコア構成が必要です (ポート1: フォースコア、ポート2: フォースコア2)。
+MSG_NETPLAY_PLAYERS_LIMIT=現在のコントローラー構成ではプレイヤーが多すぎます！\nプレイヤー3-4にはフォースコア構成が必要です (ポート1: フォースコア、ポート2: フォースコア2)。
+MSG_NETPLAY_CONN_LOST=Kaillera: 接続が切断されたため、ネットプレイセッションを終了しました。
+MSG_NETPLAY_SETTINGS=ゲームのホストが異なるエミュレーター設定 (PPUモードまたはGame Genie) を使用しています！\nすべてのプレイヤーは、同じPPUモード (NTSC/PAL/ハイブリッド) と同じGame Genieの状態を使用する必要があります。ホストと同じ設定に合わせて、再接続してください。
+MSG_NETPLAY_BLOCKED=ネットプレイセッション中はこの操作は利用できません！\n先に切断してください (ネットプレイ > 切断)。

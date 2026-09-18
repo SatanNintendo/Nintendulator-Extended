@@ -500,3 +500,22 @@ MENU_MOVIE=&影片
 MENU_MOVIE_RECORD_OLD=&录制...
 MENU_MOVIE_PLAY_OLD=&播放...
 MENU_MOVIE_STOP_OLD=&停止
+
+# === 联机游戏 (Kaillera) ===
+NETPLAY_TITLE=Kaillera 联机游戏
+NETPLAY_CHAT_TITLE=Kaillera 聊天
+MENU_NETPLAY=&联机游戏
+MENU_NETPLAY_CONNECT=&连接...\tCtrl+K
+MENU_NETPLAY_DISCONNECT=&断开连接
+MENU_NETPLAY_CHAT=&聊天...\tCtrl+T
+MSG_NETPLAY_DLL_MISSING=未找到 Kaillera 客户端 (kailleraclient.dll)!\n\n请将 Kaillera 客户端 DLL 放入模拟器文件夹中 (程序旁边)，然后重新启动程序。\n请确保 DLL 与此版本匹配。这是 %d 位模拟器，因此需要 %d 位的 kailleraclient.dll。64 位客户端可从 Open Kaillera 项目下载 (open-kaillera.github.io, n02 客户端)。
+MSG_NETPLAY_DLL_BITNESS=模拟器文件夹中的 kailleraclient.dll 无法用于此版本!\n\n此模拟器是 %d 位版本，因此需要 %d 位的 kailleraclient.dll，而您放入的 DLL 是为其他架构编译的。\n请确保您放入的确实是 %d 位版本的 kailleraclient.dll (例如 open-kaillera.github.io 的 n02 客户端)，然后重新启动程序。
+MSG_NETPLAY_DLL_INVALID=模拟器文件夹中的 kailleraclient.dll 不是有效的 Kaillera 客户端!\n\n请确保您放入的是与此版本 (%d 位) 匹配的真正 Kaillera 客户端 DLL，然后重新启动程序。
+MSG_NETPLAY_NEED_ROM=连接前请先加载 ROM!
+MSG_NETPLAY_NSF=联机游戏不适用于 NSF 文件。
+MSG_NETPLAY_CONTROLLERS=控制器配置不支持联机游戏!\n\n支持的配置:\n- 端口 1: 标准控制器，端口 2: 标准控制器 (最多 2 名玩家)\n- 端口 1: 四分线，端口 2: 四分线 2，四个子控制器均设为标准控制器 (最多 4 名玩家)\n\n扩展端口必须保持未连接。\n请通过 输入 > 设置... 进行配置，然后重试。
+MSG_NETPLAY_NO_SLOT=您的玩家编号与当前控制器配置不匹配!\n玩家 3-4 需要四分线配置 (端口 1: 四分线，端口 2: 四分线 2)。
+MSG_NETPLAY_PLAYERS_LIMIT=当前控制器配置支持的玩家数量不足!\n玩家 3-4 需要四分线配置 (端口 1: 四分线，端口 2: 四分线 2)。
+MSG_NETPLAY_CONN_LOST=Kaillera: 连接已丢失，联机游戏会话已结束。
+MSG_NETPLAY_SETTINGS=游戏房主使用了不同的模拟器设置 (PPU 模式或 Game Genie)!\n所有玩家必须使用相同的 PPU 模式 (NTSC/PAL/混合) 和相同的 Game Genie 状态。请将设置调整为与房主一致，然后重新连接。
+MSG_NETPLAY_BLOCKED=联机游戏会话期间此操作不可用!\n请先断开连接 (联机游戏 > 断开连接)。

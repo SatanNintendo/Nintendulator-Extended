@@ -500,3 +500,22 @@ MENU_MOVIE=&Filme
 MENU_MOVIE_RECORD_OLD=&Gravar...
 MENU_MOVIE_PLAY_OLD=&Reproduzir...
 MENU_MOVIE_STOP_OLD=&Parar
+
+# === Jogo em rede (Kaillera) ===
+NETPLAY_TITLE=Jogo em rede Kaillera
+NETPLAY_CHAT_TITLE=Chat do Kaillera
+MENU_NETPLAY=Jogo em &rede
+MENU_NETPLAY_CONNECT=&Conectar...\tCtrl+K
+MENU_NETPLAY_DISCONNECT=&Desconectar
+MENU_NETPLAY_CHAT=&Bate-papo...\tCtrl+T
+MSG_NETPLAY_DLL_MISSING=Cliente Kaillera (kailleraclient.dll) não encontrado!\n\nColoque a DLL cliente do Kaillera na pasta do emulador, junto ao programa, e reinicie-o em seguida.\nCertifique-se de que a DLL corresponde a esta versão: este é o emulador de %d bits, portanto é necessária uma kailleraclient.dll de %d bits. O cliente de 64 bits pode ser baixado no projeto Open Kaillera (open-kaillera.github.io, cliente n02).
+MSG_NETPLAY_DLL_BITNESS=A kailleraclient.dll na pasta do emulador não pode ser usada com esta versão!\n\nEste emulador é uma versão de %d bits, portanto requer uma kailleraclient.dll de %d bits - a DLL colocada foi compilada para outra arquitetura.\nCertifique-se de que você colocou realmente uma versão de %d bits do kailleraclient.dll (por exemplo, o cliente n02 de open-kaillera.github.io) e reinicie o programa.
+MSG_NETPLAY_DLL_INVALID=A kailleraclient.dll na pasta do emulador não é um cliente Kaillera válido!\n\nCertifique-se de que você colocou uma DLL cliente do Kaillera autêntica que corresponde a esta versão (%d bits) e reinicie o programa.
+MSG_NETPLAY_NEED_ROM=Carregue uma ROM antes de conectar!
+MSG_NETPLAY_NSF=O jogo em rede não está disponível para arquivos NSF.
+MSG_NETPLAY_CONTROLLERS=Configuração de controladores não suportada para o jogo em rede!\n\nConfigurações suportadas:\n- Porta 1: Controlador Padrão, Porta 2: Controlador Padrão (até 2 jogadores)\n- Porta 1: Four Score, Porta 2: Four Score 2, os quatro sub-controladores definidos como Controlador Padrão (até 4 jogadores)\n\nA porta de expansão deve permanecer Desconectado.\nConfigure os controladores em Entrada > Configurar... e tente novamente.
+MSG_NETPLAY_NO_SLOT=Seu número de jogador não corresponde à configuração atual de controladores!\nOs jogadores 3-4 requerem a configuração com Four Score (Porta 1: Four Score, Porta 2: Four Score 2).
+MSG_NETPLAY_PLAYERS_LIMIT=Jogadores demais para a configuração atual de controladores!\nOs jogadores 3-4 requerem a configuração com Four Score (Porta 1: Four Score, Porta 2: Four Score 2).
+MSG_NETPLAY_CONN_LOST=Kaillera: conexão perdida - a sessão de jogo em rede foi encerrada.
+MSG_NETPLAY_SETTINGS=O host da partida usa configurações diferentes do emulador (modo PPU ou Game Genie)!\nTodos os jogadores devem usar o mesmo modo de PPU (NTSC/PAL/Híbrido) e o mesmo estado do Game Genie. Ajuste suas configurações para ficarem iguais às do host e reconecte-se.
+MSG_NETPLAY_BLOCKED=Esta ação não está disponível durante uma sessão de jogo em rede!\nDesconecte-se primeiro (Jogo em rede > Desconectar).

@@ -500,3 +500,22 @@ MENU_MOVIE=&Film
 MENU_MOVIE_RECORD_OLD=&Opnemen...
 MENU_MOVIE_PLAY_OLD=&Afspelen...
 MENU_MOVIE_STOP_OLD=&Stoppen
+
+# === Netwerkspel (Kaillera) ===
+NETPLAY_TITLE=Kaillera-netwerkspel
+NETPLAY_CHAT_TITLE=Kaillera-chat
+MENU_NETPLAY=&Netwerkspel
+MENU_NETPLAY_CONNECT=&Verbinden...\tCtrl+K
+MENU_NETPLAY_DISCONNECT=Ver&breken
+MENU_NETPLAY_CHAT=&Chat...\tCtrl+T
+MSG_NETPLAY_DLL_MISSING=Kaillera-client (kailleraclient.dll) niet gevonden!\n\nPlaats de client-DLL van Kaillera in de map van de emulator, naast het programma, en start het daarna opnieuw op.\nZorg ervoor dat de DLL bij deze versie past: dit is de %d-bits emulator, dus een %d-bits kailleraclient.dll is vereist. Een 64-bits client kan worden gedownload van het Open Kaillera-project (open-kaillera.github.io, client n02).
+MSG_NETPLAY_DLL_BITNESS=De kailleraclient.dll in de map van de emulator kan niet met deze versie worden gebruikt!\n\nDeze emulator is een %d-bits versie en vereist dus een %d-bits kailleraclient.dll - de geplaatste DLL is gebouwd voor een andere architectuur.\nZorg ervoor dat u echt een %d-bits versie van kailleraclient.dll hebt geplaatst (bijvoorbeeld de client n02 van open-kaillera.github.io) en start het programma opnieuw op.
+MSG_NETPLAY_DLL_INVALID=De kailleraclient.dll in de map van de emulator is geen geldige Kaillera-client!\n\nZorg ervoor dat u een echte Kaillera-client-DLL hebt geplaatst die bij deze versie past (%d-bits) en start het programma opnieuw op.
+MSG_NETPLAY_NEED_ROM=Laad eerst een ROM voordat u verbinding maakt!
+MSG_NETPLAY_NSF=Netwerkspel is niet beschikbaar voor NSF-bestanden.
+MSG_NETPLAY_CONTROLLERS=Niet-ondersteunde controllerconfiguratie voor netwerkspel!\n\nOndersteunde configuraties:\n- Poort 1: Standaardcontroller, Poort 2: Standaardcontroller (tot 2 spelers)\n- Poort 1: Four Score, Poort 2: Four Score 2, alle vier de sub-controllers ingesteld op Standaardcontroller (tot 4 spelers)\n\nDe uitbreidingspoort moet op Niet verbonden blijven.\nStel het in via Invoer > Instellingen... en probeer het opnieuw.
+MSG_NETPLAY_NO_SLOT=Uw spelersnummer past niet bij de huidige controllerconfiguratie!\nSpelers 3-4 vereisen de Four Score-configuratie (Poort 1: Four Score, Poort 2: Four Score 2).
+MSG_NETPLAY_PLAYERS_LIMIT=Te veel spelers voor de huidige controllerconfiguratie!\nSpelers 3-4 vereisen de Four Score-configuratie (Poort 1: Four Score, Poort 2: Four Score 2).
+MSG_NETPLAY_CONN_LOST=Kaillera: verbinding verbroken - de netwerkspelsessie is beëindigd.
+MSG_NETPLAY_SETTINGS=De host van het spel gebruikt andere emulatorinstellingen (PPU-modus of Game Genie)!\nAlle spelers moeten dezelfde PPU-modus (NTSC/PAL/Hybride) en dezelfde Game Genie-status gebruiken. Pas uw instellingen aan die van de host aan en maak opnieuw verbinding.
+MSG_NETPLAY_BLOCKED=Deze actie is niet beschikbaar tijdens een netwerkspelsessie!\nVerbreek eerst de verbinding (Netwerkspel > Verbreken).

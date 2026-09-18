@@ -500,3 +500,22 @@ MENU_MOVIE=&영상
 MENU_MOVIE_RECORD_OLD=&녹화...
 MENU_MOVIE_PLAY_OLD=&재생...
 MENU_MOVIE_STOP_OLD=&중지...
+
+# === 넷플레이 (Kaillera) ===
+NETPLAY_TITLE=Kaillera 넷플레이
+NETPLAY_CHAT_TITLE=Kaillera 채팅
+MENU_NETPLAY=&넷플레이
+MENU_NETPLAY_CONNECT=연결(&C)...\tCtrl+K
+MENU_NETPLAY_DISCONNECT=연결 해제(&D)
+MENU_NETPLAY_CHAT=채팅(&T)...\tCtrl+T
+MSG_NETPLAY_DLL_MISSING=Kaillera 클라이언트(kailleraclient.dll)를 찾을 수 없습니다!\n\nKaillera 클라이언트 DLL을 에뮬레이터 폴더(프로그램 옆)에 넣고 프로그램을 다시 시작하세요.\nDLL가 이 빌드와 일치하는지 확인하세요. 이 에뮬레이터는 %d비트이므로 %d비트 kailleraclient.dll이 필요합니다. 64비트 클라이언트는 Open Kaillera 프로젝트(open-kaillera.github.io, n02 클라이언트)에서 다운로드할 수 있습니다.
+MSG_NETPLAY_DLL_BITNESS=에뮬레이터 폴더에 있는 kailleraclient.dll을 이 빌드에서 사용할 수 없습니다!\n\n이 에뮬레이터는 %d비트 빌드이므로 %d비트 kailleraclient.dll이 필요합니다. 놓으신 DLL은 다른 아키텍처용으로 빌드되었습니다.\n실제로 %d비트 버전의 kailleraclient.dll을 넣었는지 확인하세요(예: open-kaillera.github.io의 n02 클라이언트). 확인 후 프로그램을 다시 시작하세요.
+MSG_NETPLAY_DLL_INVALID=에뮬레이터 폴더에 있는 kailleraclient.dll이 유효한 Kaillera 클라이언트가 아닙니다!\n\n이 빌드(%d비트)와 일치하는 정품 Kaillera 클라이언트 DLL을 넣었는지 확인하고 프로그램을 다시 시작하세요.
+MSG_NETPLAY_NEED_ROM=연결하기 전에 ROM을 먼저 로드하세요!
+MSG_NETPLAY_NSF=넷플레이는 NSF 파일에서 사용할 수 없습니다.
+MSG_NETPLAY_CONTROLLERS=넷플레이에서 지원하지 않는 컨트롤러 구성입니다!\n\n지원되는 구성:\n- 포트 1: 표준 컨트롤러, 포트 2: 표준 컨트롤러 (최대 2명)\n- 포트 1: 포어 스코어, 포트 2: 포어 스코어 2, 네 개의 서브 컨트롤러를 모두 표준 컨트롤러로 설정 (최대 4명)\n\n확장 포트는 연결되지 않음으로 두어야 합니다.\n입력 > 설정... 에서 구성한 후 다시 시도하세요.
+MSG_NETPLAY_NO_SLOT=플레이어 번호가 현재 컨트롤러 구성과 맞지 않습니다!\n플레이어 3-4는 포어 스코어 구성이 필요합니다 (포트 1: 포어 스코어, 포트 2: 포어 스코어 2).
+MSG_NETPLAY_PLAYERS_LIMIT=현재 컨트롤러 구성에 비해 플레이어가 너무 많습니다!\n플레이어 3-4는 포어 스코어 구성이 필요합니다 (포트 1: 포어 스코어, 포트 2: 포어 스코어 2).
+MSG_NETPLAY_CONN_LOST=Kaillera: 연결이 끊겨 넷플레이 세션이 종료되었습니다.
+MSG_NETPLAY_SETTINGS=게임 호스트가 다른 에뮬레이터 설정(PPU 모드 또는 Game Genie)을 사용하고 있습니다!\n모든 플레이어는 동일한 PPU 모드(NTSC/PAL/하이브리드)와 동일한 Game Genie 상태를 사용해야 합니다. 호스트와 동일하게 설정을 맞춘 후 다시 연결하세요.
+MSG_NETPLAY_BLOCKED=넷플레이 세션 중에는 이 작업을 사용할 수 없습니다!\n먼저 연결을 해제하세요 (넷플레이 > 연결 해제).
