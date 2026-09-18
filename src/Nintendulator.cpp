@@ -692,15 +692,27 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     // the transition associated with the user's audible crackle.
     BOOL wasRunning = NES::Running;
     if (wasRunning)
+    {
         NES::Pause(TRUE);
+        // P99: once the emulation thread is actually stopped, also stop the
+        // DirectSound playback cursor. Without this, a display-mode rebuild
+        // can consume the finite ~66 ms write-ahead while GFX::Stop/Start is
+        // running. Repeated fullscreen toggles could therefore under-run the
+        // audio ring even though the NES producer itself remained phase-safe.
+        // This is NOT SoundOFF/SoundON: no buffer clear, cursor reset, APU
+        // phase reset or SetFrequency() occurs.
+        APU::SuspendForDisplayTransition();
+    }
 
     GFX::Stop();
     GFX::Fullscreen = !GFX::Fullscreen;
     GFX::Start();
-    APU::UpdateDRC();
 
     if (wasRunning)
+    {
+        APU::ResumeFromDisplayTransition();
         NES::Resume();
+    }
     break;
 }
 
@@ -798,14 +810,21 @@ case ID_PPU_EXCLUSIVEFS:
         // so there is no need to recreate the audio rate/buffer.
         BOOL wasRunning = NES::Running;
         if (wasRunning)
+        {
             NES::Pause(TRUE);
+            // Keep DirectSound from draining during the exclusive-display
+            // mode switch; resume from the same hardware cursor afterwards.
+            APU::SuspendForDisplayTransition();
+        }
 
         GFX::Stop();
         GFX::Start();
-        APU::UpdateDRC();
 
         if (wasRunning)
+        {
+            APU::ResumeFromDisplayTransition();
             NES::Resume();
+        }
     }
     break;
 }

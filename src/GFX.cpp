@@ -1631,14 +1631,17 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 (long)InterlockedExchangeAdd(&s_FQSkippedFrames, 0));
         _ftprintf(f, _T("PBO streaming: ready=%d count=%d\n"),
                 s_PBOReady ? 1 : 0, PBO_COUNT);
-        _ftprintf(f, _T("Audio MMR state: mode=deterministic workerPolls=%ld setFreq=%ld playStarts=%ld playPending=%ld primeSlots=%ld currentFreq=%ld safetyWaits=%ld notifyActive=0 notifySignals=0 playSlot=0 notifyPeriodUs=0\n"),
+        _ftprintf(f, _T("Audio MMR state: mode=deterministic workerPolls=%ld setFreq=%ld playStarts=%ld playPending=%ld primeSlots=%ld currentFreq=%ld safetyWaits=%ld displayStops=%ld displayResumes=%ld displayResumeFailures=%ld notifyActive=0 notifySignals=0 playSlot=0 notifyPeriodUs=0\n"),
                 APU::GetAudioWorkerPolls(),
                 APU::GetAudioSetFreqCalls(),
                 APU::GetAudioPlayStarts(),
                 APU::GetAudioPlayPending(),
                 APU::GetAudioPrimeSlots(),
                 APU::GetAudioCurrentFreq(),
-                APU::GetAudioSafetyWaits());
+                APU::GetAudioSafetyWaits(),
+                APU::GetAudioDisplayTransitionStops(),
+                APU::GetAudioDisplayTransitionResumes(),
+                APU::GetAudioDisplayTransitionResumeFailures());
         _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | paceEnter | paceWait | pace->produce | postPaceCPU | postPaceWall | postPaceCycles | buildWall | buildCPU | buildCycles | swapCPU | swapCycles | pboOrphan | pboMap | pboCopy | pboUnmap | pboSubmit | safetyMs | safetyLoops | traceSeq | prodGap | renderGap | consume->present | presentInterval | presentErr | fqP2C | fqPcs | fqCcs | fqSched | fqCS2 | fqPHold | fqCHold | fqSigWait | render2t0 | submit2dwm | dwmDispInt | dwmFrameStep | dwmMissStep | dwmDropStep | dwmLateStep | dwmLate | dwmSrc | dwmHr | dwmFrame | dwmRefresh | dwmVBlankInt | dwmComposeInt | dwmLateCount | dwmOutstanding | dwmUnique | dwmAvail | dwmMiss | dwmDrop | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
 
         // P43 (session 20): t0->t4 only spans GL_DrawFrame+OnFrameEnd+
