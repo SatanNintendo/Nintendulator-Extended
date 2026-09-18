@@ -2262,7 +2262,44 @@ void    Run (void)
                                 unsigned long sw = (unsigned long)InterlockedExchangeAdd(&g_DSCacheWpos, 0L);
                                 if (sw < sr) sw += FRAMEBUF;
                                 if (!((sr <= next_pos) && (next_pos <= sw)))
-                                        goto write_slot;
+                                {
+                                        // P103.1: the cached check passed, but the
+                                        // cache can lag the real play cursor by up
+                                        // to one frame (~one slot). A write that
+                                        // looks 2+ slots ahead of the STALE play
+                                        // estimate is provably safe (the live mix
+                                        // window never reaches that far), but a
+                                        // write that lands within the forward risk
+                                        // zone -- from the stale play slot up to
+                                        // two slots past the stale write slot --
+                                        // can sit ON TOP of the live mix window.
+                                        // Verify exactly those writes with one
+                                        // fresh GetCurrentPosition before writing;
+                                        // anything else keeps the zero-IPC cached
+                                        // fast path. In the verified steady state
+                                        // (lead 4-5 slots, the 2026-09-18 Log3
+                                        // run) this branch never executes.
+                                        unsigned long np = next_pos;
+                                        if (np < sr)
+                                                np += FRAMEBUF;
+                                        if (!(sr <= np && np <= sw + 2))
+                                                goto write_slot;
+                                        unsigned long pr, pw;
+                                        if (SUCCEEDED(Buffer->GetCurrentPosition(&pr, &pw)))
+                                        {
+                                                unsigned long fr = pr / LockSize;
+                                                unsigned long fw = pw / LockSize;
+                                                if (fw < fr) fw += FRAMEBUF;
+                                                if (!((fr <= np) && (np <= fw)))
+                                                        goto write_slot;
+                                        }
+                                        // Fresh positions say the slot is (still)
+                                        // inside the live play..write window -- or
+                                        // the read failed; either way fall through
+                                        // to the original wait loop below, which
+                                        // re-reads and retries with full error
+                                        // handling, exactly as before.
+                                }
                         }
                         else
                         {
