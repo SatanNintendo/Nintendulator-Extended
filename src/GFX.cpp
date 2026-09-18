@@ -1465,7 +1465,33 @@ void StopRenderThread(void)
         // that can turn MMR-off into a process-wide hang.  Join the thread
         // first; only after it has released the context do we destroy the
         // queue and close the handle.
-        WaitForSingleObject(s_RenderThread, INFINITE);
+        //
+        // P98: the join above used to be a raw WaitForSingleObject(..., INFINITE)
+        // executed on the UI thread. That blocks the UI thread's message queue
+        // completely while waiting. On this UI thread, SwapBuffers()/the GL
+        // driver/DWM can -- on some systems/drivers, especially right around a
+        // window-style or display-mode change -- need the owning window's
+        // message queue to be pumped before a pending GL/DWM call on the
+        // render thread can complete. With the UI thread frozen in a message-
+        // less wait, that produces a genuine cross-thread deadlock: the UI
+        // thread waits for the render thread to exit, and the render thread
+        // (indirectly, via the graphics stack) waits for the UI thread to pump
+        // messages. The window then stops responding entirely and can only be
+        // killed from Task Manager -- this is exactly the reported "unchecking
+        // Match Monitor Rate freezes the emulator" symptom.
+        //
+        // Fix: wait for the thread while still pumping the UI thread's message
+        // queue, the same pattern NES::Stop()/NES::Pause() already use for the
+        // emulation thread (see NES.cpp). This does not change shutdown
+        // ordering or resource lifetime at all -- GL_Destroy()/FQ_Destroy()
+        // still only run after the render thread has actually exited -- it
+        // only keeps the UI thread's message loop alive while we wait, which
+        // is enough to break the deadlock without weakening the join.
+        while (WaitForSingleObject(s_RenderThread, 0) == WAIT_TIMEOUT)
+        {
+                ProcessMessages();
+                Sleep(1);
+        }
         CloseHandle(s_RenderThread);
         s_RenderThread = NULL;
         FQ_Destroy();

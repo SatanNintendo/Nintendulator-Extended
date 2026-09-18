@@ -1913,9 +1913,37 @@ void    Run (void)
                 write_slot:
                 if (isEnabled)
                 {
-                        Try(Buffer->Lock(next_pos * LockSize, LockSize, &bufPtr, &bufBytes, NULL, 0, 0), Lang::GetString(LANG_ERR_APU_BUFFER));
-                        memcpy(bufPtr, buffer, bufBytes);
-                        Try(Buffer->Unlock(bufPtr, bufBytes, NULL, 0), Lang::GetString(LANG_ERR_APU_BUFFER));
+                        // P98: fade in the very first primed slot after a SoundOFF()/
+                        // SoundON() restart (fullscreen toggle, MMR audio-rate restart,
+                        // etc). SoundON() hard-stops and re-Play()s the DirectSound
+                        // buffer; the waveform is essentially never sitting on a zero
+                        // crossing at that instant, so jumping straight from silence to
+                        // full-amplitude audio produces an audible click/crackle right
+                        // at the transition. Ramp only this one slot's samples from 0 to
+                        // full amplitude -- every other slot (including this one once
+                        // primed > 0) is copied unchanged, so normal playback is
+                        // completely untouched.
+                        LONG primedBefore = InterlockedExchangeAdd(&g_AudioPrimeSlots, 0L);
+                        if (primedBefore == 0 && buflen > 0)
+                        {
+                                static short s_FadeInBuf[4096];
+                                int n = buflen;
+                                if (n > 4096) n = 4096;
+                                for (int fi = 0; fi < n; fi++)
+                                {
+                                        double gain = (double)fi / (double)buflen;
+                                        s_FadeInBuf[fi] = (short)((double)buffer[fi] * gain);
+                                }
+                                Try(Buffer->Lock(next_pos * LockSize, LockSize, &bufPtr, &bufBytes, NULL, 0, 0), Lang::GetString(LANG_ERR_APU_BUFFER));
+                                memcpy(bufPtr, s_FadeInBuf, bufBytes);
+                                Try(Buffer->Unlock(bufPtr, bufBytes, NULL, 0), Lang::GetString(LANG_ERR_APU_BUFFER));
+                        }
+                        else
+                        {
+                                Try(Buffer->Lock(next_pos * LockSize, LockSize, &bufPtr, &bufBytes, NULL, 0, 0), Lang::GetString(LANG_ERR_APU_BUFFER));
+                                memcpy(bufPtr, buffer, bufBytes);
+                                Try(Buffer->Unlock(bufPtr, bufBytes, NULL, 0), Lang::GetString(LANG_ERR_APU_BUFFER));
+                        }
 
                         // P90: prime four complete slots before starting
                         // playback. The buffer is stopped during this phase,
