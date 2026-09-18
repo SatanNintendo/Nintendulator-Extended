@@ -52,11 +52,6 @@ void    SetRegion       (void);
 void    UpdateDRC       (void);
 void    ResetDRC        (void);
 void    RestartForMonitorSync (void); // posts one safe audio restart at frame end
-// Temporarily stop/resume only the DirectSound playback loop around a
-// fullscreen/exclusive-display transition. Does not reset the audio buffer,
-// APU phase, or MMR playback frequency.
-void    SuspendForDisplayTransition (void);
-void    ResumeFromDisplayTransition (void);
 
 #ifndef NSFPLAYER
 // Tell the APU that the monitor sync module needs to be informed of the
@@ -73,9 +68,6 @@ long    GetAudioSafetyWaits (void);
 long    GetAudioCurrentFreq (void);
 long    GetAudioPlayPending (void);
 long    GetAudioPrimeSlots (void);
-long    GetAudioDisplayTransitionStops (void);
-long    GetAudioDisplayTransitionResumes (void);
-long    GetAudioDisplayTransitionResumeFailures (void);
 long    GetAudioNotifyActive (void);
 long    GetAudioNotifySignals(void);
 long    GetAudioNotifyPlaySlot(void);

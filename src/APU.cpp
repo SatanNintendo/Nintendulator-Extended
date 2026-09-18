@@ -120,16 +120,6 @@ static volatile LONG     g_AudioPrimeSlots = 0L;
 static volatile LONG     g_AudioPlayPending = 0L;
 static volatile LONG     g_AudioRestartPending = 0L;
 
-// P99: display transitions must not let DirectSound keep consuming the
-// finite write-ahead while GFX::Stop()/Start() rebuilds the OpenGL path.
-// This state is deliberately separate from SoundOFF/SoundON: the secondary
-// buffer position, samples, playback rate and APU software phase are kept
-// intact. Only the hardware playback loop is temporarily stopped/resumed.
-static volatile LONG     g_AudioDisplayTransitionPlaying = 0L;
-static volatile LONG     g_AudioDisplayTransitionStops = 0L;
-static volatile LONG     g_AudioDisplayTransitionResumes = 0L;
-static volatile LONG     g_AudioDisplayTransitionResumeFailures = 0L;
-
 // Forward declaration: SoundON() appears before the definition below.
 static double GetEffectiveProducerSampleRate();
 
@@ -1159,18 +1149,6 @@ long GetAudioPrimeSlots(void)
 {
         return (long)InterlockedExchangeAdd(&g_AudioPrimeSlots, 0L);
 }
-long GetAudioDisplayTransitionStops(void)
-{
-        return (long)InterlockedExchangeAdd(&g_AudioDisplayTransitionStops, 0L);
-}
-long GetAudioDisplayTransitionResumes(void)
-{
-        return (long)InterlockedExchangeAdd(&g_AudioDisplayTransitionResumes, 0L);
-}
-long GetAudioDisplayTransitionResumeFailures(void)
-{
-        return (long)InterlockedExchangeAdd(&g_AudioDisplayTransitionResumeFailures, 0L);
-}
 long GetAudioNotifyActive(void)
 {
         return 0;
@@ -1376,49 +1354,8 @@ void    Reset  (void)
 }
 
 #ifndef NSFPLAYER
-
-void    SuspendForDisplayTransition (void)
-{
-        if (!Buffer || !isEnabled)
-                return;
-
-        // During the initial SoundON prime phase the buffer is intentionally
-        // stopped already. Do not turn a pending Play() into an early playback
-        // start merely because the user toggled fullscreen immediately.
-        if (InterlockedExchangeAdd(&g_AudioPlayPending, 0L) != 0)
-        {
-                InterlockedExchange(&g_AudioDisplayTransitionPlaying, 0L);
-                return;
-        }
-
-        if (SUCCEEDED(Buffer->Stop()))
-        {
-                InterlockedExchange(&g_AudioDisplayTransitionPlaying, 1L);
-                InterlockedIncrement(&g_AudioDisplayTransitionStops);
-        }
-        else
-        {
-                InterlockedExchange(&g_AudioDisplayTransitionPlaying, 0L);
-        }
-}
-
-void    ResumeFromDisplayTransition (void)
-{
-        LONG wasPlaying = InterlockedExchange(&g_AudioDisplayTransitionPlaying, 0L);
-        if (!wasPlaying || !Buffer || !isEnabled)
-                return;
-
-        // Do not move the cursor and do not touch SetFrequency(). Stop() keeps
-        // the secondary-buffer position; Play() resumes from that exact phase.
-        if (SUCCEEDED(Buffer->Play(0, 0, DSBPLAY_LOOPING)))
-                InterlockedIncrement(&g_AudioDisplayTransitionResumes);
-        else
-                InterlockedIncrement(&g_AudioDisplayTransitionResumeFailures);
-}
-
 void    SoundOFF (void)
 {
-        InterlockedExchange(&g_AudioDisplayTransitionPlaying, 0L);
         if (!isEnabled)
                 return;
 
@@ -1455,7 +1392,6 @@ void    SoundOFF (void)
 
 void    SoundON (void)
 {
-        InterlockedExchange(&g_AudioDisplayTransitionPlaying, 0L);
         LPVOID bufPtr;
         DWORD bufBytes;
         if (isEnabled)
