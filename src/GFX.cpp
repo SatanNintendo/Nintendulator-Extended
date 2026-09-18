@@ -1260,8 +1260,11 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
         // presentation timestamp. Audio/CPU pacing never waits here because
         // this code executes only on the dedicated GL render thread.
 
+        const bool renderStopping =
+                (InterlockedExchangeAdd(&s_RenderThreadStop, 0) != 0);
         const bool useDwmPresentation =
-                (MatchMonitorRate &&
+                (!renderStopping &&
+                 MatchMonitorRate &&
                  !(Fullscreen && ExclusiveFullscreen) &&
                  !MonitorSync::HasDXGIVBlank());
 
@@ -1456,9 +1459,18 @@ void StartRenderThread(void)
 void StopRenderThread(void)
 {
         if (!s_RenderThread) return;
+
         InterlockedExchange(&s_RenderThreadStop, 1);
         if (s_FrameEvent) SetEvent(s_FrameEvent);  // wake it up if blocked
-        WaitForSingleObject(s_RenderThread, 1000);
+
+        // P95: the render thread owns the OpenGL context for its entire
+        // lifetime.  Closing its HANDLE after a timeout and immediately
+        // destroying the GL context is unsafe if the thread is still inside
+        // SwapBuffers/DwmFlush.  That is exactly the kind of shutdown race
+        // that can turn MMR-off into a process-wide hang.  Join the thread
+        // first; only after it has released the context do we destroy the
+        // queue and close the handle.
+        WaitForSingleObject(s_RenderThread, INFINITE);
         CloseHandle(s_RenderThread);
         s_RenderThread = NULL;
         FQ_Destroy();

@@ -179,10 +179,15 @@ int APIENTRY _tWinMain (HINSTANCE hInstance, HINSTANCE hPrevInstance, LPTSTR lpC
                 return FALSE;
 
         // Initialize the MonitorSync module now that the main window exists.
-        // It loads DWM/WGL function pointers and queries the current monitor
-        // refresh rate. Does not enable anything yet — that happens only when
-        // the user toggles "Match Monitor Rate" on.
+        // NES::Init/GFX::Start run earlier during InitInstance(), so a saved
+        // MatchRate=TRUE setting can reach GFX::Start before MonitorSync itself
+        // has been initialized.  In that cold-start case Enable(TRUE) used to
+        // return early and the session ran with the UI checkbox checked but
+        // without the actual monitor-sync state.  Re-enable it here after Init
+        // so the timing/audio path is genuinely active for the whole session.
         MonitorSync::Init(hMainWnd);
+        if (GFX::MatchMonitorRate)
+                MonitorSync::Enable(TRUE);
 
         hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_NINTENDULATOR));
 
@@ -711,17 +716,24 @@ case ID_PPU_MATCHRATE:
 {
         // MMR owns a separate render thread and that thread owns the OpenGL
         // context. A hot toggle cannot safely transfer that context while the
-        // emulation thread is still running. Restart the emulation/video pair
-        // exactly like the other video-mode changes so ownership is always
-        // deterministic: NES thread stops -> MMR worker/render thread stops ->
-        // video context is destroyed -> mode changes -> context is recreated ->
-        // the appropriate thread receives the context.
+        // emulation thread is still running.  Stop the NES first.  When turning
+        // MMR OFF, clear the raw MatchMonitorRate flag *before* stopping the
+        // render thread so its next iteration cannot enter the DwmFlush path
+        // while shutdown is in progress.  The render-thread join is then safe
+        // and its GL context remains owned by that thread until it has actually
+        // exited.
         BOOL wasRunning = NES::Running;
+        BOOL enableMMR = GFX::MatchMonitorRate ? FALSE : TRUE;
         NES::Stop();
-        MonitorSync::Enable(FALSE);
-        GFX::Stop();
 
-        GFX::MatchMonitorRate = !GFX::MatchMonitorRate;
+        if (!enableMMR)
+        {
+                GFX::MatchMonitorRate = FALSE;
+                MonitorSync::Enable(FALSE);
+        }
+
+        GFX::Stop();
+        GFX::MatchMonitorRate = enableMMR;
         GFX::Start();
         if (wasRunning)
                 NES::Start(FALSE);

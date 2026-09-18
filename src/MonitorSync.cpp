@@ -648,11 +648,13 @@ void Enable(BOOL on)
         g_PaceEpochQPC.QuadPart = 0;
         g_PaceFrameIndex = 0;
         StopVBlankThread();
-        // P93: audio rate changes are performed by a single explicit
-        // SoundOFF/SoundON transition. There is no background audio-control
-        // worker to wait for or race with during MMR shutdown.
+        // P95: disabling MMR only restores the normal external audio-rate
+        // state. Do not post a restart request here: NES::Stop() has already
+        // stopped the emulation thread, and the subsequent SoundON() on the
+        // normal-rate restart selects 44100 Hz directly. Leaving a request
+        // behind would otherwise be serviced by a later UpdateDRC() after the
+        // mode was already disabled.
         APU::ResetDRC();
-        APU::RestartForMonitorSync();
     }
 }
 

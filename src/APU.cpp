@@ -1378,19 +1378,35 @@ void    SoundON (void)
         // the nominal 44100-Hz APU stream must be consumed at the same ratio.
         // This value is applied only at a SoundOFF/SoundON transition; there
         // is no runtime SetFrequency worker anymore.
+        // P95: when MMR is active, playback must follow the *actual sample
+        // producer rate* of the slot generator while the emulation clock is
+        // slowed to the monitor cadence.  The slot generator produces 735
+        // samples per ~29830 CPU cycles, so its native-rate stream is slightly
+        // below 44100 Hz; scale that exact producer rate by target/NES-native
+        // clock ratio.  Using raw 44100 Hz here drains the ring while MMR is
+        // running at 60.000 Hz and reproduces the user's delayed crackle.
         double targetHz = MonitorSync::GetTargetHz();
         double nesHz = MonitorSync::GetNESHz();
         DWORD startFreq = FREQ;
-        if (MonitorSync::IsEnabled() && targetHz > 0.0 && nesHz > 0.0)
-                startFreq = (DWORD)((double)FREQ * (targetHz / nesHz) + 0.5);
+        if (GFX::MatchMonitorRate && targetHz > 0.0 && nesHz > 0.0)
+        {
+                double nativeProducerHz = GetEffectiveProducerSampleRate();
+                double mmrProducerHz = nativeProducerHz * (targetHz / nesHz);
+                startFreq = (DWORD)(mmrProducerHz + 0.5);
+        }
         if (startFreq < 100) startFreq = 100;
         if (startFreq > 100000) startFreq = 100000;
         Try(Buffer->SetFrequency(startFreq), Lang::GetString(LANG_ERR_APU_BUFFER));
         InterlockedIncrement(&g_AudioSetFreqCalls);
         InterlockedExchange(&g_AudioCurrentFreq, (LONG)startFreq);
         drc_play_freq = startFreq;
+        // If the MMR restart request was posted before the DirectSound buffer
+        // existed (the cold-start case), SoundON itself has now satisfied that
+        // request. Do not perform an unnecessary second SoundOFF/SoundON on
+        // the first rendered frame.
+        InterlockedExchange(&g_AudioRestartPending, 0L);
         // Invalidate the legacy DS-position cache used only by the non-MMR
-        // path. The MMR path uses its QPC-predicted consumer cursor instead.
+        // path. The MMR path does not consult the consumer cursor.
         InterlockedExchange(&g_DSCacheRpos, -1L);
         InterlockedExchange(&g_DSCacheWpos, -1L);
         InterlockedExchange(&g_DSCacheAge,  99L);
@@ -1793,6 +1809,10 @@ void    ResetDRC (void)
 {
 #ifndef NSFPLAYER
         drc_play_freq = FREQ;
+        // A disabled MMR mode must not leave a stale restart request waiting
+        // for a future frame.  The next SoundON() will select the normal
+        // 44100-Hz path directly.
+        InterlockedExchange(&g_AudioRestartPending, 0L);
 #endif /* !NSFPLAYER */
 }
 
