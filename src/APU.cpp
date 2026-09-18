@@ -114,6 +114,9 @@ static volatile LONG     g_AudioPrimeSlots = 0L;
 static volatile LONG     g_AudioPlayPending = 0L;
 static volatile LONG     g_AudioRestartPending = 0L;
 
+// Forward declaration: SoundON() appears before the definition below.
+static double GetEffectiveProducerSampleRate();
+
 
 void StartAudioCtrlThread() {}
 void StopAudioCtrlThread() {}
