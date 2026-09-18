@@ -43,25 +43,20 @@
 // DwmFlush is loaded dynamically so the binary stays compatible with
 // Windows XP/2003 where dwmapi.dll does not exist.
 //
-// P85: in DWM-composited OpenGL modes (windowed/borderless), Match Monitor
-// Rate uses:
-//     wglSwapIntervalEXT(0) -> SwapBuffers() -> DwmFlush()
+// DwmFlush is kept as legacy code for historical diagnostics, but the runtime
+// path is currently disabled (USE_DWMFLUSH=0).  DwmFlush is a synchronous OS
+// call with no cancellation mechanism; allowing the render thread to block in
+// it makes safe MMR shutdown impossible if the compositor/driver stalls.
 //
-// SwapBuffers is deliberately non-blocking. DwmFlush remains the render-thread
-// backpressure point, but its completion QPC is diagnostic-only. Emulator pacing
-// uses uniquely identified DWM composition timestamps (qpcCompose + cFrame).
-//
-// The DwmFlush wait lives on the dedicated render thread, which owns the GL
-// context. The emulation/audio thread therefore does not wait on the compositor.
-//
-// Exclusive fullscreen is intentionally excluded because DWM is not in the
-// presentation path there; that path keeps using the existing GL/DXGI logic.
+// Windowed/borderless MMR therefore uses the deterministic PaceFrame clock and
+// optional DWM composition *diagnostics* only. Exclusive fullscreen never uses
+// DWM as a presentation master.
 typedef HRESULT (WINAPI *PFN_DwmFlush)(void);
 static PFN_DwmFlush s_pfnDwmFlush = reinterpret_cast<PFN_DwmFlush>(1); // 1 = not yet loaded
 typedef HRESULT (WINAPI *PFN_DwmGetCompositionTimingInfo)(HWND, DWM_TIMING_INFO *);
 static PFN_DwmGetCompositionTimingInfo s_pfnDwmGetCompositionTimingInfo = reinterpret_cast<PFN_DwmGetCompositionTimingInfo>(1);
 
-#define USE_DWMFLUSH 1
+#define USE_DWMFLUSH 0
 
 // P84: synchronize from the first frame. The wait is on the render thread,
 // so there is no reason to keep the old multi-second unsynchronised warmup.
@@ -2458,7 +2453,14 @@ static void GL_DrawFrame(void)
         }
 #endif // USE_DWMFLUSH
 
-        if (MatchMonitorRate)
+        // DWM composition timing is only a valid presentation master while
+        // DWM is actually composing the window.  In exclusive fullscreen
+        // ChangeDisplaySettingsEx disables the compositor; querying DWM there
+        // can return stale/global timing data and contaminate PaceFrame() with
+        // a phase that has nothing to do with the exclusive swap chain.  Keep
+        // the diagnostic query/phase feedback for windowed and borderless
+        // modes, but force exclusive fullscreen to the deterministic QPC path.
+        if (MatchMonitorRate && !(Fullscreen && ExclusiveFullscreen))
         {
                 int idxDwm = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
                 if (DiagQueryDwmTiming(s_diagBuf[idxDwm]) &&
@@ -2824,6 +2826,14 @@ void    Start (void)
 
                                 // Activate exclusive mode without changing resolution
                                 ChangeDisplaySettingsEx(NULL, &SavedDisplayMode, NULL, CDS_FULLSCREEN, NULL);
+                                // The refresh/mode query above ran while the
+                                // desktop was still in windowed mode.  Refresh
+                                // MonitorSync after the actual exclusive mode
+                                // switch so the MMR target and the DirectSound
+                                // playback frequency selected by the subsequent
+                                // NES::Start()/APU::SoundON() match the real
+                                // fullscreen display mode.
+                                MonitorSync::OnDisplayChange();
                                 // P37 (session 14): same rationale as the restore call
                                 // in Stop() -- this mode switch can invalidate the
                                 // cached IDXGIOutput*, so get a fresh one now, before
@@ -2904,13 +2914,18 @@ void    Start (void)
                 // right GL state already set up.
                 if (MatchMonitorRate)
                 {
-                        // P84: choose the presentation master after the mode
-                        // transition. Exclusive fullscreen stays on the
-                        // non-DWM path; windowed/borderless mode uses DwmFlush
-                        // when no DXGI vblank source is available.
+                        // P97: DwmFlush is disabled because it is an
+                        // uninterruptible blocking call and can deadlock the
+                        // UI during MMR shutdown.  Keep the explicit branch
+                        // here so that the setting cannot accidentally report
+                        // DWM as the active sync master while USE_DWMFLUSH=0.
+#if USE_DWMFLUSH
                         const bool useDwm =
                                 !(Fullscreen && ExclusiveFullscreen) &&
                                 !MonitorSync::HasDXGIVBlank();
+#else
+                        const bool useDwm = false;
+#endif
                         MonitorSync::SetDwmSyncMode(useDwm);
                         StartRenderThread();
                 }
@@ -3133,6 +3148,10 @@ void    Stop (void)
                 {
                         ChangeDisplaySettingsEx(NULL, NULL, NULL, 0, NULL);
                         HasSavedDisplayMode = FALSE;
+                        // The display is back in its desktop timing domain.
+                        // Refresh the monitor-rate cache before the next
+                        // windowed MMR SoundON() chooses its playback rate.
+                        MonitorSync::OnDisplayChange();
                         // P37 (session 14): ChangeDisplaySettingsEx can invalidate
                         // the IDXGIOutput* cached by MonitorSync's P28 DXGI vblank
                         // bypass, leaving the background poller thread spinning on
