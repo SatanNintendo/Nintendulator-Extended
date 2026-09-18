@@ -1293,6 +1293,19 @@ DWORD   WINAPI  Thread (void *param)
         // special case - do not silence audio during soft stop
         if (!(DoStop & STOPMODE_SOFT))
                 APU::SoundOFF();
+        else
+        {
+                // P102: soft stop (display transition / savestate /
+                // reset). The emulation thread is about to stop
+                // producing audio slots, but DirectSound keeps consuming
+                // the ring while the pause lasts. Mute the ring now so
+                // the pause is heard as a brief fade to silence instead
+                // of the play cursor lapping the frozen write cursor
+                // and replaying stale slots as crackle. No driver state
+                // is touched; SoftResume() re-anchors the phase when
+                // the producer restarts.
+                APU::SoftPause();
+        }
         Movie::ShowFrame();
 
 #endif  /* CPU_BENCHMARK */
@@ -1364,6 +1377,15 @@ void    Resume (void)
         DWORD ThreadID;
         if (Running)
                 return;
+        // P102: the emulation thread has exited (soft pause -- e.g. a
+        // fullscreen / display transition or a savestate), and it is
+        // NOT restarted here, so this is the safe moment to re-anchor
+        // the audio ring phase before the new thread begins producing
+        // slots. SoftResume() places the write cursor a fresh lead
+        // ahead of the play cursor and restarts the fade-in, repairing
+        // the phase damage the pause duration caused. It is a no-op
+        // when audio is not currently running.
+        APU::SoftResume();
         Running = TRUE;
 #ifdef  ENABLE_DEBUGGER
         Debugger::Step = FALSE;

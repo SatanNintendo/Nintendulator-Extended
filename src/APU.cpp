@@ -76,6 +76,14 @@ const unsigned int      LOCK_SIZE = FREQ * (BITS / 8);
 
 static DWORD            drc_play_freq   = FREQ;  // current DirectSound playback frequency
 
+// P102: throttled ring-phase feedback state (see UpdateDRC).
+// drc_base_freq is the playback rate established by the last SoundON();
+// the feedback controller is only allowed to trim the current rate by
+// a small, inaudible amount around this base, so the deterministic P95
+// rate selection remains authoritative.
+static DWORD            drc_base_freq   = FREQ;
+static long             drc_feedback_check_count = 0;
+
 // P94: no deferred DirectSound frequency request is kept here.  Rate changes
 // happen only during the explicit SoundOFF/SoundON transition requested by
 // RestartForMonitorSync(), on the NES thread at a safe frame boundary.
@@ -119,6 +127,32 @@ static volatile LONG     g_AudioResumeValid = 0L;
 static volatile LONG     g_AudioPrimeSlots = 0L;
 static volatile LONG     g_AudioPlayPending = 0L;
 static volatile LONG     g_AudioRestartPending = 0L;
+
+// ------------------------------------------------------------------
+// P102: throttled ring-phase feedback parameters (see UpdateDRC).
+// One fill check every 32 frames (~0.53 s at 60 Hz, ~0.64 s at 50 Hz)
+// is enough to keep the write cursor centered in the 6-slot ring while
+// adding at most one GetCurrentPosition call per interval -- executed
+// at the post-SwapBuffers point the P90 notes explicitly blessed for
+// audio maintenance (never inside CPU/PPU execution).
+//
+// The controller targets a 3-slot lead and only trims the playback
+// frequency when the measured lead leaves the 1.5..4.5 slot band. The
+// proportional gain (0.05% per slot of error, capped at +-0.3% total)
+// corresponds to a pitch shift of at most ~5 cents -- inaudible in game
+// audio -- while correcting drift at up to ~130 samples/second. If the
+// lead ever reaches the danger zone (< 0.7 or > 5.3 slots: the producer
+// stalled hard or a transition scrambled the phase), the write cursor
+// is snap-re-anchored 4 slots ahead of the play cursor instead.
+// ------------------------------------------------------------------
+#define DRC_FEEDBACK_INTERVAL   32
+static const double     DRC_FILL_TARGET  = 3.0;   // desired lead, in slots
+static const double     DRC_FILL_MIN     = 1.5;   // trim when lead drops below
+static const double     DRC_FILL_MAX     = 4.5;   // trim when lead rises above
+static const double     DRC_FILL_SNAP_LO = 0.7;   // snap-reanchor below this
+static const double     DRC_FILL_SNAP_HI = (double)FRAMEBUF - 0.7; // or above this
+static const double     DRC_FILL_KP      = 0.0005; // freq trim per slot of error
+static const double     DRC_FREQ_TRIM_MAX = 0.003; // +-0.3% around SoundON base
 
 // Forward declaration: SoundON() appears before the definition below.
 static double GetEffectiveProducerSampleRate();
@@ -1390,12 +1424,115 @@ void    SoundOFF (void)
         InterlockedExchange(&g_AudioResumeValid, resumeValid ? 1L : 0L);
 }
 
+// ------------------------------------------------------------------
+// P102: soft-pause audio lifecycle (fullscreen / savestate / reset).
+//
+// Those flows stop the NES producer thread through STOPMODE_SOFT
+// *without* stopping DirectSound. While the producer is gone the
+// secondary buffer keeps consuming the ring at drc_play_freq Hz:
+// once the buffered lead plays out, the play cursor laps the frozen
+// write cursor and replays stale ring content (audible crackling), and
+// after the producer resumes, the ring phase (write-ahead) is left
+// wherever the pause duration happened to put it -- potentially right
+// on top of the play cursor. Because the MMR producer writes slots in
+// bursts (the 17/17/16 ms pacing beat) and the P90+ design has no
+// consumer feedback at all, that phase error never self-corrects and
+// turns into a sustained crackle.
+//
+// SoftPause() mutes the ring when the producer stops, so the pause is
+// heard as a brief fade to silence instead of stale audio.
+// SoftResume() re-anchors the write cursor AUDIO_PRIME_SLOTS ahead of
+// the current play position (one cheap GetCurrentPosition, issued at a
+// moment when the NES thread is provably not running) and restarts the
+// P98 fade-in so playback resumes with a clean lead.
+//
+// Neither function touches Stop/Play/SetFrequency/SetCurrentPosition:
+// the DirectSound driver state is never manipulated here.
+// ------------------------------------------------------------------
+static void AudioReanchorRing (void)
+{
+        DWORD playPos = 0;
+        if (FAILED(Buffer->GetCurrentPosition(&playPos, NULL)))
+                return;
+
+        DWORD slotBytes = (DWORD)LockSize;
+        if (slotBytes == 0)
+                return;
+
+        DWORD ringBytes = slotBytes * FRAMEBUF;
+        if (ringBytes == 0 || playPos >= ringBytes)
+                return;
+
+        DWORD playSlot = playPos / slotBytes;
+        if (playSlot >= FRAMEBUF)
+                playSlot = 0;
+
+        // Next written slot goes AUDIO_PRIME_SLOTS ahead of the play
+        // cursor. Everything the consumer will cross before reaching it
+        // is silenced so no stale sample can leak out first.
+        DWORD anchorSlot = (playSlot + AUDIO_PRIME_SLOTS) % FRAMEBUF;
+        DWORD writeStart = anchorSlot * slotBytes;
+
+        next_pos = (unsigned long)anchorSlot;
+
+        DWORD dist = (writeStart + ringBytes - playPos) % ringBytes;
+        if (dist > 0)
+        {
+                LPVOID p1 = NULL, p2 = NULL;
+                DWORD n1 = 0, n2 = 0;
+                if (SUCCEEDED(Buffer->Lock(playPos, dist, &p1, &n1, &p2, &n2, 0)))
+                {
+                        if (p1 && n1)
+                                ZeroMemory(p1, n1);
+                        if (p2 && n2)
+                                ZeroMemory(p2, n2);
+                        Buffer->Unlock(p1, n1, p2, n2);
+                }
+        }
+
+        // Restart the fade-in counter so the first slot written after
+        // the re-anchor ramps in from silence instead of clicking.
+        InterlockedExchange(&g_AudioPrimeSlots, 0L);
+}
+
+void    SoftPause (void)
+{
+        LPVOID bufPtr;
+        DWORD bufBytes;
+        if (!isEnabled || !Buffer)
+                return;
+
+        // Zero the whole ring. The consumer keeps looping over silence
+        // for the rest of the pause, so no stale audio can ever replay,
+        // whatever the pause duration. Pure shared-memory writes -- the
+        // same operation a normal slot write performs.
+        if (FAILED(Buffer->Lock(0, 0, &bufPtr, &bufBytes, NULL, 0, DSBLOCK_ENTIREBUFFER)))
+                return;
+        ZeroMemory(bufPtr, bufBytes);
+        Buffer->Unlock(bufPtr, bufBytes, NULL, 0);
+}
+
+void    SoftResume (void)
+{
+        if (!isEnabled || !Buffer || LockSize == 0)
+                return;
+        AudioReanchorRing();
+}
+
 void    SoundON (void)
 {
         LPVOID bufPtr;
         DWORD bufBytes;
         if (isEnabled)
+        {
+                // P102: SoundON while audio is already running means the
+                // emulation thread is (re)starting after a soft pause
+                // (NES::Start following a STOPMODE_SOFT exit). NES::Resume()
+                // re-anchors the ring directly; this branch covers the
+                // Start()-style entry points. No driver state is touched.
+                SoftResume();
                 return;
+        }
         if (!Buffer)
         {
                 Start();
@@ -1468,6 +1605,12 @@ void    SoundON (void)
                 InterlockedExchange(&g_AudioCurrentFreq, (LONG)startFreq);
         }
         drc_play_freq = startFreq;
+        // P102: this is the playback rate the throttled feedback
+        // controller in UpdateDRC() trims around; also restart its
+        // check cadence so the first fill check happens a full interval
+        // after the fresh prime.
+        drc_base_freq = startFreq;
+        drc_feedback_check_count = 0;
         // If the MMR restart request was posted before the DirectSound buffer
         // existed (the cold-start case), SoundON itself has now satisfied that
         // request. Do not perform an unnecessary second SoundOFF/SoundON on
@@ -1862,7 +2005,99 @@ void    UpdateDRC (void)
         if (!Buffer || !isEnabled)
                 return;
         if (!MonitorSync::IsEnabled())
+        {
                 drc_play_freq = FREQ;
+                return;
+        }
+
+        // ============================================================
+        // P102: throttled ring-phase feedback.
+        //
+        // The P90+ MMR audio path is fully deterministic and fully
+        // open-loop: the producer writes slots blind and nothing ever
+        // verifies that the write cursor keeps a safe distance from the
+        // DirectSound play cursor. Two consequences were measured on the
+        // user's machine (Log 2026-09-18):
+        //
+        //   1. PaceSlot() re-anchors its target sequence to live DWM
+        //      composition timestamps every frame, so the producer
+        //      effectively runs at the REAL composition rate (measured
+        //      60.0108 fps, a 17/17/16 ms 3-frame beat), while the
+        //      consumer rate is fixed at SoundON time from the NOMINAL
+        //      reported target (44100 * 60.000/60.0988 = 44027 Hz).
+        //      That +9 samples/s mismatch makes the write cursor lap
+        //      the play cursor roughly every 8 minutes -> the periodic
+        //      "random" crackle.
+        //
+        //   2. Any producer stall (display transition, scheduler hiccup,
+        //      DWM maintenance) permanently shifts the ring phase, and
+        //      nothing ever pulls it back.
+        //
+        // This controller restores the pre-P90 self-healing property
+        // WITHOUT reintroducing per-frame audiodg IPC: one
+        // GetCurrentPosition per 32 frames (~0.5 s), executed here in
+        // UpdateDRC -- the post-SwapBuffers point the P90 notes
+        // explicitly identified as safe for audio maintenance. A
+        // periodic SetFrequency trim of at most +-0.3% (about 5 cents,
+        // inaudible) is applied only when the measured lead leaves the
+        // 1.5..4.5 slot band; in the 0.7..5.3 slot danger zone the write
+        // cursor is snap-re-anchored 4 slots ahead of the play cursor
+        // instead (see AudioReanchorRing). Steady state costs at most a
+        // couple of SetFrequency calls per minute and typically none
+        // once converged.
+        // ============================================================
+        if (!GFX::MatchMonitorRate || LockSize == 0)
+                return;
+        if (InterlockedExchangeAdd(&g_AudioPlayPending, 0L) != 0L)
+                return;         // still priming; the consumer is not running yet
+
+        if (++drc_feedback_check_count < DRC_FEEDBACK_INTERVAL)
+                return;
+        drc_feedback_check_count = 0;
+
+        DWORD playPos = 0;
+        if (FAILED(Buffer->GetCurrentPosition(&playPos, NULL)))
+                return;
+
+        DWORD slotBytes = (DWORD)LockSize;
+        DWORD ringBytes = slotBytes * FRAMEBUF;
+        if (ringBytes == 0 || playPos >= ringBytes)
+                return;
+
+        DWORD writePos = (DWORD)next_pos * slotBytes;
+        LONG fillBytes = (LONG)((writePos + ringBytes - playPos) % ringBytes);
+        double fillSlots = (double)fillBytes / (double)slotBytes;
+
+        if (fillSlots < DRC_FILL_SNAP_LO || fillSlots > DRC_FILL_SNAP_HI)
+        {
+                // Danger zone: the cursors are about to collide (or the
+                // phase was scrambled by a stall). Repair immediately by
+                // re-anchoring the write cursor with a fresh lead.
+                AudioReanchorRing();
+                return;
+        }
+
+        if (fillSlots < DRC_FILL_MIN || fillSlots > DRC_FILL_MAX)
+        {
+                double base = (drc_base_freq > 0) ? (double)drc_base_freq : (double)FREQ;
+                double want = base * (1.0 + DRC_FILL_KP * (fillSlots - DRC_FILL_TARGET));
+                double fmin = base * (1.0 - DRC_FREQ_TRIM_MAX);
+                double fmax = base * (1.0 + DRC_FREQ_TRIM_MAX);
+                if (want < fmin) want = fmin;
+                if (want > fmax) want = fmax;
+                DWORD newFreq = (DWORD)(want + 0.5);
+                if (newFreq < 100)   newFreq = 100;
+                if (newFreq > 100000) newFreq = 100000;
+                if ((LONG)newFreq != InterlockedExchangeAdd(&g_AudioCurrentFreq, 0L))
+                {
+                        if (SUCCEEDED(Buffer->SetFrequency(newFreq)))
+                        {
+                                InterlockedIncrement(&g_AudioSetFreqCalls);
+                                InterlockedExchange(&g_AudioCurrentFreq, (LONG)newFreq);
+                        }
+                }
+                drc_play_freq = newFreq;
+        }
 #endif /* !NSFPLAYER */
 }
 

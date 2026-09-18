@@ -41,6 +41,14 @@ void    SaveSettings    (HKEY);
 void    LoadSettings    (HKEY);
 void    SoundOFF        (void);
 void    SoundON         (void);
+// P102: soft-pause lifecycle. SoftPause() mutes the ring when the NES
+// producer thread exits through a soft stop (fullscreen / savestate /
+// reset) while DirectSound keeps playing; SoftResume() re-anchors the
+// write cursor a safe lead ahead of the play cursor when the producer
+// is about to start again. Neither touches Stop/Play/SetFrequency or
+// SetCurrentPosition, so the DirectSound driver state is preserved.
+void    SoftPause       (void);
+void    SoftResume      (void);
 #endif  /* !NSFPLAYER */
 void    PowerOn         (void);
 void    Reset           (void);
