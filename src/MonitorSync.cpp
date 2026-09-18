@@ -1209,6 +1209,24 @@ void ApplyPendingVSync()
     }
 }
 
+// Shutdown helper executed by the GL render thread while its own context
+// is current. Never call SetOpenGLVSync() here because that function performs
+// wglMakeCurrent() and can steal the context from the thread that owns it.
+void PrepareForRenderShutdown()
+{
+    if (!pfnWglSwapIntervalEXT)
+        LoadWGLSwapControl();
+
+    if (pfnWglSwapIntervalEXT)
+        pfnWglSwapIntervalEXT(0);
+
+    g_VSyncActive = false;
+    InterlockedExchange(&g_DwmSyncMode, 0L);
+    // Invalidate any interval queued by the UI thread immediately before
+    // shutdown so there is no second, blocking vsync change on the final frame.
+    InterlockedExchange(&g_PendingVSyncInterval, -1L);
+}
+
 // ------------------------------------------------------------------
 // P28: DXGI vblank bypass public API
 // ------------------------------------------------------------------

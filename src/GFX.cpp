@@ -1053,6 +1053,12 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 s_diagHead = (s_diagHead + 1) % DIAG_FRAMES;
         }
 
+        // StopRenderThread() may request shutdown after this packet was
+        // consumed but before drawing begins. Do not start another GL frame
+        // in that case; the render thread can release its context immediately.
+        if (InterlockedExchangeAdd(&s_RenderThreadStop, 0) != 0)
+                return;
+
         MonitorSync::ApplyPendingVSync();
         ApplyPendingResize();
         {
@@ -1296,6 +1302,13 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 DiagGetThreadCpu100ns(&s_diagBuf[diagSwapIdxPre].swapStartCPU100ns);
                 QueryThreadCycleTime(GetCurrentThread(), &s_diagBuf[diagSwapIdxPre].swapStartCycles);
         }
+
+        // If the UI has requested render-thread shutdown while this frame was
+        // already in progress, make the final swap non-blocking on the render
+        // thread's own WGL context. This avoids joining a thread that is stuck
+        // inside a driver vsync wait during MMR/fullscreen teardown.
+        if (renderStopping)
+                MonitorSync::PrepareForRenderShutdown();
 
         SwapBuffers(hGLDC);
 

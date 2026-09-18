@@ -108,6 +108,12 @@ static volatile LONG     g_AudioPlayStarts = 0L;
 static volatile LONG     g_AudioSafetyWaits = 0L;
 static volatile LONG     g_AudioCurrentFreq = FREQ;
 
+// P99: remember the DirectSound playback slot across an explicit audio
+// restart. SoundOFF/SoundON is used for fullscreen/MMR transitions, so
+// preserving the playback phase avoids forcing the driver back to byte zero.
+static volatile LONG     g_AudioResumePosition = 0L;
+static volatile LONG     g_AudioResumeValid = 0L;
+
 // P93: prime four complete slots (~66.7 ms at 60 Hz) before Play().
 #define AUDIO_PRIME_SLOTS 4
 static volatile LONG     g_AudioPrimeSlots = 0L;
@@ -116,6 +122,10 @@ static volatile LONG     g_AudioRestartPending = 0L;
 
 // Forward declaration: SoundON() appears before the definition below.
 static double GetEffectiveProducerSampleRate();
+
+// SoundON() is defined before these audio-only sample accumulators.
+extern int sampcycles;
+extern int samppos;
 
 
 void StartAudioCtrlThread() {}
@@ -1273,6 +1283,14 @@ void    Start (void)
                 MessageBox(hMainWnd, Lang::GetString(LANG_ERR_APU_BUFFER), Lang::GetString(LANG_DLG_NINTENDULATOR), MB_OK);
                 return;
         }
+
+        // A newly-created secondary buffer always starts at the original
+        // format rate. Clear the cached rate so a later SoundON() cannot
+        // accidentally skip SetFrequency() based on a stale previous buffer.
+        InterlockedExchange(&g_AudioCurrentFreq, FREQ);
+        InterlockedExchange(&g_AudioResumePosition, 0L);
+        InterlockedExchange(&g_AudioResumeValid, 0L);
+
         EI.DbgOut(Lang::GetString(LANG_MSG_APU_STARTED));
 #endif  /* !NSFPLAYER */
 }
@@ -1340,11 +1358,36 @@ void    SoundOFF (void)
 {
         if (!isEnabled)
                 return;
+
+        // IDirectSoundBuffer::Stop() does not reset the secondary-buffer
+        // playback cursor. Stop first, then read the cursor while the buffer
+        // is no longer advancing; this removes a small race at slot boundaries.
+        LONG resumePos = 0L;
+        BOOL resumeValid = FALSE;
         isEnabled = FALSE;
         InterlockedExchange(&g_AudioPlayPending, 0L);
         InterlockedExchange(&g_AudioPrimeSlots, 0L);
+
         if (Buffer)
+        {
                 Buffer->Stop();
+                if (LockSize > 0)
+                {
+                        DWORD playPos = 0;
+                        if (SUCCEEDED(Buffer->GetCurrentPosition(&playPos, NULL)))
+                        {
+                                DWORD bufferBytes = (DWORD)(LockSize * FRAMEBUF);
+                                if (playPos < bufferBytes)
+                                {
+                                        resumePos = (LONG)((playPos / (DWORD)LockSize) * (DWORD)LockSize);
+                                        resumeValid = TRUE;
+                                }
+                        }
+                }
+        }
+
+        InterlockedExchange(&g_AudioResumePosition, resumePos);
+        InterlockedExchange(&g_AudioResumeValid, resumeValid ? 1L : 0L);
 }
 
 void    SoundON (void)
@@ -1359,23 +1402,42 @@ void    SoundON (void)
                 if (!Buffer)
                         return;
         }
+
+        LONG resumePos = InterlockedExchange(&g_AudioResumePosition, 0L);
+        BOOL resumeValid = (InterlockedExchange(&g_AudioResumeValid, 0L) != 0);
+
+        // Reset only the software sample accumulators. This does not reset any
+        // emulated APU channel state; it simply prevents a partial sample
+        // averaging window from straddling a fullscreen/MMR transition.
+        Cycles = 0;
+        BufPos = 0;
+        sampcycles = 0;
+        samppos = 0;
+
         Try(Buffer->Lock(0, 0, &bufPtr, &bufBytes, NULL, 0, DSBLOCK_ENTIREBUFFER), Lang::GetString(LANG_ERR_APU_BUFFER));
         ZeroMemory(bufPtr, bufBytes);
         Try(Buffer->Unlock(bufPtr, bufBytes, NULL, 0), Lang::GetString(LANG_ERR_APU_BUFFER));
-        // Explicitly align both playback phase and sample rate before the
-        // buffer starts looping. After SoundOFF(), DirectSound does not need
-        // to resume at slot zero; zeroing the buffer alone therefore does not
-        // guarantee producer/consumer phase alignment. Fullscreen toggling
-        // calls SoundOFF/SoundON and was observed to cure the crackle, so make
-        // that recovery deterministic rather than driver-position dependent.
-        Try(Buffer->SetCurrentPosition(0), Lang::GetString(LANG_ERR_APU_BUFFER));
+
+        // DirectSound keeps the secondary-buffer cursor when it is stopped.
+        // Do not call SetCurrentPosition(0) here: moving the cursor during a
+        // mode transition creates an abrupt phase jump that can become audible
+        // as a click/crackle. The slot containing the saved cursor is left as
+        // one silent slot; new audio is then primed starting at the following
+        // slot, with the existing fade-in protecting the restart edge.
+        next_pos = 0;
+        if (resumeValid && LockSize > 0)
+        {
+                DWORD resumeSlot = (DWORD)resumePos / (DWORD)LockSize;
+                if (resumeSlot < (DWORD)FRAMEBUF)
+                        next_pos = (resumeSlot + 1) % FRAMEBUF;
+        }
+
         // Keep the buffer stopped until the initial prime slots have been
         // copied. The DirectSound playback rate is established while stopped,
         // then playback starts only after enough audio lead exists.
         isEnabled = TRUE;
         InterlockedExchange(&g_AudioPlayPending, 1L);
         InterlockedExchange(&g_AudioPrimeSlots, 0L);
-        next_pos = 0;
         // Establish the playback rate while the buffer is stopped.
         // With MMR the whole emulator clock is slowed by targetHz/NESHz, so
         // the nominal 44100-Hz APU stream must be consumed at the same ratio.
@@ -1399,9 +1461,12 @@ void    SoundON (void)
         }
         if (startFreq < 100) startFreq = 100;
         if (startFreq > 100000) startFreq = 100000;
-        Try(Buffer->SetFrequency(startFreq), Lang::GetString(LANG_ERR_APU_BUFFER));
-        InterlockedIncrement(&g_AudioSetFreqCalls);
-        InterlockedExchange(&g_AudioCurrentFreq, (LONG)startFreq);
+        if (InterlockedExchangeAdd(&g_AudioCurrentFreq, 0L) != (LONG)startFreq)
+        {
+                Try(Buffer->SetFrequency(startFreq), Lang::GetString(LANG_ERR_APU_BUFFER));
+                InterlockedIncrement(&g_AudioSetFreqCalls);
+                InterlockedExchange(&g_AudioCurrentFreq, (LONG)startFreq);
+        }
         drc_play_freq = startFreq;
         // If the MMR restart request was posted before the DirectSound buffer
         // existed (the cold-start case), SoundON itself has now satisfied that

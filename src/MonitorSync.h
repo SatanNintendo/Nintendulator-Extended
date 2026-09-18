@@ -93,6 +93,12 @@ namespace MonitorSync
         // DwmFlush via USE_DWMFLUSH=1.
         void    SetDwmSyncMode (bool useDwm);
 
+        // Called by the GL render thread immediately before its final
+        // SwapBuffers() during shutdown. Because the render thread owns the
+        // current WGL context, this switches its own swap interval to 0
+        // without stealing the context from the UI thread.
+        void    PrepareForRenderShutdown ();
+
         // Current measured monitor refresh rate, in Hz.
         // Fractional rates such as 59.940 Hz are preserved when Windows exposes
         // them through DWM. Falls back to the current display mode otherwise.
