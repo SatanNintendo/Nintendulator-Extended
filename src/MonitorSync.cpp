@@ -872,7 +872,7 @@ void PaceSlot()
             if (anchorFrame != s_seenAnchorFrame || s_nextPresentationTargetQPC <= 0)
             {
                 s_seenAnchorFrame = anchorFrame;
-                s_nextPresentationTargetQPC = anchorQPC + period - leadTicks;
+                s_nextPresentationTargetQPC = anchorQPC + nominalPeriod - leadTicks;
             }
 
             LONGLONG targetQPC = s_nextPresentationTargetQPC;
@@ -880,7 +880,7 @@ void PaceSlot()
             // If a host stall made the scheduled target historical, skip only
             // the stale phase targets. This call still consumes one current slot.
             while (targetQPC <= now.QuadPart)
-                targetQPC += period;
+                targetQPC += nominalPeriod;
 
             double remainMs = (double)(targetQPC - now.QuadPart) *
                               1000.0 / (double)g_QPCFreq.QuadPart;
@@ -916,7 +916,7 @@ void PaceSlot()
 
             // Critical P86/P88 rule: one display-period target is consumed per
             // PaceFrame invocation.
-            s_nextPresentationTargetQPC = targetQPC + period;
+            s_nextPresentationTargetQPC = targetQPC + nominalPeriod;
             return;
         }
     }
