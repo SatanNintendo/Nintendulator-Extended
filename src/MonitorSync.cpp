@@ -381,10 +381,10 @@ static volatile LONGLONG g_PresentationPeriodQPC      = 0;
 static volatile LONG     g_PresentationClockLocked   = FALSE;
 static volatile LONG     g_PresentationHzMilli       = 0;
 static volatile LONG     g_PresentationIntervalErrUs = 0;
-// P85: DWM composition samples are snapshots, so track the DWM frame id
+// DWM presentation samples are snapshots, so track the displayed frame id
 // separately. This rejects duplicate samples and prevents a 0ms/16ms pair
 // from being interpreted as a real presentation cadence.
-static volatile ULONGLONG g_LastDwmCompositionFrame = 0;
+static volatile ULONGLONG g_LastDwmDisplayedFrame = 0;
 static volatile LONG       g_PresentationSampleStreak = 0;
 // P86/P88: DWM supplies phase, while PaceSlot owns one display-period target
 // per call. In P88 the semantic caller is PaceFrame(), once per NES frame.
@@ -588,7 +588,7 @@ void OnDisplayChange()
     InterlockedExchange(&g_PresentationClockLocked, FALSE);
     InterlockedExchange(&g_PresentationHzMilli, 0);
     InterlockedExchange(&g_PresentationIntervalErrUs, 0);
-    InterlockedExchange64((volatile LONGLONG*)&g_LastDwmCompositionFrame, 0);
+    InterlockedExchange64((volatile LONGLONG*)&g_LastDwmDisplayedFrame, 0);
     InterlockedExchange(&g_PresentationSampleStreak, 0);
     InterlockedExchange64(&g_PresentationAnchorQPC, 0);
     InterlockedExchange64((volatile LONGLONG*)&g_PresentationAnchorFrame, 0);
@@ -766,7 +766,7 @@ void ResetState()
     InterlockedExchange(&g_PresentationClockLocked, FALSE);
     InterlockedExchange(&g_PresentationHzMilli, 0);
     InterlockedExchange(&g_PresentationIntervalErrUs, 0);
-    InterlockedExchange64((volatile LONGLONG*)&g_LastDwmCompositionFrame, 0);
+    InterlockedExchange64((volatile LONGLONG*)&g_LastDwmDisplayedFrame, 0);
     InterlockedExchange(&g_PresentationSampleStreak, 0);
     InterlockedExchange64(&g_PresentationAnchorQPC, 0);
     InterlockedExchange64((volatile LONGLONG*)&g_PresentationAnchorFrame, 0);
@@ -1054,26 +1054,30 @@ void NotifyFramePresented(LONGLONG qpcPresented)
     }
 }
 
-void NotifyDwmCompositionSample(LONGLONG qpcCompose, ULONGLONG dwmFrame)
+void NotifyDwmCompositionSample(LONGLONG qpcDisplayed, ULONGLONG dwmFrameDisplayed)
 {
-    if (qpcCompose <= 0 || dwmFrame == 0 || g_QPCFreq.QuadPart <= 0)
+    if (qpcDisplayed <= 0 || dwmFrameDisplayed == 0 || g_QPCFreq.QuadPart <= 0)
         return;
 
     ULONGLONG previousFrame =
             (ULONGLONG)InterlockedExchange64(
-                    (volatile LONGLONG*)&g_LastDwmCompositionFrame,
-                    (LONGLONG)dwmFrame);
+                    (volatile LONGLONG*)&g_LastDwmDisplayedFrame,
+                    (LONGLONG)dwmFrameDisplayed);
 
-    // DwmGetCompositionTimingInfo() returns a snapshot. The same composition
+    // DwmGetCompositionTimingInfo() returns a snapshot. The same displayed
     // frame can therefore be observed more than once. Never turn duplicate
     // snapshots into artificial 0ms/16ms presentation samples.
-    if (previousFrame == dwmFrame)
+    if (previousFrame == dwmFrameDisplayed)
         return;
 
+    // The caller supplies qpcFrameDisplayed/cFrameDisplayed here. These are
+    // application-specific display events, rather than DWM's global
+    // composition counter, so the phase master follows the frames that
+    // actually reached the application's presentation path.
     LONGLONG previousQpc =
-            InterlockedExchange64(&g_LastPresentationQPC, qpcCompose);
+            InterlockedExchange64(&g_LastPresentationQPC, qpcDisplayed);
 
-    if (previousQpc <= 0 || qpcCompose <= previousQpc)
+    if (previousQpc <= 0 || qpcDisplayed <= previousQpc)
     {
         InterlockedExchange(&g_PresentationClockLocked, FALSE);
         InterlockedExchange(&g_PresentationSampleStreak, 0);
@@ -1083,17 +1087,17 @@ void NotifyDwmCompositionSample(LONGLONG qpcCompose, ULONGLONG dwmFrame)
         return;
     }
 
-    ULONGLONG frameDelta = dwmFrame - previousFrame;
+    ULONGLONG frameDelta = dwmFrameDisplayed - previousFrame;
     const double targetHz = (GetTargetHz() > 0.0) ? GetTargetHz() : 60.0;
     const LONGLONG nominal =
             (LONGLONG)((double)g_QPCFreq.QuadPart / targetHz + 0.5);
     if (nominal <= 0)
         return;
 
-    LONGLONG delta = qpcCompose - previousQpc;
+    LONGLONG delta = qpcDisplayed - previousQpc;
 
-    // Only a consecutive one-composition-per-refresh stream is good enough
-    // to become the phase master. A skipped composition resets the startup
+    // Only a consecutive one-displayed-frame-per-refresh stream is good
+    // enough to become the phase master. A skipped display resets the startup
     // qualification instead of promoting a 33ms interval into the clock.
     if (frameDelta != 1 ||
         delta < (nominal * 3) / 4 || delta > (nominal * 5) / 4)
@@ -1114,7 +1118,7 @@ void NotifyDwmCompositionSample(LONGLONG qpcCompose, ULONGLONG dwmFrame)
     if (oldPeriod <= 0)
         oldPeriod = delta;
 
-    // Slow filter: keep the actual DWM composition period as the phase master
+    // Slow filter: keep the actual DWM display period as the phase master
     // without allowing one noisy sample to move the schedule by a full ms.
     LONGLONG filtered = oldPeriod + (delta - oldPeriod) / 8;
     if (filtered <= 0)
@@ -1130,14 +1134,14 @@ void NotifyDwmCompositionSample(LONGLONG qpcCompose, ULONGLONG dwmFrame)
     InterlockedExchange(&g_PresentationHzMilli, hzMilli);
 
     LONG streak = InterlockedIncrement(&g_PresentationSampleStreak);
-    // P85/P86: qualify after three consecutive unique DWM composition samples.
-    // P86 also publishes qpcCompose/cFrame as the phase anchor used by the
+    // Qualify after three consecutive unique displayed-frame samples.
+    // The displayed QPC/frame pair becomes the phase anchor used by the
     // producer-side target sequence.
     if (streak >= 3)
     {
-        InterlockedExchange64(&g_PresentationAnchorQPC, qpcCompose);
+        InterlockedExchange64(&g_PresentationAnchorQPC, qpcDisplayed);
         InterlockedExchange64((volatile LONGLONG*)&g_PresentationAnchorFrame,
-                              (LONGLONG)dwmFrame);
+                              (LONGLONG)dwmFrameDisplayed);
         InterlockedExchange(&g_PresentationClockLocked, TRUE);
     }
 }

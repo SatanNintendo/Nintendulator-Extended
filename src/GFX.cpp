@@ -1263,11 +1263,19 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
 
         const bool renderStopping =
                 (InterlockedExchangeAdd(&s_RenderThreadStop, 0) != 0);
+#if USE_DWMFLUSH
         const bool useDwmPresentation =
                 (!renderStopping &&
                  MatchMonitorRate &&
                  !(Fullscreen && ExclusiveFullscreen) &&
                  !MonitorSync::HasDXGIVBlank());
+#else
+        // P97: DwmFlush is disabled because it is an uninterruptible
+        // blocking call during MMR teardown. Without DwmFlush there is
+        // no replacement for interval=0, so keep the normal GL-vsync
+        // interval instead of disabling WGL backpressure.
+        const bool useDwmPresentation = false;
+#endif
 
 #if USE_DWMFLUSH
         if (useDwmPresentation)
@@ -1355,15 +1363,16 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
         {
                 int idxDwm = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
                 if (DiagQueryDwmTiming(s_diagBuf[idxDwm]) &&
-                    s_diagBuf[idxDwm].dwmFrame > 0 &&
-                    s_diagBuf[idxDwm].dwmCompose > 0)
+                    s_diagBuf[idxDwm].dwmFrameDisplayed > 0 &&
+                    s_diagBuf[idxDwm].dwmDisplayed > 0)
                 {
-                        // P85: qpcCompose is tied to a concrete DWM composition
-                        // frame. NotifyDwmCompositionSample rejects duplicate
-                        // snapshots and does not require DwmFlush timing.
+                        // Use the application's actual displayed frame as the
+                        // phase sample. cFrame/qpcCompose describe DWM's global
+                        // composition tick; cFrameDisplayed/qpcFrameDisplayed
+                        // identify when this application's frame was displayed.
                         MonitorSync::NotifyDwmCompositionSample(
-                                s_diagBuf[idxDwm].dwmCompose,
-                                s_diagBuf[idxDwm].dwmFrame);
+                                s_diagBuf[idxDwm].dwmDisplayed,
+                                s_diagBuf[idxDwm].dwmFrameDisplayed);
                 }
         }
 
@@ -2042,8 +2051,9 @@ static bool DiagQueryDwmTiming(FrameTimingEntry &e)
         // P70: Windows 7/8-era DWM expects a real HWND for this query,
         // while Windows 8.1+ requires NULL. Try the actual NES window first
         // (the important path for the legacy systems this project supports),
-        // then fall back to NULL for newer DWM implementations. This is
-        // diagnostics-only and never affects rendering or pacing.
+        // then fall back to NULL for newer DWM implementations. The query
+        // also supplies the application-displayed frame timestamp used by
+        // MonitorSync as a presentation-phase feedback signal.
         DWM_TIMING_INFO ti;
         ZeroMemory(&ti, sizeof(ti));
         ti.cbSize = sizeof(ti);
@@ -2503,12 +2513,12 @@ static void GL_DrawFrame(void)
         {
                 int idxDwm = (s_diagHead + DIAG_FRAMES - 1) % DIAG_FRAMES;
                 if (DiagQueryDwmTiming(s_diagBuf[idxDwm]) &&
-                    s_diagBuf[idxDwm].dwmFrame > 0 &&
-                    s_diagBuf[idxDwm].dwmCompose > 0)
+                    s_diagBuf[idxDwm].dwmFrameDisplayed > 0 &&
+                    s_diagBuf[idxDwm].dwmDisplayed > 0)
                 {
                         MonitorSync::NotifyDwmCompositionSample(
-                                s_diagBuf[idxDwm].dwmCompose,
-                                s_diagBuf[idxDwm].dwmFrame);
+                                s_diagBuf[idxDwm].dwmDisplayed,
+                                s_diagBuf[idxDwm].dwmFrameDisplayed);
                 }
         }
 
