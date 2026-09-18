@@ -844,7 +844,7 @@ void PaceSlot()
     // is entered more often than DWM advances cFrame, multiple producer calls
     // can reuse one sample and the emulator can run faster than the monitor.
     // Keep an independent target sequence: DWM can move phase, but every
-    // PaceSlot call consumes exactly one presentation-period slot.
+    // PaceSlot call consumes exactly one nominal target-clock slot.
     static ULONGLONG s_seenAnchorFrame = 0;
     static LONG      s_seenAnchorGeneration = 0;
     static LONGLONG  s_nextPresentationTargetQPC = 0;
@@ -862,17 +862,28 @@ void PaceSlot()
         LONGLONG anchorQPC = InterlockedExchangeAdd64(&g_PresentationAnchorQPC, 0);
         ULONGLONG anchorFrame = (ULONGLONG)InterlockedExchangeAdd64(
                 (volatile LONGLONG*)&g_PresentationAnchorFrame, 0);
-        LONGLONG period = InterlockedExchangeAdd64(&g_PresentationPeriodQPC, 0);
+        LONGLONG sampledPeriod = InterlockedExchangeAdd64(&g_PresentationPeriodQPC, 0);
 
-        if (anchorQPC > 0 && anchorFrame > 0 && period > 0)
+        if (anchorQPC > 0 && anchorFrame > 0 && sampledPeriod > 0)
         {
             const LONGLONG leadTicks =
                     (LONGLONG)((double)g_QPCFreq.QuadPart * 0.007 + 0.5);
 
+            // The presentation sampler is intentionally phase-only. The actual
+            // MMR cadence must remain the same nominal target used by the audio
+            // clock (GetTargetHz()). The previous implementation used the
+            // sampled DWM period itself as the scheduling period here, which
+            // meant a noisy/stale 60.14-Hz sample could silently accelerate the
+            // NES thread while SoundON() kept DirectSound at the nominal 60-Hz
+            // target. That produces a slow audio-buffer phase drift even though
+            // every local frame interval still looks plausible.
+            //
+            // Keep the sampled period in the lock qualification/diagnostics, but
+            // advance the actual target sequence by nominalPeriod only.
             if (anchorFrame != s_seenAnchorFrame || s_nextPresentationTargetQPC <= 0)
             {
                 s_seenAnchorFrame = anchorFrame;
-                s_nextPresentationTargetQPC = anchorQPC + period - leadTicks;
+                s_nextPresentationTargetQPC = anchorQPC + nominalPeriod - leadTicks;
             }
 
             LONGLONG targetQPC = s_nextPresentationTargetQPC;
@@ -880,7 +891,7 @@ void PaceSlot()
             // If a host stall made the scheduled target historical, skip only
             // the stale phase targets. This call still consumes one current slot.
             while (targetQPC <= now.QuadPart)
-                targetQPC += period;
+                targetQPC += nominalPeriod;
 
             double remainMs = (double)(targetQPC - now.QuadPart) *
                               1000.0 / (double)g_QPCFreq.QuadPart;
@@ -914,9 +925,9 @@ void PaceSlot()
             QueryPerformanceCounter(&paceWake);
             RecordPaceDiagnostic(targetQPC, paceWake.QuadPart, 1);
 
-            // Critical P86/P88 rule: one display-period target is consumed per
+            // Critical rule: one nominal MMR target period is consumed per
             // PaceFrame invocation.
-            s_nextPresentationTargetQPC = targetQPC + period;
+            s_nextPresentationTargetQPC = targetQPC + nominalPeriod;
             return;
         }
     }
