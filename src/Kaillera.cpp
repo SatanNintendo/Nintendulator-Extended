@@ -8,7 +8,11 @@
  *
  *  - kailleraclient.dll is loaded dynamically at startup.  When the DLL is
  *    missing (or has the wrong bitness) the emulator behaves exactly as
- *    before - netplay is simply unavailable.
+ *    before - netplay is simply unavailable.  64-bit Kaillera clients DO
+ *    exist (e.g. the n02 client from the Open Kaillera project,
+ *    open-kaillera.github.io) - they use the very same file name, so when
+ *    the DLL cannot be used, Netplay > Connect explains precisely what to
+ *    check (file missing / wrong architecture / not a Kaillera client).
  *
  *  - Netplay > Connect... runs the Kaillera server browser (the DLL's own
  *    window) on a dedicated thread, so the emulator UI stays responsive.
@@ -69,6 +73,21 @@ int             NumPlayers = 0;                         // players in the curren
  * ────────────────────────────────────────────────────────────────────────── */
 
 static HMODULE                          hClientDLL = NULL;
+
+// Why the client DLL is unavailable (used to show a meaningful message
+// when the user tries to connect).  Note that 64-bit kailleraclient.dll
+// builds exist (e.g. the n02 client from the Open Kaillera project,
+// open-kaillera.github.io) - they are simply named the same as the 32-bit
+// ones, so the user has to verify the bitness of the file he placed.
+enum DLLProblem
+{
+        DLL_OK = 0,             // loaded successfully
+        DLL_NOT_FOUND,          // no kailleraclient.dll / kailleraclient64.dll next to the program
+        DLL_BAD_ARCH,           // a DLL was found, but it was built for another architecture
+        DLL_INVALID             // the DLL loaded, but does not export the Kaillera API
+};
+static int      dllProblem = DLL_NOT_FOUND;
+
 static kailleraGetVersionFunc           p_GetVersion = NULL;
 static kailleraInitFunc                 p_Init = NULL;
 static kailleraShutdownFunc             p_Shutdown = NULL;
@@ -153,6 +172,26 @@ static char                     gameList[512];
 static void KailleraMsg (LangStringID id)
 {
         MessageBox(hMainWnd, Lang::GetString(id), Lang::GetString(LANG_NETPLAY_TITLE), MB_OK | MB_ICONWARNING);
+}
+
+/* Bitness of this emulator build, as a number, for the user-guidance
+ * messages below.  printf-family functions safely ignore arguments for
+ * which the format string has no placeholder, so all three DLL messages
+ * can share one call that passes the bitness three times. */
+#ifdef _WIN64
+#define KAILLERA_BUILD_BITS     64
+#else
+#define KAILLERA_BUILD_BITS     32
+#endif
+
+/* Show one of the MSG_NETPLAY_DLL_* messages, with this build's bitness
+ * substituted for the %d placeholders. */
+static void KailleraMsgDll (LangStringID id)
+{
+        TCHAR buf[LANG_MAX_STRING];
+        _sntprintf(buf, LANG_MAX_STRING, Lang::GetString(id), KAILLERA_BUILD_BITS, KAILLERA_BUILD_BITS, KAILLERA_BUILD_BITS);
+        buf[LANG_MAX_STRING - 1] = 0;   // _sntprintf may leave the buffer unterminated
+        MessageBox(hMainWnd, buf, Lang::GetString(LANG_NETPLAY_TITLE), MB_OK | MB_ICONWARNING);
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -313,6 +352,8 @@ void Init (void)
 {
         TCHAR dllPath[MAX_PATH];
         HMODULE hDLL;
+        DWORD err;
+        BOOL sawBadArch = FALSE;
 
         // Always load from the emulator's own directory (ProgPath has a trailing
         // backslash), independent of the current working directory.
@@ -320,15 +361,40 @@ void Init (void)
         hDLL = LoadLibrary(dllPath);
         if (hDLL == NULL)
         {
-                // Not found or wrong architecture (e.g. a 32-bit DLL in the 64-bit
-                // build) - try the 64-bit client name, like FBNeo does.
+                err = GetLastError();
+                // ERROR_BAD_EXE_FORMAT means the file is there but was built for
+                // another architecture (typically the classic 32-bit client
+                // placed next to the 64-bit build) - remember that, so the
+                // connect-time message can tell the user what to verify.
+                if (err == ERROR_BAD_EXE_FORMAT)
+                        sawBadArch = TRUE;
+
+                // Not found under the standard name - try the alternative
+                // FBNeo-style name, in case the user has a client that is
+                // distributed as kailleraclient64.dll.
                 _sntprintf(dllPath, MAX_PATH, _T("%skailleraclient64.dll"), ProgPath);
                 hDLL = LoadLibrary(dllPath);
-        }
-        if (hDLL == NULL)
-        {
-                AddDebug(_T("Kaillera: kailleraclient.dll not found - netplay disabled."));
-                return;
+                if (hDLL == NULL)
+                {
+                        err = GetLastError();
+                        if (err == ERROR_BAD_EXE_FORMAT)
+                                sawBadArch = TRUE;
+
+                        // No loadable client DLL.  If at least one of the two
+                        // file names exists with the wrong architecture, that is
+                        // the real problem; otherwise the DLL is simply absent.
+                        if (sawBadArch)
+                        {
+                                dllProblem = DLL_BAD_ARCH;
+                                AddDebug(_T("Kaillera: kailleraclient.dll does not match this build (wrong architecture) - netplay disabled."));
+                        }
+                        else
+                        {
+                                dllProblem = DLL_NOT_FOUND;
+                                AddDebug(_T("Kaillera: kailleraclient.dll not found - netplay disabled."));
+                        }
+                        return;
+                }
         }
 
         p_GetVersion             = (kailleraGetVersionFunc)        Resolve(hDLL, "kailleraGetVersion", 4);
@@ -346,6 +412,7 @@ void Init (void)
          || (p_SelectServerDialog == NULL) || (p_ModifyPlayValues == NULL)
          || (p_ChatSend == NULL) || (p_EndGame == NULL))
         {
+                dllProblem = DLL_INVALID;
                 AddDebug(_T("Kaillera: kailleraclient.dll is not a valid Kaillera client - netplay disabled."));
                 FreeLibrary(hDLL);
                 p_GetVersion = NULL;
@@ -359,6 +426,7 @@ void Init (void)
                 return;
         }
 
+        dllProblem = DLL_OK;
         hClientDLL = hDLL;
         p_Init();
 
@@ -450,7 +518,21 @@ BOOL Connect (void)
 
         if (!Available())
         {
-                KailleraMsg(LANG_MSG_NETPLAY_DLL_MISSING);
+                // Explain precisely why the client DLL cannot be used, so the
+                // user knows what to verify (the 64-bit client exists - it
+                // just has to match this build's architecture).
+                switch (dllProblem)
+                {
+                case DLL_BAD_ARCH:
+                        KailleraMsgDll(LANG_MSG_NETPLAY_DLL_BITNESS);
+                        break;
+                case DLL_INVALID:
+                        KailleraMsgDll(LANG_MSG_NETPLAY_DLL_INVALID);
+                        break;
+                default:
+                        KailleraMsgDll(LANG_MSG_NETPLAY_DLL_MISSING);
+                        break;
+                }
                 return FALSE;
         }
         if (!NES::ROMLoaded)
