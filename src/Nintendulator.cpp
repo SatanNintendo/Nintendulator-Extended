@@ -682,14 +682,27 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         CheckMenuRadioItem(hMenu, ID_PPU_SLOWDOWN_2, ID_PPU_SLOWDOWN_20, ID_PPU_SLOWDOWN_20, MF_BYCOMMAND);
                         break;
                 case ID_PPU_FULLSCREEN:
-    NES::Stop();
+{
+    // Fullscreen is a video/display transition, not an emulation restart.
+    // Pause/Resume deliberately keeps DirectSound alive: NES::Thread exits
+    // through STOPMODE_SOFT without calling APU::SoundOFF(), so the audio
+    // playback cursor and device phase are not torn down and rebuilt merely
+    // because the window changes mode.  A hard Stop/Start here used to turn
+    // every fullscreen transition into a DirectSound restart, which is exactly
+    // the transition associated with the user's audible crackle.
+    BOOL wasRunning = NES::Running;
+    if (wasRunning)
+        NES::Pause(TRUE);
+
     GFX::Stop();
     GFX::Fullscreen = !GFX::Fullscreen;
     GFX::Start();
     APU::UpdateDRC();
-    if (running)
-        NES::Start(FALSE);
+
+    if (wasRunning)
+        NES::Resume();
     break;
+}
 
 case ID_PPU_SCANLINES:
     NES::Stop();
@@ -771,6 +784,7 @@ case ID_PPU_ALWAYSONTOP:
     break;
 
 case ID_PPU_EXCLUSIVEFS:
+{
     GFX::ExclusiveFullscreen = !GFX::ExclusiveFullscreen;
     if (GFX::ExclusiveFullscreen)
         CheckMenuItem(hMenu, ID_PPU_EXCLUSIVEFS, MF_CHECKED);
@@ -778,13 +792,23 @@ case ID_PPU_EXCLUSIVEFS:
         CheckMenuItem(hMenu, ID_PPU_EXCLUSIVEFS, MF_UNCHECKED);
     if (GFX::Fullscreen)
     {
-        NES::Stop();
+        // Exclusive/windowed display policy is also a video-only transition.
+        // Preserve the running DirectSound stream for the same reason as the
+        // normal fullscreen toggle above. MMR itself is not being toggled here,
+        // so there is no need to recreate the audio rate/buffer.
+        BOOL wasRunning = NES::Running;
+        if (wasRunning)
+            NES::Pause(TRUE);
+
         GFX::Stop();
         GFX::Start();
         APU::UpdateDRC();
-        if (running) NES::Start(FALSE);
+
+        if (wasRunning)
+            NES::Resume();
     }
     break;
+}
 
 case ID_PPU_THEME_LIGHT:
     Theme::SetMode(Theme::MODE_LIGHT);

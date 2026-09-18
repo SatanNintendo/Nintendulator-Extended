@@ -108,14 +108,24 @@ static volatile LONG     g_AudioPlayStarts = 0L;
 static volatile LONG     g_AudioSafetyWaits = 0L;
 static volatile LONG     g_AudioCurrentFreq = FREQ;
 
-// P93/P100: prime five complete slots (~83.3 ms at 60 Hz) before Play().
-#define AUDIO_PRIME_SLOTS 5
+// P99: remember the DirectSound playback slot across an explicit audio
+// restart. SoundOFF/SoundON is used for fullscreen/MMR transitions, so
+// preserving the playback phase avoids forcing the driver back to byte zero.
+static volatile LONG     g_AudioResumePosition = 0L;
+static volatile LONG     g_AudioResumeValid = 0L;
+
+// P93: prime four complete slots (~66.7 ms at 60 Hz) before Play().
+#define AUDIO_PRIME_SLOTS 4
 static volatile LONG     g_AudioPrimeSlots = 0L;
 static volatile LONG     g_AudioPlayPending = 0L;
 static volatile LONG     g_AudioRestartPending = 0L;
 
 // Forward declaration: SoundON() appears before the definition below.
 static double GetEffectiveProducerSampleRate();
+
+// SoundON() is defined before these audio-only sample accumulators.
+extern int sampcycles;
+extern int samppos;
 
 
 void StartAudioCtrlThread() {}
@@ -1275,8 +1285,11 @@ void    Start (void)
         }
 
         // A newly-created secondary buffer always starts at the original
-        // format rate. Clear the cached diagnostic value as well.
+        // format rate. Clear the cached rate so a later SoundON() cannot
+        // accidentally skip SetFrequency() based on a stale previous buffer.
         InterlockedExchange(&g_AudioCurrentFreq, FREQ);
+        InterlockedExchange(&g_AudioResumePosition, 0L);
+        InterlockedExchange(&g_AudioResumeValid, 0L);
 
         EI.DbgOut(Lang::GetString(LANG_MSG_APU_STARTED));
 #endif  /* !NSFPLAYER */
@@ -1346,17 +1359,35 @@ void    SoundOFF (void)
         if (!isEnabled)
                 return;
 
-        // Keep the transition deliberately free of GetCurrentPosition().
-        // Display-mode changes already disturb the Windows audio/graphics
-        // timing domains; adding another audiodg IPC call here can introduce
-        // an avoidable transition stall. The subsequent SoundON() rebuilds a
-        // deterministic DirectSound phase from slot 0 while the buffer is
-        // stopped.
+        // IDirectSoundBuffer::Stop() does not reset the secondary-buffer
+        // playback cursor. Stop first, then read the cursor while the buffer
+        // is no longer advancing; this removes a small race at slot boundaries.
+        LONG resumePos = 0L;
+        BOOL resumeValid = FALSE;
         isEnabled = FALSE;
         InterlockedExchange(&g_AudioPlayPending, 0L);
         InterlockedExchange(&g_AudioPrimeSlots, 0L);
+
         if (Buffer)
+        {
                 Buffer->Stop();
+                if (LockSize > 0)
+                {
+                        DWORD playPos = 0;
+                        if (SUCCEEDED(Buffer->GetCurrentPosition(&playPos, NULL)))
+                        {
+                                DWORD bufferBytes = (DWORD)(LockSize * FRAMEBUF);
+                                if (playPos < bufferBytes)
+                                {
+                                        resumePos = (LONG)((playPos / (DWORD)LockSize) * (DWORD)LockSize);
+                                        resumeValid = TRUE;
+                                }
+                        }
+                }
+        }
+
+        InterlockedExchange(&g_AudioResumePosition, resumePos);
+        InterlockedExchange(&g_AudioResumeValid, resumeValid ? 1L : 0L);
 }
 
 void    SoundON (void)
@@ -1372,30 +1403,53 @@ void    SoundON (void)
                         return;
         }
 
-        // Clear the entire stopped secondary buffer before restarting.
-        // The MMR path then rebuilds a known slot phase from byte zero. This
-        // avoids carrying an arbitrary hardware cursor across an exclusive
-        // fullscreen transition.
+        LONG resumePos = InterlockedExchange(&g_AudioResumePosition, 0L);
+        BOOL resumeValid = (InterlockedExchange(&g_AudioResumeValid, 0L) != 0);
+
+        // Reset only the software sample accumulators. This does not reset any
+        // emulated APU channel state; it simply prevents a partial sample
+        // averaging window from straddling a fullscreen/MMR transition.
+        Cycles = 0;
+        BufPos = 0;
+        sampcycles = 0;
+        samppos = 0;
+
         Try(Buffer->Lock(0, 0, &bufPtr, &bufBytes, NULL, 0, DSBLOCK_ENTIREBUFFER), Lang::GetString(LANG_ERR_APU_BUFFER));
         ZeroMemory(bufPtr, bufBytes);
         Try(Buffer->Unlock(bufPtr, bufBytes, NULL, 0), Lang::GetString(LANG_ERR_APU_BUFFER));
-        Try(Buffer->SetCurrentPosition(0), Lang::GetString(LANG_ERR_APU_BUFFER));
+
+        // DirectSound keeps the secondary-buffer cursor when it is stopped.
+        // Do not call SetCurrentPosition(0) here: moving the cursor during a
+        // mode transition creates an abrupt phase jump that can become audible
+        // as a click/crackle. The slot containing the saved cursor is left as
+        // one silent slot; new audio is then primed starting at the following
+        // slot, with the existing fade-in protecting the restart edge.
+        next_pos = 0;
+        if (resumeValid && LockSize > 0)
+        {
+                DWORD resumeSlot = (DWORD)resumePos / (DWORD)LockSize;
+                if (resumeSlot < (DWORD)FRAMEBUF)
+                        next_pos = (resumeSlot + 1) % FRAMEBUF;
+        }
 
         // Keep the buffer stopped until the initial prime slots have been
-        // copied. The playback rate is established before Play(), and the
-        // first five complete slots provide about 83 ms of lead at 60 Hz.
-        // This absorbs the short 30-Hz/25-ms display-mode disturbances seen
-        // immediately around ChangeDisplaySettingsEx().
+        // copied. The DirectSound playback rate is established while stopped,
+        // then playback starts only after enough audio lead exists.
         isEnabled = TRUE;
         InterlockedExchange(&g_AudioPlayPending, 1L);
         InterlockedExchange(&g_AudioPrimeSlots, 0L);
-        next_pos = 0;
-
-        // Establish the deterministic MMR playback rate while stopped.
-        // The producer cadence is owned by the same target-clock PaceSlot()
-        // below; keeping both on the nominal MMR target avoids a hidden
-        // producer/consumer rate mismatch when the presentation sampler is
-        // noisy during or after a display-mode transition.
+        // Establish the playback rate while the buffer is stopped.
+        // With MMR the whole emulator clock is slowed by targetHz/NESHz, so
+        // the nominal 44100-Hz APU stream must be consumed at the same ratio.
+        // This value is applied only at a SoundOFF/SoundON transition; there
+        // is no runtime SetFrequency worker anymore.
+        // P95: when MMR is active, playback must follow the *actual sample
+        // producer rate* of the slot generator while the emulation clock is
+        // slowed to the monitor cadence.  The slot generator produces 735
+        // samples per ~29830 CPU cycles, so its native-rate stream is slightly
+        // below 44100 Hz; scale that exact producer rate by target/NES-native
+        // clock ratio.  Using raw 44100 Hz here drains the ring while MMR is
+        // running at 60.000 Hz and reproduces the user's delayed crackle.
         double targetHz = MonitorSync::GetTargetHz();
         double nesHz = MonitorSync::GetNESHz();
         DWORD startFreq = FREQ;
@@ -1407,23 +1461,20 @@ void    SoundON (void)
         }
         if (startFreq < 100) startFreq = 100;
         if (startFreq > 100000) startFreq = 100000;
-
-        // Do not rely on a software cache as proof of the driver's current
-        // frequency. A display-mode transition can reconfigure downstream
-        // audio resources without changing our Buffer pointer. Setting the
-        // frequency once for every stopped SoundON establishes the actual
-        // DirectSound state deterministically and is not part of steady-state
-        // frame pacing.
-        Try(Buffer->SetFrequency(startFreq), Lang::GetString(LANG_ERR_APU_BUFFER));
-        InterlockedIncrement(&g_AudioSetFreqCalls);
-        InterlockedExchange(&g_AudioCurrentFreq, (LONG)startFreq);
+        if (InterlockedExchangeAdd(&g_AudioCurrentFreq, 0L) != (LONG)startFreq)
+        {
+                Try(Buffer->SetFrequency(startFreq), Lang::GetString(LANG_ERR_APU_BUFFER));
+                InterlockedIncrement(&g_AudioSetFreqCalls);
+                InterlockedExchange(&g_AudioCurrentFreq, (LONG)startFreq);
+        }
         drc_play_freq = startFreq;
-
         // If the MMR restart request was posted before the DirectSound buffer
-        // existed (cold-start case), SoundON has satisfied it.
+        // existed (the cold-start case), SoundON itself has now satisfied that
+        // request. Do not perform an unnecessary second SoundOFF/SoundON on
+        // the first rendered frame.
         InterlockedExchange(&g_AudioRestartPending, 0L);
-
-        // Invalidate the legacy DS-position cache used only by the non-MMR path.
+        // Invalidate the legacy DS-position cache used only by the non-MMR
+        // path. The MMR path does not consult the consumer cursor.
         InterlockedExchange(&g_DSCacheRpos, -1L);
         InterlockedExchange(&g_DSCacheWpos, -1L);
         InterlockedExchange(&g_DSCacheAge,  99L);
