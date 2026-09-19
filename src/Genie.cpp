@@ -2,7 +2,7 @@
  * Copyright (C) QMT Productions
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "MapperInterface.h"
@@ -374,8 +374,8 @@ int	Load (FILE *in, int version_id)
 	readByte(Code1V);
 
 	readWord(addr);
-	Code3A = addr & 0xFFF;
-	Code3B = addr >> 12;
+	Code2A = addr & 0xFFF;
+	Code2B = addr >> 12;
 	readByte(Code2O);
 	readByte(Code2V);
 

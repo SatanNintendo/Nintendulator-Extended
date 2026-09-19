@@ -2,7 +2,7 @@
  * Copyright (C) QMT Productions
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "Movie.h"
@@ -99,7 +99,7 @@ void    ExpPort_Tablet::Frame (unsigned char mode)
                 MovData[1] = State->PosY;
                 MovData[2] = State->Button;
         }
-        
+
         State->NewBits = 0;
         if (State->Button)
                 State->NewBits |= 0x0001;
@@ -153,7 +153,7 @@ INT_PTR CALLBACK        ExpPort_Tablet_ConfigProc (HWND hDlg, UINT uMsg, WPARAM 
         if (uMsg == WM_INITDIALOG)
         {
                 SetWindowLongPtr(hDlg, GWLP_USERDATA, lParam);
-                
+
                 SetWindowText(hDlg, Lang::GetString(LANG_DLG_CTRL_TABLET));
                 HWND hChild = GetWindow(hDlg, GW_CHILD);
                 while (hChild) {

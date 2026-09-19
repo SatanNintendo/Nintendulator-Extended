@@ -18,7 +18,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "Lang.h"
@@ -389,7 +389,7 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
         HDC hdc;
         PAINTSTRUCT ps;
-        int wmId, wmEvent;
+        int wmId;
         TCHAR FileName[MAX_PATH];
         OPENFILENAME ofn;
         BOOL running = NES::Running;
@@ -398,7 +398,6 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         {
         case WM_COMMAND:
                 wmId = LOWORD(wParam);
-                wmEvent = HIWORD(wParam);
                 // Parse the menu selections:
                 switch (wmId)
                 {
@@ -444,7 +443,8 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         if (GetOpenFileName(&ofn))
                         {
                                 _tcscpy(Path_ROM, FileName);
-                                Path_ROM[ofn.nFileOffset-1] = 0;
+                                if (ofn.nFileOffset > 0)
+                                        Path_ROM[ofn.nFileOffset-1] = 0;
                                 Theme::Reapply();
                                 if (Kaillera::Active)
                                         Kaillera::Disconnect();
@@ -492,7 +492,8 @@ LRESULT CALLBACK WndProc (HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         if (GetOpenFileName(&ofn))
                         {
                                 _tcscpy(Path_ROM, FileName);
-                                Path_ROM[ofn.nFileOffset-1] = 0;
+                                if (ofn.nFileOffset > 0)
+                                        Path_ROM[ofn.nFileOffset-1] = 0;
                                 HeaderEdit::Open(FileName);
                         }
                         // Re-apply theme - GetOpenFileName can reset dark/light mode state
@@ -861,7 +862,7 @@ case ID_SOUND_ENABLED:
         CheckMenuItem(hMenu, ID_SOUND_ENABLED, MF_UNCHECKED);
     }
     break;
-                        
+
                 case ID_SOUND_VOLUME:
                         APU::Config();
                         break;
@@ -1150,8 +1151,6 @@ INT_PTR CALLBACK DebugWnd (HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam
 void AddDebug (const TCHAR *txt)
 {
         int dbglen = GetWindowTextLength(GetDlgItem(hDebug, IDC_DEBUGTEXT));
-//      if (!dbgVisible)
-//              return;
         SendDlgItemMessage(hDebug, IDC_DEBUGTEXT, EM_SETSEL, dbglen, dbglen);
         SendDlgItemMessage(hDebug, IDC_DEBUGTEXT, EM_REPLACESEL, FALSE, (LPARAM)txt);
         dbglen += (int)_tcslen(txt);

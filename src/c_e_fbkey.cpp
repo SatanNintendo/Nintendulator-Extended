@@ -2,7 +2,7 @@
  * Copyright (C) QMT Productions
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "Movie.h"
@@ -102,9 +102,12 @@ unsigned char   ExpPort_FamilyBasicKeyboard::Read1 (void)
 unsigned char   ExpPort_FamilyBasicKeyboard::Read2 (void)
 {
         unsigned char result = 0;
-        if (State->Column)
-                result = (State->Keys[State->Row] & 0xF0) >> 3;
-        else    result = (State->Keys[State->Row] & 0x0F) << 1;
+        if (State->Row < 9)
+        {
+                if (State->Column)
+                        result = (State->Keys[State->Row] & 0xF0) >> 3;
+                else    result = (State->Keys[State->Row] & 0x0F) << 1;
+        }
         return result ^ 0x1E;
 }
 void    ExpPort_FamilyBasicKeyboard::Write (unsigned char Val)
@@ -150,9 +153,11 @@ void    ExpPort_FamilyBasicKeyboard::Config (HWND hWnd)
         {
                 // use hMainWnd instead of hWnd, so it stays open after closing Controller Config
                 ExpPort_FamilyBasicKeyboard_ConfigWindow = CreateDialog(hInst, MAKEINTRESOURCE(IDD_EXPPORT_FBKEY), hMainWnd, ExpPort_FamilyBasicKeyboard_ConfigProc);
-        if (ExpPort_FamilyBasicKeyboard_ConfigWindow)
+                if (ExpPort_FamilyBasicKeyboard_ConfigWindow)
+                {
                         SetWindowText(ExpPort_FamilyBasicKeyboard_ConfigWindow, Lang::GetString(LANG_DLG_CTRL_FBKEY));
-                SetWindowPos(ExpPort_FamilyBasicKeyboard_ConfigWindow, hMainWnd, 0, 0, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE);
+                        SetWindowPos(ExpPort_FamilyBasicKeyboard_ConfigWindow, hMainWnd, 0, 0, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE);
+                }
         }
 }
 void    ExpPort_FamilyBasicKeyboard::SetMasks (void)

@@ -2,7 +2,7 @@
  * Copyright (C) QMT Productions
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "Movie.h"
@@ -72,7 +72,7 @@ void    ExpPort_ArkanoidPaddle::Frame (unsigned char mode)
         int x, i, bits;
         if (mode & MOV_PLAY)
         {
-                State->Pos = MovData[0] | ((MovData[1] << 8) & 0x7F);
+                State->Pos = MovData[0] | ((MovData[1] & 0x7F) << 8);
                 State->Button = MovData[1] >> 7;
         }
         else
@@ -130,7 +130,6 @@ INT_PTR CALLBACK        ExpPort_ArkanoidPaddle_ConfigProc (HWND hDlg, UINT uMsg,
         ExpPort *Cont;
         if (uMsg == WM_INITDIALOG)
         {
-                SetWindowLongPtr(hDlg, GWLP_USERDATA, lParam);
                 SetWindowLongPtr(hDlg, GWLP_USERDATA, lParam);
 
                 SetWindowText(hDlg, Lang::GetString(LANG_DLG_CTRL_ARKPAD));

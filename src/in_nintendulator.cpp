@@ -36,9 +36,6 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 	return TRUE;
 }
 
-// post this to the main window at end of file (after playback as stopped)
-#define WM_WA_MPEG_EOF WM_USER+2
-
 extern In_Module mod;				// the output module (declared near the bottom of this file)
 TCHAR lastfn[MAX_PATH];				// currently playing file (used for getting info on the current file)
 int file_length;				// file length, in bytes
@@ -146,7 +143,7 @@ void	quit (void)
 
 int isourfile(const TCHAR *fn) { return 0; }	// used for detecting URL streams.. unused here. strncmp(fn,"http://",7) to detect HTTP streams, etc
 
-int play(const TCHAR *fn) 
+int play(const TCHAR *fn)
 {
 	int maxlatency;
 	int thread_id;
@@ -170,7 +167,11 @@ int play(const TCHAR *fn)
 	file_length = GetFileSize(input_file, NULL) - 128;
 	// make sure the NSF isn't so large that it overflows the PRG ROM buffer
 	if (file_length > MAX_PRGROM_SIZE * 0x1000)
+	{
+		CloseHandle(input_file);
+		input_file = INVALID_HANDLE_VALUE;
 		return 1;
+	}
 
 	_tcscpy(lastfn, fn);
 	paused=0;
@@ -195,7 +196,15 @@ int play(const TCHAR *fn)
 
 	ReadFile(input_file, Header, 128, &numBytesRead, NULL);
 	if (memcmp(Header, "NESM\x1a\x01", 6))
+	{
+		// Not an NSF file - release the handle and the output
+		// device we already opened before bailing out.
+		CloseHandle(input_file);
+		input_file = INVALID_HANDLE_VALUE;
+		mod.outMod->Close();
+		mod.SAVSADeInit();
 		return 1;
+	}
 
 	RI.Filename = lastfn;
 	RI.ROMType = ROM_NSF;
@@ -265,11 +274,8 @@ void stop() {
 	if (thread_handle != INVALID_HANDLE_VALUE)
 	{
 		killPlayThread = TRUE;
-		if (WaitForSingleObject(thread_handle, INFINITE) == WAIT_TIMEOUT)
-		{
-			MessageBox(mod.hMainWindow, _T("error asking thread to die!"), _T("error killing decode thread"), 0);
-			TerminateThread(thread_handle, 0);
-		}
+		// INFINITE wait - the play thread always honors killPlayThread
+		WaitForSingleObject(thread_handle, INFINITE);
 		CloseHandle(thread_handle);
 		thread_handle = INVALID_HANDLE_VALUE;
 	}
@@ -286,15 +292,15 @@ void stop() {
 	NES::CloseFile();
 }
 
-int getlength() { 
+int getlength() {
 	return -1;	// infinite length
 }
 
-int getoutputtime() { 
-	return decode_pos_ms+(mod.outMod->GetOutputTime()-mod.outMod->GetWrittenTime()); 
+int getoutputtime() {
+	return decode_pos_ms+(mod.outMod->GetOutputTime()-mod.outMod->GetWrittenTime());
 }
 
-void setoutputtime(int time_in_ms) { 
+void setoutputtime(int time_in_ms) {
 }
 
 void setvolume(int volume) { mod.outMod->SetVolume(volume); }
@@ -312,28 +318,28 @@ void getfileinfo(const TCHAR *filename, TCHAR *title, int *length_in_ms)
 	if (!filename || !*filename)  // currently playing file
 	{
 		if (length_in_ms) *length_in_ms=getlength();
-		if (title) 
+		if (title)
 		{
 			TCHAR *p=lastfn+_tcslen(lastfn);
-			while (*p != '\\' && p >= lastfn) p--;
+			while (p >= lastfn && *p != '\\') p--;
 			_tcscpy(title, ++p);
 		}
 	}
 	else // some other file
 	{
-		if (length_in_ms) 
+		if (length_in_ms)
 			*length_in_ms = -1000;
-		if (title) 
+		if (title)
 		{
 			const TCHAR *p=filename+_tcslen(filename);
-			while (*p != _T('\\') && p >= filename) p--;
+			while (p >= filename && *p != _T('\\')) p--;
 			_tcscpy(title, ++p);
 		}
 	}
 }
 
-void eq_set(int on, char data[10], int preamp) 
-{ 
+void eq_set(int on, char data[10], int preamp)
+{
 }
 
 
@@ -365,11 +371,9 @@ DWORD	WINAPI	PlayThread (void *param)
 		}
 	}
 	ExitThread(0);
-// warning C4702: unreachable code
-//	return 0;
 }
 
-In_Module mod = 
+In_Module mod =
 {
 	IN_VER,
 	"Nintendulator NSF Player v0.985",
@@ -392,7 +396,7 @@ In_Module mod =
 	unpause,
 	ispaused,
 	stop,
-	
+
 	getlength,
 	getoutputtime,
 	setoutputtime,

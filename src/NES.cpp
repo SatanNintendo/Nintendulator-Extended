@@ -2,7 +2,7 @@
  * Copyright (C) QMT Productions
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "MapperInterface.h"
@@ -864,7 +864,7 @@ const TCHAR *   OpenFileUNIF (FILE *in)
                                 memcpy(PRGPoint, tPRG[i], RI.UNIF_PRGSize[i]);
                                 PRGPoint += RI.UNIF_PRGSize[i];
                         }
-                        delete tPRG[i];
+                        delete[] tPRG[i];
                 }
                 if (tCHR[i])
                 {
@@ -873,7 +873,7 @@ const TCHAR *   OpenFileUNIF (FILE *in)
                                 memcpy(CHRPoint, tCHR[i], RI.UNIF_CHRSize[i]);
                                 CHRPoint += RI.UNIF_CHRSize[i];
                         }
-                        delete tCHR[i];
+                        delete[] tCHR[i];
                 }
         }
         if (error)
@@ -1245,7 +1245,7 @@ DWORD   WINAPI  Thread (void *param)
                         DoStop |= STOPMODE_NOW;
                 }
         }
-        
+
         while (!(DoStop & STOPMODE_NOW))
         {
 #ifdef  ENABLE_DEBUGGER
@@ -1348,7 +1348,7 @@ void    Stop (void)
         if (!Running)
                 return;
         DoStop = STOPMODE_NOW;
-        
+
         while (Running)
         {
                 ProcessMessages();
@@ -1365,7 +1365,7 @@ void    Pause (BOOL wait)
                 DoStop = STOPMODE_SOFT | STOPMODE_WAIT;
         else
                 DoStop = STOPMODE_SOFT | STOPMODE_NOW;
-        
+
         while (Running)
         {
                 ProcessMessages();
@@ -1420,7 +1420,7 @@ void    MapperConfig (void)
 void    UpdateInterface (void)
 {
         HWND hWnd = hMainWnd;
-        
+
         int w = 256 * SizeMult;
         int h = 240 * SizeMult;
 
@@ -1446,7 +1446,7 @@ void    UpdateInterface (void)
         desktop.top = GetSystemMetrics(SM_YVIRTUALSCREEN);
         desktop.right = desktop.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
         desktop.bottom = desktop.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        
+
         bool moved = false;
         GetWindowRect(hWnd, &window);
         // check right/bottom first, then left/top
@@ -1521,7 +1521,7 @@ void    RelocateSaveData_Progdir (void);
 
 void    LoadSettings (void)
 {
-        HKEY SettingsBase;
+        HKEY SettingsBase = NULL;
         unsigned long Size;
         int PosX, PosY;
         Region MyRegion = REGION_NTSC;
@@ -1626,12 +1626,40 @@ void    LoadSettings (void)
         UpdateInterface();
 }
 
-void    RelocateSaveData_Progdir (void)
+// Move every file matching "<srcDir>\<pattern>" into "<dstDir>\",
+// preserving file names. Shared implementation for the save-data
+// relocation helpers below (identical to the original per-group blocks).
+static void     RelocateFiles (const TCHAR *srcDir, const TCHAR *pattern, const TCHAR *dstDir)
 {
         WIN32_FIND_DATA Data;
+        TCHAR filename[MAX_PATH], oldfile[MAX_PATH], newfile[MAX_PATH];
         HANDLE Handle;
 
+        _stprintf(filename, _T("%s\\%s"), srcDir, pattern);
+        Handle = FindFirstFile(filename, &Data);
+        if (Handle == INVALID_HANDLE_VALUE)
+                return;
+        do
+        {
+                _stprintf(oldfile, _T("%s\\%s"), srcDir, Data.cFileName);
+                _stprintf(newfile, _T("%s\\%s"), dstDir, Data.cFileName);
+                MoveFile(oldfile, newfile);
+        }       while (FindNextFile(Handle, &Data));
+        FindClose(Handle);
+}
+
+// Remove <dir> if it exists and is a directory (best effort - used on
+// emptied relocation source folders).
+static void     RemoveDirIfPresent (const TCHAR *dir)
+{
+        if ((GetFileAttributes(dir) != INVALID_FILE_ATTRIBUTES) && (GetFileAttributes(dir) & FILE_ATTRIBUTE_DIRECTORY))
+                RemoveDirectory(dir);
+}
+
+void    RelocateSaveData_Progdir (void)
+{
         TCHAR filename[MAX_PATH];
+        TCHAR savesDir[MAX_PATH], dstDir[MAX_PATH];
 
         // check if the program's builtin Saves directory is present
         _tcscpy(filename, ProgPath);
@@ -1643,99 +1671,29 @@ void    RelocateSaveData_Progdir (void)
         if (!(GetFileAttributes(filename) & FILE_ATTRIBUTE_DIRECTORY))
                 return;
 
+        // ProgPath always ends with a backslash, so "%sSaves" yields
+        // "C:\...\Saves" without a doubled separator.
+        _stprintf(savesDir, _T("%sSaves"), ProgPath);
+
         // Relocate FDS disk changes
-        _stprintf(filename, _T("%sSaves\\*.fsv"), ProgPath);
-        Handle = FindFirstFile(filename, &Data);
-        if (Handle != INVALID_HANDLE_VALUE)
-        {
-                do
-                {
-                        TCHAR oldfile[MAX_PATH], newfile[MAX_PATH];
-                        _stprintf(oldfile, _T("%sSaves\\%s"), ProgPath, Data.cFileName);
-                        _stprintf(newfile, _T("%s\\FDS\\%s"), DataPath, Data.cFileName);
-                        MoveFile(oldfile, newfile);
-                }       while (FindNextFile(Handle,&Data));
-                FindClose(Handle);
-        }
+        _stprintf(dstDir, _T("%s\\FDS"), DataPath);
+        RelocateFiles(savesDir, _T("*.fsv"), dstDir);
 
         // Relocate SRAM data
-        _stprintf(filename, _T("%sSaves\\*.sav"), ProgPath);
-        Handle = FindFirstFile(filename, &Data);
-        if (Handle != INVALID_HANDLE_VALUE)
-        {
-                do
-                {
-                        TCHAR oldfile[MAX_PATH], newfile[MAX_PATH];
-                        _stprintf(oldfile, _T("%sSaves\\%s"), ProgPath, Data.cFileName);
-                        _stprintf(newfile, _T("%s\\SRAM\\%s"), DataPath, Data.cFileName);
-                        MoveFile(oldfile, newfile);
-                }       while (FindNextFile(Handle,&Data));
-                FindClose(Handle);
-        }
+        _stprintf(dstDir, _T("%s\\SRAM"), DataPath);
+        RelocateFiles(savesDir, _T("*.sav"), dstDir);
 
         // Relocate Savestates
-        _stprintf(filename, _T("%sSaves\\*.ns?"), ProgPath);
-        Handle = FindFirstFile(filename, &Data);
-        if (Handle != INVALID_HANDLE_VALUE)
-        {
-                do
-                {
-                        TCHAR oldfile[MAX_PATH], newfile[MAX_PATH];
-                        _stprintf(oldfile, _T("%sSaves\\%s"), ProgPath, Data.cFileName);
-                        _stprintf(newfile, _T("%s\\States\\%s"), DataPath, Data.cFileName);
-                        MoveFile(oldfile, newfile);
-                }       while (FindNextFile(Handle,&Data));
-                FindClose(Handle);
-        }
+        _stprintf(dstDir, _T("%s\\States"), DataPath);
+        RelocateFiles(savesDir, _T("*.ns?"), dstDir);
 
-        // Relocate Debug dumps - Logfiles
-        _stprintf(filename, _T("%sSaves\\*.debug"), ProgPath);
-        Handle = FindFirstFile(filename, &Data);
-        if (Handle != INVALID_HANDLE_VALUE)
-        {
-                do
-                {
-                        TCHAR oldfile[MAX_PATH], newfile[MAX_PATH];
-                        _stprintf(oldfile, _T("%sSaves\\%s"), ProgPath, Data.cFileName);
-                        _stprintf(newfile, _T("%s\\Dumps\\%s"), DataPath, Data.cFileName);
-                        MoveFile(oldfile, newfile);
-                }       while (FindNextFile(Handle,&Data));
-                FindClose(Handle);
-        }
-
-        // Relocate Debug dumps - CPU dumps
-        _stprintf(filename, _T("%sSaves\\*.cpumem"), ProgPath);
-        Handle = FindFirstFile(filename, &Data);
-        if (Handle != INVALID_HANDLE_VALUE)
-        {
-                do
-                {
-                        TCHAR oldfile[MAX_PATH], newfile[MAX_PATH];
-                        _stprintf(oldfile, _T("%sSaves\\%s"), ProgPath, Data.cFileName);
-                        _stprintf(newfile, _T("%s\\Dumps\\%s"), DataPath, Data.cFileName);
-                        MoveFile(oldfile, newfile);
-                }       while (FindNextFile(Handle,&Data));
-                FindClose(Handle);
-        }
-
-        // Relocate Debug dumps - PPU dumps
-        _stprintf(filename, _T("%sSaves\\*.ppumem"), ProgPath);
-        Handle = FindFirstFile(filename, &Data);
-        if (Handle != INVALID_HANDLE_VALUE)
-        {
-                do
-                {
-                        TCHAR oldfile[MAX_PATH], newfile[MAX_PATH];
-                        _stprintf(oldfile, _T("%sSaves\\%s"), ProgPath, Data.cFileName);
-                        _stprintf(newfile, _T("%s\\Dumps\\%s"), DataPath, Data.cFileName);
-                        MoveFile(oldfile, newfile);
-                }       while (FindNextFile(Handle,&Data));
-                FindClose(Handle);
-        }
+        // Relocate Debug dumps - Logfiles, CPU dumps, PPU dumps
+        _stprintf(dstDir, _T("%s\\Dumps"), DataPath);
+        RelocateFiles(savesDir, _T("*.debug"), dstDir);
+        RelocateFiles(savesDir, _T("*.cpumem"), dstDir);
+        RelocateFiles(savesDir, _T("*.ppumem"), dstDir);
 
         // Finally, try to delete the old Saves directory entirely
-        _tcscpy(filename, ProgPath);
-        PathAppend(filename, _T("Saves"));
         if (RemoveDirectory(filename))
                 EI.DbgOut(_T("Savestate directory successfully relocated"));
         else
@@ -1752,11 +1710,8 @@ void    RelocateSaveData_Progdir (void)
 // In order to properly handle users who used builds during that time period, we need to be able to move the stuff back to Application Data
 void    RelocateSaveData_Mydocs (void)
 {
-        WIN32_FIND_DATA Data;
-        HANDLE Handle;
-
         TCHAR oldPath[MAX_PATH];
-        TCHAR filename[MAX_PATH];
+        TCHAR srcDir[MAX_PATH], dstDir[MAX_PATH];
 
         // look for our folder in My Documents, if it exists
         if (!SUCCEEDED(SHGetFolderPath(NULL, CSIDL_PERSONAL, NULL, 0, oldPath)))
@@ -1770,80 +1725,28 @@ void    RelocateSaveData_Mydocs (void)
                 return;
 
         // Relocate FDS disk changes
-        _stprintf(filename, _T("%s\\FDS\\*"), oldPath);
-        Handle = FindFirstFile(filename, &Data);
-        if (Handle != INVALID_HANDLE_VALUE)
-        {
-                do
-                {
-                        TCHAR oldfile[MAX_PATH], newfile[MAX_PATH];
-                        _stprintf(oldfile, _T("%s\\FDS\\%s"), oldPath, Data.cFileName);
-                        _stprintf(newfile, _T("%s\\FDS\\%s"), DataPath, Data.cFileName);
-                        MoveFile(oldfile, newfile);
-                }       while (FindNextFile(Handle,&Data));
-                FindClose(Handle);
-        }
-        _tcscpy(filename, oldPath);
-        PathAppend(filename, _T("FDS"));
-        if ((GetFileAttributes(filename) != INVALID_FILE_ATTRIBUTES) && (GetFileAttributes(filename) & FILE_ATTRIBUTE_DIRECTORY))
-                RemoveDirectory(filename);
+        _stprintf(srcDir, _T("%s\\FDS"), oldPath);
+        _stprintf(dstDir, _T("%s\\FDS"), DataPath);
+        RelocateFiles(srcDir, _T("*"), dstDir);
+        RemoveDirIfPresent(srcDir);
 
         // Relocate SRAM data
-        _stprintf(filename, _T("%s\\SRAM\\*"), oldPath);
-        Handle = FindFirstFile(filename, &Data);
-        if (Handle != INVALID_HANDLE_VALUE)
-        {
-                do
-                {
-                        TCHAR oldfile[MAX_PATH], newfile[MAX_PATH];
-                        _stprintf(oldfile, _T("%s\\SRAM\\%s"), oldPath, Data.cFileName);
-                        _stprintf(newfile, _T("%s\\SRAM\\%s"), DataPath, Data.cFileName);
-                        MoveFile(oldfile, newfile);
-                }       while (FindNextFile(Handle,&Data));
-                FindClose(Handle);
-        }
-        _tcscpy(filename, oldPath);
-        PathAppend(filename, _T("SRAM"));
-        if ((GetFileAttributes(filename) != INVALID_FILE_ATTRIBUTES) && (GetFileAttributes(filename) & FILE_ATTRIBUTE_DIRECTORY))
-                RemoveDirectory(filename);
+        _stprintf(srcDir, _T("%s\\SRAM"), oldPath);
+        _stprintf(dstDir, _T("%s\\SRAM"), DataPath);
+        RelocateFiles(srcDir, _T("*"), dstDir);
+        RemoveDirIfPresent(srcDir);
 
         // Relocate Savestates
-        _stprintf(filename, _T("%s\\States\\*"), oldPath);
-        Handle = FindFirstFile(filename, &Data);
-        if (Handle != INVALID_HANDLE_VALUE)
-        {
-                do
-                {
-                        TCHAR oldfile[MAX_PATH], newfile[MAX_PATH];
-                        _stprintf(oldfile, _T("%s\\States\\%s"), oldPath, Data.cFileName);
-                        _stprintf(newfile, _T("%s\\States\\%s"), DataPath, Data.cFileName);
-                        MoveFile(oldfile, newfile);
-                }       while (FindNextFile(Handle,&Data));
-                FindClose(Handle);
-        }
-        _tcscpy(filename, oldPath);
-        PathAppend(filename, _T("States"));
-        if ((GetFileAttributes(filename) != INVALID_FILE_ATTRIBUTES) && (GetFileAttributes(filename) & FILE_ATTRIBUTE_DIRECTORY))
-                RemoveDirectory(filename);
+        _stprintf(srcDir, _T("%s\\States"), oldPath);
+        _stprintf(dstDir, _T("%s\\States"), DataPath);
+        RelocateFiles(srcDir, _T("*"), dstDir);
+        RemoveDirIfPresent(srcDir);
 
         // Relocate Debug dumps
-        _stprintf(filename, _T("%s\\Dumps\\*"), oldPath);
-        Handle = FindFirstFile(filename, &Data);
-        if (Handle != INVALID_HANDLE_VALUE)
-        {
-                do
-                {
-                        TCHAR oldfile[MAX_PATH], newfile[MAX_PATH];
-                        _stprintf(oldfile, _T("%s\\Dumps\\%s"), oldPath, Data.cFileName);
-                        _stprintf(newfile, _T("%s\\Dumps\\%s"), DataPath, Data.cFileName);
-                        MoveFile(oldfile, newfile);
-                }       while (FindNextFile(Handle,&Data));
-                FindClose(Handle);
-        }
-        _tcscpy(filename, oldPath);
-        PathAppend(filename, _T("Dumps"));
-        if ((GetFileAttributes(filename) != INVALID_FILE_ATTRIBUTES) && (GetFileAttributes(filename) & FILE_ATTRIBUTE_DIRECTORY))
-                RemoveDirectory(filename);
+        _stprintf(srcDir, _T("%s\\Dumps"), oldPath);
+        _stprintf(dstDir, _T("%s\\Dumps"), DataPath);
+        RelocateFiles(srcDir, _T("*"), dstDir);
+        RemoveDirIfPresent(srcDir);
 
         // Finally, try to delete the old directory from My Documents
         if (RemoveDirectory(oldPath))

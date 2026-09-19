@@ -2,7 +2,7 @@
  * Copyright (C) QMT Productions
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "Movie.h"
@@ -71,7 +71,7 @@ void    StdPort_ArkanoidPaddle::Frame (unsigned char mode)
         int x, i, bits;
         if (mode & MOV_PLAY)
         {
-                State->Pos = MovData[0] | ((MovData[1] << 8) & 0x7F);
+                State->Pos = MovData[0] | ((MovData[1] & 0x7F) << 8);
                 State->Button = MovData[1] >> 7;
         }
         else

@@ -20,7 +20,7 @@
  * timing path.
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "MapperInterface.h"
@@ -28,6 +28,7 @@
 #include "GFX.h"
 #include "NES.h"
 #include "APU.h"
+#include <math.h>               // fabs (GetTargetHz rate comparison)
 #include <dwmapi.h>
 
 // ------------------------------------------------------------------
@@ -824,7 +825,7 @@ static void RecordPaceDiagnostic(LONGLONG targetQPC, LONGLONG wakeQPC, LONG sour
     InterlockedExchange(&g_LastPaceSource, source);
 }
 
-void PaceSlot()
+static void PaceSlot()
 {
     if (g_QPCFreq.QuadPart <= 0)
     {
@@ -991,67 +992,6 @@ LONGLONG GetLastPaceWakeQPC()
 bool WasLastPacePresentationAnchored()
 {
     return InterlockedExchangeAdd(&g_LastPaceSource, 0) != 0;
-}
-
-void NotifyFramePresented(LONGLONG qpcPresented)
-{
-    // Legacy API retained for non-DWM callers. P85 intentionally no longer
-    // uses the return time of DwmFlush() here: that timestamp is a submit/
-    // flush-completion point, not a vblank/composition timestamp.
-    if (qpcPresented <= 0 || g_QPCFreq.QuadPart <= 0)
-        return;
-
-    LONGLONG previous =
-            InterlockedExchange64(&g_LastPresentationQPC, qpcPresented);
-
-    if (previous <= 0 || qpcPresented <= previous)
-    {
-        InterlockedExchange(&g_PresentationClockLocked, FALSE);
-        InterlockedExchange(&g_PresentationSampleStreak, 0);
-        InterlockedExchange64(&g_PresentationAnchorQPC, 0);
-        InterlockedExchange64((volatile LONGLONG*)&g_PresentationAnchorFrame, 0);
-        InterlockedIncrement(&g_PresentationAnchorGeneration);
-        return;
-    }
-
-    const double targetHz = (GetTargetHz() > 0.0) ? GetTargetHz() : 60.0;
-    const LONGLONG nominal =
-            (LONGLONG)((double)g_QPCFreq.QuadPart / targetHz + 0.5);
-    if (nominal <= 0)
-        return;
-
-    LONGLONG delta = qpcPresented - previous;
-    if (delta >= (nominal * 3) / 4 && delta <= (nominal * 5) / 4)
-    {
-        LONGLONG oldPeriod =
-                InterlockedExchangeAdd64(&g_PresentationPeriodQPC, 0);
-        if (oldPeriod <= 0)
-            oldPeriod = delta;
-
-        LONGLONG filtered = oldPeriod + (delta - oldPeriod) / 8;
-        if (filtered <= 0)
-            filtered = delta;
-        InterlockedExchange64(&g_PresentationPeriodQPC, filtered);
-
-        LONG errUs = (LONG)(((delta - nominal) * 1000000LL) /
-                            g_QPCFreq.QuadPart);
-        InterlockedExchange(&g_PresentationIntervalErrUs, errUs);
-
-        LONG hzMilli = (LONG)(((double)g_QPCFreq.QuadPart /
-                               (double)filtered) * 1000.0 + 0.5);
-        InterlockedExchange(&g_PresentationHzMilli, hzMilli);
-    }
-    else
-    {
-        InterlockedExchange(&g_PresentationClockLocked, FALSE);
-        InterlockedExchange(&g_PresentationSampleStreak, 0);
-        InterlockedExchange64(&g_PresentationAnchorQPC, 0);
-        InterlockedExchange64((volatile LONGLONG*)&g_PresentationAnchorFrame, 0);
-        InterlockedIncrement(&g_PresentationAnchorGeneration);
-        InterlockedExchange(&g_PresentationIntervalErrUs,
-                            (LONG)(((delta - nominal) * 1000000LL) /
-                                   g_QPCFreq.QuadPart));
-    }
 }
 
 void NotifyDwmCompositionSample(LONGLONG qpcDisplayed, ULONGLONG dwmFrameDisplayed)

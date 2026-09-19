@@ -8,7 +8,7 @@
 # include "CPU.h"
 # include "APU.h"
 #else	/* !NSFPLAYER */
-# include "stdafx.h"
+# include "StdAfx.h"
 # include "Nintendulator.h"
 # include "MapperInterface.h"
 # include "NES.h"
@@ -17,7 +17,7 @@
 # include "APU.h"
 #endif	/* NSFPLAYER */
 
-#include "Lang.h"   //
+#include "Lang.h"
 
 namespace CPU
 {

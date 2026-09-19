@@ -76,14 +76,6 @@ long    GetAudioSafetyWaits (void);
 long    GetAudioCurrentFreq (void);
 long    GetAudioPlayPending (void);
 long    GetAudioPrimeSlots (void);
-long    GetAudioNotifyActive (void);
-long    GetAudioNotifySignals(void);
-long    GetAudioNotifyPlaySlot(void);
-long    GetAudioNotifyPeriodUs(void);
-
-// Retained as no-op compatibility entry points for older callers.
-void    StartAudioCtrlThread (void);
-void    StopAudioCtrlThread  (void);
 #endif  /* !NSFPLAYER */
 
 int     MAPINT  IntRead (int, int);

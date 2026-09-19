@@ -5,7 +5,6 @@
 #pragma once
 #include <windows.h>
 #include <tchar.h>
-#include <map>
 #include <vector>
 #include <string>
 
@@ -184,7 +183,7 @@ enum LangStringID
     LANG_CONT_CONFIG,
     LANG_CONT_UDLR,
     LANG_CONT_POV,
-    
+
     // ---------- Common Dialogs ----------
     LANG_DLG_OK,
     LANG_DLG_CANCEL,
@@ -212,7 +211,7 @@ enum LangStringID
     LANG_MENU_CPU_FRAMESTEP,
     LANG_MENU_CPU_FRAMESTEP_ENABLED,
     LANG_MENU_CPU_FRAMESTEP_STEP,    
-    
+
     // ---------- Sound Submenu ----------
     LANG_MENU_SOUND_ENABLED,
 

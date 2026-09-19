@@ -31,20 +31,13 @@ namespace Theme
     // Clean up resources (called at shutdown)
     void Destroy(void);
 
-    // Get/set current theme mode
-    Mode GetMode(void);
+    // Set current theme mode
     void SetMode(Mode mode);
-
-    // Toggle between light and dark
-    void Toggle(void);
 
     // Apply theme to a dialog window and all its child controls
     // This subclasses the dialog and all children to handle color messages
     // Also sets the dark title bar attribute on Windows 10+
     void ApplyToDialog(HWND hDlg);
-
-    // Remove theme subclassing from a dialog (called before dialog destruction)
-    void RemoveFromDialog(HWND hDlg);
 
     // Apply theme to the main window background, title bar, and menu
     void ApplyToMainWindow(HWND hWnd);
@@ -72,13 +65,4 @@ namespace Theme
 
     // Check if dark mode is active (convenience)
     bool IsDark(void);
-
-    // Enable/disable dark mode for a specific window (Win10+ API wrapper)
-    void EnableForWindow(HWND hWnd, BOOL enable);
-
-    // Set the dark title bar attribute for a window (Win10+ DWM API)
-    void SetTitleBarDark(HWND hWnd, BOOL dark);
-
-    // Refresh the menu bar to apply dark mode (Win10+)
-    void RefreshMenuBar(void);
 }

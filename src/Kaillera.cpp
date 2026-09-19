@@ -45,7 +45,7 @@
  *    announced in the first exchange and verified by every client.
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "MapperInterface.h"
@@ -274,6 +274,7 @@ static void WINAPI DropCallback (char *nick, int playernb)
         // suffix the player number so it is clear who left
         char caption[320];
         _snprintf(caption, sizeof(caption), "%s (player %i)", nick, playernb);
+        caption[sizeof(caption) - 1] = 0;   // MSVC _snprintf does not NUL-terminate on truncation
         PostFormatted(WM_APP_KAILLERA_DROPPED, caption, "left the game");
 }
 

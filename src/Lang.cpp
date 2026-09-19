@@ -3,12 +3,10 @@
  * src/Lang.cpp
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Lang.h"
 #include "Nintendulator.h"
 #include "resource.h"
-#include <fstream>
-#include <algorithm>
 
 // ============================================================
 // DEFAULT STRINGS (English)
@@ -129,7 +127,7 @@ static const TCHAR *DefaultStrings[LANG_STRING_COUNT] =
     _T("&Config"),
     _T("&Allow simultaneous Left+Right and Up+Down"),
     _T("Configure &POV triggers as 8-way buttons"),
-    
+
     // Controllers
     _T("Unable to initialize keyboard input device!"),
     _T("Unable to set keyboard input data format!"),
@@ -213,7 +211,7 @@ static const TCHAR *DefaultStrings[LANG_STRING_COUNT] =
     _T("Fra&me Step"),
     _T("&Enabled\tCtrl+F"),
     _T("&Step\tSpace"),    
-    
+
     // Sound Submenu
     _T("&Enabled\tCtrl+S"),
 

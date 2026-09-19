@@ -2,7 +2,7 @@
  * Copyright (C) QMT Productions
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "MapperInterface.h"
@@ -41,11 +41,8 @@ void	SetSlot (int Slot)
 	_stprintf(tpchr, _T("%s\\States\\%s.ns%i"), DataPath, BaseFilename, SelSlot);
 	tmp = _tfopen(tpchr, _T("rb"));
 	if (tmp)
-	{
 		fclose(tmp);
-		PrintTitlebar(Lang::GetString(LANG_MSG_STATE_SLOT), Slot);
-	}
-	else	PrintTitlebar(Lang::GetString(LANG_MSG_STATE_SLOT), Slot);
+	PrintTitlebar(Lang::GetString(LANG_MSG_STATE_SLOT), Slot);
 }
 
 int	SaveData (FILE *out)
@@ -165,6 +162,11 @@ void	SaveState (void)
 
 	_stprintf(tps, _T("%s\\States\\%s.ns%i"), DataPath, BaseFilename, SelSlot);
 	out = _tfopen(tps, _T("w+b"));
+	if (!out)
+	{
+		PrintTitlebar(Lang::GetString(LANG_ERR_STATE_SAVE));
+		return;
+	}
 	flen = 0;
 
 	fwrite("NSS\x1A", 1, 4, out);
@@ -218,12 +220,30 @@ BOOL	LoadData (FILE *in, int flen, int version_id)
 		else if (!memcmp(csig, "NPRA", 4))
 		{
 			memset(NES::PRG_RAM, 0, sizeof(NES::PRG_RAM));
-			fread(NES::PRG_RAM, 1, clen, in);	clen = 0;
+			// Clamp the length to the buffer size: a corrupted or
+			// hand-edited savestate must not overflow PRG_RAM.
+			if (clen > (int)sizeof(NES::PRG_RAM))
+			{
+				fread(NES::PRG_RAM, 1, sizeof(NES::PRG_RAM), in);
+				fseek(in, clen - (int)sizeof(NES::PRG_RAM), SEEK_CUR);
+			}
+			else if (clen > 0)
+				fread(NES::PRG_RAM, 1, clen, in);
+			clen = 0;
 		}
 		else if (!memcmp(csig, "NCRA", 4))
 		{
 			memset(NES::CHR_RAM, 0, sizeof(NES::CHR_RAM));
-			fread(NES::CHR_RAM, 1, clen, in);	clen = 0;
+			// Clamp the length to the buffer size: a corrupted or
+			// hand-edited savestate must not overflow CHR_RAM.
+			if (clen > (int)sizeof(NES::CHR_RAM))
+			{
+				fread(NES::CHR_RAM, 1, sizeof(NES::CHR_RAM), in);
+				fseek(in, clen - (int)sizeof(NES::CHR_RAM), SEEK_CUR);
+			}
+			else if (clen > 0)
+				fread(NES::CHR_RAM, 1, clen, in);
+			clen = 0;
 		}
 		else if (!memcmp(csig, "DISK", 4))
 		{
@@ -233,7 +253,9 @@ BOOL	LoadData (FILE *in, int flen, int version_id)
 		}
 		else if (!memcmp(csig, "MAPR", 4))
 		{
-			if ((MI) && (MI->SaveLoad))
+			// Sanity-check the length: a corrupted or hand-edited
+			// savestate must not trigger a giant allocation here.
+			if ((MI) && (MI->SaveLoad) && (clen >= 0) && (clen <= 16 * 1024 * 1024))
 			{
 				unsigned char *tpmi = new unsigned char[clen];
 				fread(tpmi, 1, clen, in);		//	CUST	uint8[...]	Custom mapper data

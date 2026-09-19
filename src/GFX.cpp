@@ -2,7 +2,7 @@
  * Copyright (C) QMT Productions
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "MapperInterface.h"
@@ -14,6 +14,7 @@
 #include "PPU.h"
 #include "AVI.h"
 #include <commctrl.h>
+#include <cstdint>              // uint32_t (GL_DrawFrame frame buffer)
 #include <dwmapi.h>
 #include "Lang.h"
 #include "APU.h"
@@ -115,7 +116,6 @@ LPDIRECTDRAW7           DirectDraw;
 LPDIRECTDRAWSURFACE7    PrimarySurf, SecondarySurf;
 LPDIRECTDRAWCLIPPER     Clipper;
 DDSURFACEDESC2          SurfDesc;
-DWORD                   SurfSize;
 
 // OpenGL - for Bilinear and Integer Scaling
 HGLRC hGLRC = NULL;
@@ -645,7 +645,6 @@ struct FrameTimingEntry {
         LONG     paceSource;// P67: 1=presentation anchor, 0=QPC fallback
         LONGLONG dwmDisplayed;
         LONGLONG dwmVBlank;
-        LONGLONG dwmRefreshPeriod;
         LONGLONG dwmCompose;
         ULONGLONG dwmRefresh;
         ULONGLONG dwmFrame;
@@ -772,7 +771,6 @@ static ULONGLONG s_FQEmuFrameCounter = 0;
 static volatile LONGLONG s_MmrRunEnterQPC = 0, s_MmrPaceEnterQPC = 0, s_MmrPaceWakeQPC = 0;
 static volatile LONGLONG s_MmrPaceCpuWake100ns = 0, s_MmrSafetyBeginQPC = 0, s_MmrSafetyEndQPC = 0;
 static volatile LONGLONG s_MmrPaceCpuWakeCyclesHi = 0;
-static volatile LONG s_MmrPaceCpuWakeCyclesLo = 0;
 static volatile LONG s_MmrSafetyLoops = 0, s_MmrPaceTimerUsed = 0;
 static volatile LONGLONG s_MmrTraceSeq = 0;
 // P81: diagnostic-only timestamps for the frame conversion stage.
@@ -995,7 +993,6 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 // leave the previous frame's values marked as valid.
                 s_diagBuf[idx].dwmDisplayed = 0;
                 s_diagBuf[idx].dwmVBlank = 0;
-                s_diagBuf[idx].dwmRefreshPeriod = 0;
                 s_diagBuf[idx].dwmCompose = 0;
                 s_diagBuf[idx].dwmRefresh = 0;
                 s_diagBuf[idx].dwmFrame = 0;
@@ -1396,24 +1393,6 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
 }
 
 // P54: render thread entry point. Owns the GL context for its lifetime.
-static HANDLE CreateRenderPhaseTimer()
-{
-        typedef HANDLE (WINAPI *PFN_CreateWaitableTimerExW)(
-                LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
-        static const DWORD CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG = 0x00000002;
-
-        PFN_CreateWaitableTimerExW pfnEx = (PFN_CreateWaitableTimerExW)
-                GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
-                               "CreateWaitableTimerExW");
-        HANDLE hTimer = NULL;
-        if (pfnEx)
-                hTimer = pfnEx(NULL, NULL,
-                        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG, TIMER_ALL_ACCESS);
-        if (!hTimer)
-                hTimer = CreateWaitableTimer(NULL, FALSE, NULL);
-        return hTimer;
-}
-
 // P62: phase-aware presentation gate. This is intentionally NOT an independent
 // frame timer: it is anchored to the last real DWM presentation timestamp and
 // the filtered presentation period maintained by MonitorSync. Its only job is
@@ -1468,6 +1447,13 @@ void StartRenderThread(void)
         FQ_Init();
         InterlockedExchange(&s_RenderThreadStop, 0);
         s_RenderThread = CreateThread(NULL, 0, RenderThreadProc, NULL, 0, NULL);
+        if (!s_RenderThread)
+        {
+                // Thread creation failed - release the frame queue instead
+                // of leaving its event handle allocated forever.
+                FQ_Destroy();
+                return;
+        }
         // Wait for the thread to signal it's running (context acquired).
         for (int i = 0; i < 200 && !IsRenderThreadActive(); i++)
                 Sleep(1);
@@ -2080,7 +2066,6 @@ static bool DiagQueryDwmTiming(FrameTimingEntry &e)
 
         e.dwmDisplayed = (LONGLONG)ti.qpcFrameDisplayed;
         e.dwmVBlank = (LONGLONG)ti.qpcVBlank;
-        e.dwmRefreshPeriod = (LONGLONG)ti.qpcRefreshPeriod;
         e.dwmCompose = (LONGLONG)ti.qpcCompose;
         e.dwmRefresh = (ULONGLONG)ti.cRefresh;
         e.dwmFrame = (ULONGLONG)ti.cFrame;
@@ -2124,7 +2109,6 @@ static void GL_DrawFrame(void)
                 s_diagBuf[idx].paceSource = 0;
                 s_diagBuf[idx].dwmDisplayed = 0;
                 s_diagBuf[idx].dwmVBlank = 0;
-                s_diagBuf[idx].dwmRefreshPeriod = 0;
                 s_diagBuf[idx].dwmCompose = 0;
                 s_diagBuf[idx].dwmRefresh = 0;
                 s_diagBuf[idx].dwmFrame = 0;
@@ -2656,35 +2640,17 @@ void    SetRegion (void)
 // restore checkmarks reset by ModifyMenu/SetMenu
 void    SyncMenuChecks (void)
 {
-        if (Bilinear)
-                CheckMenuItem(hMenu, ID_PPU_BILINEAR, MF_CHECKED);
-        else
-                CheckMenuItem(hMenu, ID_PPU_BILINEAR, MF_UNCHECKED);
-
-        if (Scanlines)
-                CheckMenuItem(hMenu, ID_PPU_SCANLINES, MF_CHECKED);
-        else
-                CheckMenuItem(hMenu, ID_PPU_SCANLINES, MF_UNCHECKED);
-
-        if (IntegerScale)
-                CheckMenuItem(hMenu, ID_PPU_INTSCALE, MF_CHECKED);
-        else
-                CheckMenuItem(hMenu, ID_PPU_INTSCALE, MF_UNCHECKED);
-
-        if (MatchMonitorRate)
-                CheckMenuItem(hMenu, ID_PPU_MATCHRATE, MF_CHECKED);
-        else
-                CheckMenuItem(hMenu, ID_PPU_MATCHRATE, MF_UNCHECKED);
-
-        if (AlwaysOnTop)
-                CheckMenuItem(hMenu, ID_PPU_ALWAYSONTOP, MF_CHECKED);
-        else
-                CheckMenuItem(hMenu, ID_PPU_ALWAYSONTOP, MF_UNCHECKED);
-
-        if (ExclusiveFullscreen)
-                CheckMenuItem(hMenu, ID_PPU_EXCLUSIVEFS, MF_CHECKED);
-        else
-                CheckMenuItem(hMenu, ID_PPU_EXCLUSIVEFS, MF_UNCHECKED);
+        // (flag, menu id) pairs - each checkmark follows its flag's state
+        const struct { BOOL on; UINT id; } checks[] = {
+                { Bilinear,            ID_PPU_BILINEAR     },
+                { Scanlines,           ID_PPU_SCANLINES    },
+                { IntegerScale,        ID_PPU_INTSCALE     },
+                { MatchMonitorRate,    ID_PPU_MATCHRATE    },
+                { AlwaysOnTop,         ID_PPU_ALWAYSONTOP  },
+                { ExclusiveFullscreen, ID_PPU_EXCLUSIVEFS  },
+        };
+        for (int i = 0; i < (int)(sizeof(checks) / sizeof(checks[0])); i++)
+                CheckMenuItem(hMenu, checks[i].id, checks[i].on ? MF_CHECKED : MF_UNCHECKED);
 }
 
 void    Start (void)
@@ -3038,13 +3004,6 @@ void    Start (void)
                 else if (ratio < 1.7)
                         i = 2;
                 else    i = 5;
-                if (!widths_ok[0])
-                {
-                        MessageBox(hMainWnd, Lang::GetString(LANG_ERR_GFX_NO_FULLSCREEN_RES), Lang::GetString(LANG_DLG_NINTENDULATOR), MB_OK | MB_ICONERROR);
-                        Fullscreen = FALSE;
-                        Start();
-                        return;
-                }
                 while (1)
                 {
                         FullscreenBorder = (widths[i] - 512) / 2;
@@ -3568,31 +3527,15 @@ void    SetFrameskip (int skip)
                 CheckMenuItem(hMenu, ID_PPU_FRAMESKIP_AUTO, MF_CHECKED);
         else    CheckMenuItem(hMenu, ID_PPU_FRAMESKIP_AUTO, MF_UNCHECKED);
 
-        switch (FSkip)
-        {
-        case 0: CheckMenuRadioItem(hMenu, ID_PPU_FRAMESKIP_0, ID_PPU_FRAMESKIP_9, ID_PPU_FRAMESKIP_0, MF_BYCOMMAND);    break;
-        case 1: CheckMenuRadioItem(hMenu, ID_PPU_FRAMESKIP_0, ID_PPU_FRAMESKIP_9, ID_PPU_FRAMESKIP_1, MF_BYCOMMAND);    break;
-        case 2: CheckMenuRadioItem(hMenu, ID_PPU_FRAMESKIP_0, ID_PPU_FRAMESKIP_9, ID_PPU_FRAMESKIP_2, MF_BYCOMMAND);    break;
-        case 3: CheckMenuRadioItem(hMenu, ID_PPU_FRAMESKIP_0, ID_PPU_FRAMESKIP_9, ID_PPU_FRAMESKIP_3, MF_BYCOMMAND);    break;
-        case 4: CheckMenuRadioItem(hMenu, ID_PPU_FRAMESKIP_0, ID_PPU_FRAMESKIP_9, ID_PPU_FRAMESKIP_4, MF_BYCOMMAND);    break;
-        case 5: CheckMenuRadioItem(hMenu, ID_PPU_FRAMESKIP_0, ID_PPU_FRAMESKIP_9, ID_PPU_FRAMESKIP_5, MF_BYCOMMAND);    break;
-        case 6: CheckMenuRadioItem(hMenu, ID_PPU_FRAMESKIP_0, ID_PPU_FRAMESKIP_9, ID_PPU_FRAMESKIP_6, MF_BYCOMMAND);    break;
-        case 7: CheckMenuRadioItem(hMenu, ID_PPU_FRAMESKIP_0, ID_PPU_FRAMESKIP_9, ID_PPU_FRAMESKIP_7, MF_BYCOMMAND);    break;
-        case 8: CheckMenuRadioItem(hMenu, ID_PPU_FRAMESKIP_0, ID_PPU_FRAMESKIP_9, ID_PPU_FRAMESKIP_8, MF_BYCOMMAND);    break;
-        case 9: CheckMenuRadioItem(hMenu, ID_PPU_FRAMESKIP_0, ID_PPU_FRAMESKIP_9, ID_PPU_FRAMESKIP_9, MF_BYCOMMAND);    break;
-        }
+        // ID_PPU_FRAMESKIP_0 through ID_PPU_FRAMESKIP_9 are consecutive
+        // resource IDs, so the radio item and the enable state can be set
+        // with plain loops instead of ten identical case labels.
+        if ((FSkip >= 0) && (FSkip <= 9))
+                CheckMenuRadioItem(hMenu, ID_PPU_FRAMESKIP_0, ID_PPU_FRAMESKIP_9, ID_PPU_FRAMESKIP_0 + FSkip, MF_BYCOMMAND);
 
+        for (int i = 0; i < 10; i++)
+                EnableMenuItem(hMenu, ID_PPU_FRAMESKIP_0 + i, (forceNoSkip == 0) ? MF_ENABLED : MF_GRAYED);
         EnableMenuItem(hMenu, ID_PPU_FRAMESKIP_AUTO, (forceNoSkip == 0) ? MF_ENABLED : MF_GRAYED);
-        EnableMenuItem(hMenu, ID_PPU_FRAMESKIP_0, (forceNoSkip == 0) ? MF_ENABLED : MF_GRAYED);
-        EnableMenuItem(hMenu, ID_PPU_FRAMESKIP_1, (forceNoSkip == 0) ? MF_ENABLED : MF_GRAYED);
-        EnableMenuItem(hMenu, ID_PPU_FRAMESKIP_2, (forceNoSkip == 0) ? MF_ENABLED : MF_GRAYED);
-        EnableMenuItem(hMenu, ID_PPU_FRAMESKIP_3, (forceNoSkip == 0) ? MF_ENABLED : MF_GRAYED);
-        EnableMenuItem(hMenu, ID_PPU_FRAMESKIP_4, (forceNoSkip == 0) ? MF_ENABLED : MF_GRAYED);
-        EnableMenuItem(hMenu, ID_PPU_FRAMESKIP_5, (forceNoSkip == 0) ? MF_ENABLED : MF_GRAYED);
-        EnableMenuItem(hMenu, ID_PPU_FRAMESKIP_6, (forceNoSkip == 0) ? MF_ENABLED : MF_GRAYED);
-        EnableMenuItem(hMenu, ID_PPU_FRAMESKIP_7, (forceNoSkip == 0) ? MF_ENABLED : MF_GRAYED);
-        EnableMenuItem(hMenu, ID_PPU_FRAMESKIP_8, (forceNoSkip == 0) ? MF_ENABLED : MF_GRAYED);
-        EnableMenuItem(hMenu, ID_PPU_FRAMESKIP_9, (forceNoSkip == 0) ? MF_ENABLED : MF_GRAYED);
 }
 
 // Allow parts of the emulator to forcibly disable frameskip,
@@ -3614,60 +3557,6 @@ BOOL    NeedSkip (void)
         if (forceNoSkip || MatchMonitorRate)
                 return FALSE;
         return FPSCnt < FSkip;
-}
-
-// Helper function: blends two 32-bit colors in proportion t (0..255)
-static inline unsigned long BlendColors32(unsigned long c1, unsigned long c2, int t)
-{
-        int it = 255 - t;
-        unsigned long r = ((c1 >> 16 & 0xFF) * it + (c2 >> 16 & 0xFF) * t) / 255;
-        unsigned long g = ((c1 >>  8 & 0xFF) * it + (c2 >>  8 & 0xFF) * t) / 255;
-        unsigned long b = ((c1       & 0xFF) * it + (c2       & 0xFF) * t) / 255;
-        return (r << 16) | (g << 8) | b;
-}
-
-// Draws NES image with integer multiplier ISMult centered on screen.
-// Remaining area is filled with black. Only works in 32-bit mode.
-void    DrawIntegerScale (void)
-{
-        int x, y;
-        int scrW = ISBorderX * 2 + 256 * ISMult;
-        int scrH = ISBorderY * 2 + 240 * ISMult;
-
-        unsigned long *dst;
-        for (y = 0; y < scrH; y++)
-        {
-                dst = (unsigned long *)((unsigned char *)SurfDesc.lpSurface + y * Pitch);
-
-                // Rows above or below the image - black
-                if (y < ISBorderY || y >= ISBorderY + 240 * ISMult)
-                {
-                        for (x = 0; x < scrW; x++)
-                                *dst++ = 0x000000;
-                        continue;
-                }
-
-                // Which NES row corresponds to this screen row
-                int srcY = (y - ISBorderY) / ISMult;
-
-                // Left black border
-                unsigned short *dstS = (unsigned short *)dst;
-                for (x = 0; x < ISBorderX; x++)
-                        *dstS++ = 0x0000;
-
-                // NES pixels - each repeated ISMult times
-                unsigned short *src = PPU::DrawArray + srcY * 256;
-                for (x = 0; x < 256; x++)
-                {
-                        unsigned long color = Palette32[*src++];
-                        for (int px = 0; px < ISMult; px++)
-                                *dstS++ = (unsigned short)color;
-                }
-
-                // Right black border
-                for (x = ISBorderX + 256 * ISMult; x < scrW; x++)
-                        *dstS++ = 0x0000;
-        }
 }
 
 void    Draw2x (void)
@@ -3816,7 +3705,7 @@ void    Draw1x (void)
         }
         else
         {
-                register unsigned short *dst;
+                unsigned short *dst;
                 for (y = 0; y < 240; y++)
                 {
                         dst = (unsigned short *)((unsigned char *)SurfDesc.lpSurface + y*Pitch);
@@ -3851,7 +3740,7 @@ void    Update (void)
         Try(SecondarySurf->Unlock(NULL), _T("Failed to unlock secondary surface"));
         Repaint();
 }
-        
+
 void    Repaint (void)
 {
         // OpenGL does its own SwapBuffers in GL_DrawFrame
@@ -3919,7 +3808,7 @@ void    GetCursorPos (POINT *pos)
                         pos->y = 0;
                 else    pos->y = pos->y * 240 / (rect.bottom - rect.top);
         }
-        
+
 }
 
 void    SetCursorPos (int x, int y)
@@ -4650,7 +4539,7 @@ INT_PTR CALLBACK        PaletteConfigProc (HWND hDlg, UINT uMsg, WPARAM wParam, 
                 IDC_PAL_30,IDC_PAL_31,IDC_PAL_32,IDC_PAL_33,IDC_PAL_34,IDC_PAL_35,IDC_PAL_36,IDC_PAL_37,IDC_PAL_38,IDC_PAL_39,IDC_PAL_3A,IDC_PAL_3B,IDC_PAL_3C,IDC_PAL_3D,IDC_PAL_3E,IDC_PAL_3F
         };
 
-        int wmId, wmEvent;
+        int wmId;
         OPENFILENAME ofn;
         PAINTSTRUCT ps;
         HDC hdc;
@@ -4722,7 +4611,6 @@ INT_PTR CALLBACK        PaletteConfigProc (HWND hDlg, UINT uMsg, WPARAM wParam, 
                 if (inUpdate)
                         break;
                 wmId    = LOWORD(wParam);
-                wmEvent = HIWORD(wParam);
                 switch (wmId)
                 {
                 case IDC_PAL_NTSC:
@@ -4788,7 +4676,12 @@ INT_PTR CALLBACK        PaletteConfigProc (HWND hDlg, UINT uMsg, WPARAM wParam, 
                         ofn.hInstance = hInst;
                         TCHAR PalFilter[256];
                         TCHAR *pPF = PalFilter;
-                        _tcscpy(pPF, Lang::GetString(LANG_FILTER_PALETTE)); pPF += _tcslen(pPF) + 1;
+                        // Hard cap the localized name so a corrupt language
+                        // file cannot overflow this fixed buffer (the filter
+                        // pattern still needs room behind it).
+                        _tcsncpy(pPF, Lang::GetString(LANG_FILTER_PALETTE), 240);
+                        pPF[240] = 0;
+                        pPF += _tcslen(pPF) + 1;
                         _tcscpy(pPF, _T("*.PAL")); pPF += _tcslen(pPF) + 1;
                         *pPF = 0;
                         ofn.lpstrFilter = PalFilter;
@@ -4807,7 +4700,8 @@ INT_PTR CALLBACK        PaletteConfigProc (HWND hDlg, UINT uMsg, WPARAM wParam, 
                         if (GetOpenFileName(&ofn))
                         {
                                 _tcscpy(Path_PAL, extfn);
-                                Path_PAL[ofn.nFileOffset-1] = 0;
+                                if (ofn.nFileOffset > 0)
+                                        Path_PAL[ofn.nFileOffset-1] = 0;
                                 if (ImportPalette(extfn, TRUE))
                                 {
                                         pal = PALETTE_EXT;

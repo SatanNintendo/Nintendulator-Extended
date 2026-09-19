@@ -11,16 +11,12 @@
  * 4. GDI brushes are maintained and recreated on theme change.
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Theme.h"
 #include "Nintendulator.h"
 #include "resource.h"
-#include "Lang.h"
 #include "Debugger.h"
 #include <commctrl.h>
-
-// Try to import DWM functions (available on Vista+)
-#pragma comment(lib, "dwmapi.lib")
 
 namespace Theme
 {
@@ -118,7 +114,6 @@ namespace Theme
     static HBRUSH hBgBrush       = NULL;
     static HBRUSH hControlBgBrush = NULL;
     static HBRUSH hButtonBgBrush = NULL;
-    static HBRUSH hMenuBgBrush   = NULL;
 
     static void CreateBrushes(void)
     {
@@ -126,12 +121,10 @@ namespace Theme
         if (hBgBrush)        DeleteObject(hBgBrush);
         if (hControlBgBrush) DeleteObject(hControlBgBrush);
         if (hButtonBgBrush)  DeleteObject(hButtonBgBrush);
-        if (hMenuBgBrush)    DeleteObject(hMenuBgBrush);
 
         hBgBrush        = CreateSolidBrush(c.bg);
         hControlBgBrush = CreateSolidBrush(c.controlBg);
         hButtonBgBrush  = CreateSolidBrush(c.buttonBg);
-        hMenuBgBrush    = CreateSolidBrush(c.menuBg);
     }
 
     // ============================================================
@@ -329,14 +322,8 @@ namespace Theme
         if (hBgBrush)        { DeleteObject(hBgBrush);        hBgBrush = NULL; }
         if (hControlBgBrush) { DeleteObject(hControlBgBrush); hControlBgBrush = NULL; }
         if (hButtonBgBrush)  { DeleteObject(hButtonBgBrush);  hButtonBgBrush = NULL; }
-        if (hMenuBgBrush)    { DeleteObject(hMenuBgBrush);    hMenuBgBrush = NULL; }
 
         // Note: Don't free hUxTheme here since other code may still use uxtheme
-    }
-
-    Mode GetMode(void)
-    {
-        return currentMode;
     }
 
     void SetMode(Mode mode)
@@ -345,11 +332,6 @@ namespace Theme
             return;
         currentMode = mode;
         CreateBrushes();
-    }
-
-    void Toggle(void)
-    {
-        SetMode(currentMode == MODE_LIGHT ? MODE_DARK : MODE_LIGHT);
     }
 
     void ApplyToDialog(HWND hDlg)
@@ -380,11 +362,6 @@ namespace Theme
 
             ForceRepaint(hDlg);
         }
-    }
-
-    void RemoveFromDialog(HWND hDlg)
-    {
-        RemoveWindowSubclass(hDlg, ThemeDialogProc, 0);
     }
 
     void ApplyToMainWindow(HWND hWnd)
@@ -516,24 +493,6 @@ namespace Theme
     bool IsDark(void)
     {
         return currentMode == MODE_DARK;
-    }
-
-    void EnableForWindow(HWND hWnd, BOOL enable)
-    {
-        if (darkModeAPIsAvailable)
-            _AllowDarkModeForWindow(hWnd, enable);
-    }
-
-    void SetTitleBarDark(HWND hWnd, BOOL dark)
-    {
-        ApplyTitleBarDark(hWnd, dark);
-    }
-
-    void RefreshMenuBar(void)
-    {
-        if (darkModeAPIsAvailable && _RefreshImmersiveColorPolicyState)
-            _RefreshImmersiveColorPolicyState();
-        DrawMenuBar(hMainWnd);
     }
 
 } // namespace Theme

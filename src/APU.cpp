@@ -8,7 +8,7 @@
 # include "APU.h"
 # include "CPU.h"
 #else   /* !NSFPLAYER */
-# include "stdafx.h"
+# include "StdAfx.h"
 # include "Nintendulator.h"
 # include "resource.h"
 # include "MapperInterface.h"
@@ -166,10 +166,6 @@ static double GetEffectiveProducerSampleRate();
 // SoundON() is defined before these audio-only sample accumulators.
 extern int sampcycles;
 extern int samppos;
-
-
-void StartAudioCtrlThread() {}
-void StopAudioCtrlThread() {}
 
 #endif
 
@@ -1138,7 +1134,12 @@ void    SetRegion (void)
                 Frame::CycleTable = FrameCyclesNTSC;
                 break;
         default:
+#ifdef  NSFPLAYER
+                // The Winamp plugin has no localization module.
+                EI.DbgOut(_T("Invalid APU region selected!"));
+#else   /* !NSFPLAYER */
                 EI.DbgOut(Lang::GetString(LANG_ERR_APU_REGION));
+#endif  /* !NSFPLAYER */
                 break;
         }
 #ifndef NSFPLAYER
@@ -1188,22 +1189,6 @@ long GetAudioPlayPending(void)
 long GetAudioPrimeSlots(void)
 {
         return (long)InterlockedExchangeAdd(&g_AudioPrimeSlots, 0L);
-}
-long GetAudioNotifyActive(void)
-{
-        return 0;
-}
-long GetAudioNotifySignals(void)
-{
-        return 0;
-}
-long GetAudioNotifyPlaySlot(void)
-{
-        return 0;
-}
-long GetAudioNotifyPeriodUs(void)
-{
-        return 0;
 }
 #endif
 
@@ -2001,6 +1986,7 @@ int sampcycles = 0, samppos = 0;
 // sample rate is determined by the integer number of CPU/master cycles per
 // slot. Using that rate for MMR playback removes a small long-term drift
 // without changing any emulated APU timing.
+#ifndef NSFPLAYER
 static double GetEffectiveProducerSampleRate()
 {
         if (MHz == 0 || buflen <= 0)
@@ -2015,6 +2001,7 @@ static double GetEffectiveProducerSampleRate()
 
         return ((double)buflen * (double)MHz) / (double)slotCycles;
 }
+#endif  /* !NSFPLAYER */
 
 // P93: playback-rate changes are applied only by RestartForMonitorSync().
 //
@@ -2421,7 +2408,7 @@ void    Run (void)
         }
 #endif  /* SOUND_FILTERING */
         sampcycles++;
-        
+
         if (NewBufPos != BufPos)
         {
                 BufPos = NewBufPos;

@@ -2,7 +2,7 @@
  * Copyright (C) QMT Productions
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "Movie.h"
@@ -27,7 +27,7 @@ struct StdPort_VSZapper_State
 int     StdPort_VSZapper::Save (FILE *out)
 {
         int clen = 0;
-        
+
         writeByte(State->Bits);
         writeByte(State->BitPtr);
         writeByte(State->Strobe);
@@ -120,7 +120,7 @@ void    StdPort_VSZapper::Write (unsigned char Val)
         State->Strobe = Val & 1;
         if (!State->Strobe)
                 return;
-                
+
         State->Bits = 0x10;
         State->BitPtr = 0;
         if (State->Button)
@@ -164,7 +164,6 @@ INT_PTR CALLBACK        StdPort_VSZapper_ConfigProc (HWND hDlg, UINT uMsg, WPARA
         StdPort *Cont;
         if (uMsg == WM_INITDIALOG)
         {
-                SetWindowLongPtr(hDlg, GWLP_USERDATA, lParam);
                 SetWindowLongPtr(hDlg, GWLP_USERDATA, lParam);
 
                 SetWindowText(hDlg, Lang::GetString(LANG_DLG_CTRL_VSZAPPER));

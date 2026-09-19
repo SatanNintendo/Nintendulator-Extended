@@ -2,7 +2,7 @@
  * Copyright (C) QMT Productions
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include <time.h>
 #include <windowsx.h>
 #include "Nintendulator.h"
@@ -112,7 +112,7 @@ struct tBreakpoint
                 else    _tcscat(desc, Lang::GetString(LANG_DBG_BREAK_DISABLED));
         }
 };
-        
+
 BOOL    Enabled;
 int     Mode;
 
@@ -246,7 +246,7 @@ void    Init (void)
         NTabChanged = PalChanged = PatChanged = SprChanged = DetChanged = FALSE;
         DetailType = DetailNum = 0;
         DetailTypeSave = DetailNumSave = 0;
-        
+
         Logging = FALSE;
         Step = FALSE;
 
@@ -299,6 +299,40 @@ void    Destroy (void)
         StopLogging();
         SetMode(0);
         Breakpoints.clear();
+
+        // Release the debugger's GDI objects (created in Init()).
+        // Deleting the memory DC deselects the bitmap it holds, which
+        // makes the bitmap safe to delete right afterwards.
+        if (PaletteDC)
+        {
+                DeleteDC(PaletteDC);
+                PaletteDC = NULL;
+                DeleteObject(PaletteBMP);
+        }
+        if (PatternDC)
+        {
+                DeleteDC(PatternDC);
+                PatternDC = NULL;
+                DeleteObject(PatternBMP);
+        }
+        if (NameDC)
+        {
+                DeleteDC(NameDC);
+                NameDC = NULL;
+                DeleteObject(NameBMP);
+        }
+        if (SpriteDC)
+        {
+                DeleteDC(SpriteDC);
+                SpriteDC = NULL;
+                DeleteObject(SpriteBMP);
+        }
+        if (TileDC)
+        {
+                DeleteDC(TileDC);
+                TileDC = NULL;
+                DeleteObject(TileBMP);
+        }
 }
 
 void    SetMode (int NewMode)
@@ -353,6 +387,8 @@ void    StartLogging (void)
 
         if (!NES::ROMLoaded)
                 return;
+        if (Logging)   // already logging - don't leak the previous handle
+                return;
 
         time(&aclock);
         newtime = localtime(&aclock);
@@ -360,8 +396,8 @@ void    StartLogging (void)
         _stprintf(filename, _T("%s\\Dumps\\%s.%04i%02i%02i_%02i%02i%02i.debug"), DataPath, States::BaseFilename,
                 newtime->tm_year + 1900, newtime->tm_mon + 1, newtime->tm_mday, newtime->tm_hour, newtime->tm_min, newtime->tm_sec);
 
-        Logging = TRUE;
         LogFile = _tfopen(filename, _T("a+"));
+        Logging = (LogFile != NULL);
 }
 
 void    StopLogging (void)
@@ -1358,7 +1394,7 @@ void    UpdatePPU (void)
                         SetDlgItemText(PPUWnd, IDC_DEBUG_PPU_PROP5TYPE, _T("Offset"));
                         _stprintf(tpstr, _T("%i"), DetailNum & 0x3);
                         SetDlgItemText(PPUWnd, IDC_DEBUG_PPU_PROP5VAL, tpstr);
-                        
+
                         SetDlgItemText(PPUWnd, IDC_DEBUG_PPU_PROP6TYPE, _T(""));
                         SetDlgItemText(PPUWnd, IDC_DEBUG_PPU_PROP6VAL, _T(""));
 
@@ -1429,6 +1465,8 @@ void    DumpCPU (void)
         _stprintf(filename, _T("%s\\Dumps\\%s.%04i%02i%02i_%02i%02i%02i.cpumem"), DataPath, States::BaseFilename, 
                 newtime->tm_year + 1900, newtime->tm_mon + 1, newtime->tm_mday, newtime->tm_hour, newtime->tm_min, newtime->tm_sec);
         out = _tfopen(filename, _T("wb"));
+        if (!out)
+                return;
         fwrite(CPU::RAM, 1, 0x800, out);
         for (i = 4; i < 16; i++)
                 if (CPU::PRGPointer[i])
@@ -1453,6 +1491,8 @@ void    DumpPPU (void)
         _stprintf(filename, _T("%s\\Dumps\\%s.%04i%02i%02i_%02i%02i%02i.ppumem"), DataPath, States::BaseFilename, 
                 newtime->tm_year + 1900, newtime->tm_mon + 1, newtime->tm_mday, newtime->tm_hour, newtime->tm_min, newtime->tm_sec);
         out = _tfopen(filename, _T("wb"));
+        if (!out)
+                return;
         for (i = 0; i < 12; i++)
                 fwrite(PPU::CHRPointer[i], 1, 0x400, out);
         fwrite(PPU::Sprite, 1, 0x100, out);
@@ -1530,7 +1570,7 @@ LRESULT CALLBACK SignedIntegerSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, 
 
 INT_PTR CALLBACK BreakpointProc (HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
-        int wmId, wmEvent;
+        int wmId;
         TCHAR tpc[8];
         struct tBreakpoint *bp = (struct tBreakpoint *)GetWindowLongPtr(hwndDlg, GWLP_USERDATA);
         int line, len, Addr;
@@ -1720,7 +1760,6 @@ INT_PTR CALLBACK BreakpointProc (HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM 
                 return FALSE;
         case WM_COMMAND:
                 wmId    = LOWORD(wParam); 
-                wmEvent = HIWORD(wParam); 
 
                 switch (wmId)
                 {
@@ -2473,7 +2512,7 @@ LRESULT CALLBACK PPUProc_Sprite (HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
 
 INT_PTR CALLBACK PPUProc (HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
-        int wmId, wmEvent;
+        int wmId;
         LPDRAWITEMSTRUCT lpDrawItem;
         static const int dbgRadio[4] = { IDC_DEBUG_PPU_NT0, IDC_DEBUG_PPU_NT1, IDC_DEBUG_PPU_NT2, IDC_DEBUG_PPU_NT3 };
         HWND dlgItem;
@@ -2545,7 +2584,6 @@ INT_PTR CALLBACK PPUProc (HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 break;
         case WM_COMMAND:
                 wmId    = LOWORD(wParam); 
-                wmEvent = HIWORD(wParam); 
 
                 switch (wmId)
                 {

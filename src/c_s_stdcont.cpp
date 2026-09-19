@@ -2,7 +2,7 @@
  * Copyright (C) QMT Productions
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "Movie.h"
@@ -116,7 +116,6 @@ INT_PTR CALLBACK        StdPort_StdController_ConfigProc (HWND hDlg, UINT uMsg, 
         if (uMsg == WM_INITDIALOG)
         {
                 SetWindowLongPtr(hDlg, GWLP_USERDATA, lParam);
-                Cont = (StdPort *)lParam;
                 Cont = (StdPort *)lParam;
 
                 // Dialog localization

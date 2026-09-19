@@ -185,12 +185,6 @@ namespace MonitorSync
         // interval=0 switch actually happened.
         int     GetDwmSyncMode ();
 
-
-        // Legacy/internal monitor-clock wait primitive used by PaceFrame().
-        // P88 no longer calls this from APU::Run; audio-slot generation must
-        // remain independent from the video-frame cadence.
-        void    PaceSlot ();
-
         // Diagnostic-only snapshot of the most recent PaceFrame/PaceSlot timing.
         // These values are observational and are never used to alter pacing.
         // sourcePresentation is TRUE when the presentation-anchored branch
@@ -199,10 +193,6 @@ namespace MonitorSync
         LONGLONG GetLastPaceWakeQPC ();
         bool     WasLastPacePresentationAnchored ();
 
-        // Presentation feedback API used by the timing/header path. The DWM sample
-        // API intentionally alters the existing presentation-anchor state in
-        // PaceSlot() only after the DWM sample qualification succeeds.
-        void    NotifyFramePresented (LONGLONG qpcPresented);
         // P85: feed a uniquely identified DWM composition sample into the
         // presentation clock. The DWM frame id prevents duplicate sampled
         // snapshots from being mistaken for new presentation timestamps.

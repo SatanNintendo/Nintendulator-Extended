@@ -2,7 +2,7 @@
  * Copyright (C) QMT Productions
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "Movie.h"
@@ -63,7 +63,7 @@ int     StdPort_PowerPad::Load (FILE *in, int version_id)
         readByte(State->Strobe);
         readByte(State->NewBit1);
         readByte(State->NewBit2);
-        
+
         return clen;
 }
 void    StdPort_PowerPad::Frame (unsigned char mode)
@@ -132,7 +132,6 @@ INT_PTR CALLBACK        StdPort_PowerPad_ConfigProc (HWND hDlg, UINT uMsg, WPARA
         StdPort *Cont;
         if (uMsg == WM_INITDIALOG)
         {
-                SetWindowLongPtr(hDlg, GWLP_USERDATA, lParam);
                 SetWindowLongPtr(hDlg, GWLP_USERDATA, lParam);
 
                 SetWindowText(hDlg, Lang::GetString(LANG_DLG_CTRL_POWERPAD));

@@ -7,7 +7,7 @@
 # include "MapperInterface.h"
 # include "CPU.h"
 #else   /* !NSFPLAYER */
-# include "stdafx.h"
+# include "StdAfx.h"
 # include "Nintendulator.h"
 # include "resource.h"
 # include "MapperInterface.h"
@@ -136,8 +136,6 @@ FPPUWrite       MAPINT  GetPPUWriteHandler (int Page)
 
 void    MAPINT  SetPRG_ROM4 (int Bank, int Val)
 {
-//      if (!NES::PRGSizeROM)
-//              return;
         CPU::PRGPointer[Bank] = NES::PRG_ROM[Val & NES::PRGMaskROM];
         CPU::Readable[Bank] = TRUE;
         CPU::Writable[Bank] = FALSE;
@@ -527,12 +525,16 @@ void    MAPINT  StatusOut (const TCHAR *text, ...)
 
 /******************************************************************************/
 
+#ifndef NSFPLAYER
+// Localized mapper-compatibility labels (used by NES.cpp and the DLL
+// selection dialog). The Winamp plugin build has no localization module.
 const TCHAR *CompatLevel[COMPAT_NUMTYPES] = {
     Lang::GetString(LANG_COMPAT_UNSUPPORTED),
     Lang::GetString(LANG_COMPAT_PARTIAL),
     Lang::GetString(LANG_COMPAT_MOSTLY),
     Lang::GetString(LANG_COMPAT_FULL)
 };
+#endif  /* !NSFPLAYER */
 
 void    Init (void)
 {
@@ -600,19 +602,25 @@ void    Init (void)
                         DI = LoadDLL(mod.hMainWindow, &EI, CurrentMapperInterface);
                         if (!DI)
                         {
-                                MessageBox(mod.hMainWindow, Lang::GetString(LANG_ERR_MAPPER_DLL_VERSION), Lang::GetString(LANG_DLG_NINTENDULATOR), MB_OK | MB_ICONERROR);
+                                // The Winamp plugin has no localization module,
+                                // so these errors are plain English.
+                                MessageBox(mod.hMainWindow, _T("Incorrect NSF mapper DLL version!"), _T("in_nintendulator"), MB_OK | MB_ICONERROR);
                                 FreeLibrary(dInst);
                                 dInst = NULL;
+                                LoadDLL = NULL;
+                                UnloadDLL = NULL;
                         }
                 }
                 else
                 {
-                        MessageBox(mod.hMainWindow, Lang::GetString(LANG_ERR_MAPPER_DLL_LOAD), Lang::GetString(LANG_DLG_NINTENDULATOR), MB_OK | MB_ICONERROR);
+                        MessageBox(mod.hMainWindow, _T("Error loading NSF mapper DLL!"), _T("in_nintendulator"), MB_OK | MB_ICONERROR);
                         FreeLibrary(dInst);
                         dInst = NULL;
+                        LoadDLL = NULL;
+                        UnloadDLL = NULL;
                 }
         }
-        else    MessageBox(mod.hMainWindow, Lang::GetString(LANG_ERR_MAPPER_DLL_LOAD), Lang::GetString(LANG_DLG_NINTENDULATOR), MB_OK | MB_ICONERROR);
+        else    MessageBox(mod.hMainWindow, _T("Error loading NSF mapper DLL!"), _T("in_nintendulator"), MB_OK | MB_ICONERROR);
 #endif  /* !NSFPLAYER */
         ZeroMemory(&EI, sizeof(EI));
         ZeroMemory(&RI, sizeof(RI));
@@ -862,9 +870,18 @@ void    Destroy (void)
                 ThisDLL = MapperDLLs;
         }
 #else   /* NSFPLAYER */
+        // Guard against a partially-initialized plugin: if LoadLibrary or
+        // the export resolution failed in Init(), the pointers are stale.
         DI = NULL;
-        UnloadDLL();
-        FreeLibrary(dInst);
+        if (dInst)
+        {
+                if (UnloadDLL)
+                        UnloadDLL();
+                FreeLibrary(dInst);
+                dInst = NULL;
+        }
+        LoadDLL = NULL;
+        UnloadDLL = NULL;
 #endif  /* !NSFPLAYER */
 }
 } // namespace MapperInterface

@@ -3,7 +3,7 @@
  */
 
 #include "Lang.h"
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "MapperInterface.h"
@@ -61,7 +61,7 @@ INT_PTR CALLBACK        MoviePlayProc (HWND hDlg, UINT uMsg, WPARAM wParam, LPAR
         TCHAR filename[MAX_PATH] = {0};
         int len;
         int version_id = 0;
-        int wmId, wmEvent;
+        int wmId;
         BOOL resume;
         unsigned char tvmode;
 
@@ -96,8 +96,7 @@ INT_PTR CALLBACK        MoviePlayProc (HWND hDlg, UINT uMsg, WPARAM wParam, LPAR
                 Theme::ApplyToDialog(hDlg);
                 return TRUE;
         case WM_COMMAND:
-                wmId    = LOWORD(wParam); 
-                wmEvent = HIWORD(wParam); 
+                wmId    = LOWORD(wParam);
                 switch (wmId)
                 {
                 case IDC_MOVIE_PLAY_BROWSE: {
@@ -189,10 +188,11 @@ INT_PTR CALLBACK        MoviePlayProc (HWND hDlg, UINT uMsg, WPARAM wParam, LPAR
                                 fread(desc, len, 1, Data);
 #ifdef  UNICODE
                                 len2 = MultiByteToWideChar(CP_UTF8, 0, desc, len, NULL, 0);
-                                Description = new TCHAR[len2];
+                                Description = new TCHAR[len2 + 1];
                                 if (Description)
                                 {
                                         MultiByteToWideChar(CP_UTF8, 0, desc, len, Description, len2);
+                                        Description[len2] = 0;
                                         SetDlgItemText(hDlg, IDC_MOVIE_PLAY_DESCRIPTION, Description);
                                         delete[] Description;
                                         Description = NULL;
@@ -334,7 +334,7 @@ void    Play (void)
         Mode = MOV_PLAY;
         if (resume)
                 Mode |= MOV_REVIEW;
-        
+
         FindBlock();
 
         fread(buf, 1, 4, Data);
@@ -356,7 +356,7 @@ void    Play (void)
                                 SET_STDCONT(Controllers::FSPort4, Controllers::STD_STDCONTROLLER);
                         else    SET_STDCONT(Controllers::FSPort4, Controllers::STD_UNCONNECTED);
                         SET_STDCONT(Controllers::Port1, Controllers::STD_FOURSCORE);
-                        SET_STDCONT(Controllers::Port2, Controllers::STD_FOURSCORE);
+                        SET_STDCONT(Controllers::Port2, Controllers::STD_FOURSCORE2);
                 }
                 else
                 {
@@ -382,10 +382,11 @@ void    Play (void)
                 fread(desc, len, 1, Data);
 #ifdef  UNICODE
                 len2 = MultiByteToWideChar(CP_UTF8, 0, desc, len, NULL, 0);
-                Description = new TCHAR[len2];
+                Description = new TCHAR[len2 + 1];
                 if (Description)
                 {
                         MultiByteToWideChar(CP_UTF8, 0, desc, len, Description, len2);
+                        Description[len2] = 0;
                         EI.DbgOut(_T("Description: \"%s\""), Description);
                         delete[] Description;
                         Description = NULL;
@@ -419,8 +420,7 @@ INT_PTR CALLBACK        MovieRecordProc (HWND hDlg, UINT uMsg, WPARAM wParam, LP
 {
         OPENFILENAME ofn;
         TCHAR filename[MAX_PATH] = {0};
-        int wmId, wmEvent;
-        int error;
+        int wmId;
 
         switch (uMsg)
         {
@@ -476,8 +476,7 @@ INT_PTR CALLBACK        MovieRecordProc (HWND hDlg, UINT uMsg, WPARAM wParam, LP
                 Theme::ApplyToDialog(hDlg);
                 return TRUE;
         case WM_COMMAND:
-                wmId    = LOWORD(wParam); 
-                wmEvent = HIWORD(wParam); 
+                wmId    = LOWORD(wParam);
                 switch (wmId)
                 {
                 case IDC_MOVIE_RECORD_BROWSE: {
@@ -505,13 +504,11 @@ INT_PTR CALLBACK        MovieRecordProc (HWND hDlg, UINT uMsg, WPARAM wParam, LP
                         ofn.lpTemplateName = NULL;
 
                         if (!GetSaveFileName(&ofn))
-                        {
-                                error = CommDlgExtendedError();
                                 break;
-                        }
 
                         _tcscpy(Path_NMV, filename);
-                        Path_NMV[ofn.nFileOffset-1] = 0;
+                        if (ofn.nFileOffset > 0)
+                                Path_NMV[ofn.nFileOffset-1] = 0;
                         SetDlgItemText(hDlg, IDC_MOVIE_RECORD_FILE, filename);
                         return TRUE;
                 }
@@ -594,7 +591,7 @@ void    Record (void)
 
         if ((MI) && (MI->Config) && (!NES::HasMenu))
                 EnableMenuItem(hMenu, ID_GAME, MF_GRAYED);
-        
+
         len = 0;
         ReRecords = 0;
         Pos = Len = 0;
@@ -624,7 +621,7 @@ void    Record (void)
 
         fwrite("NMOV", 1, 4, Data);
         fwrite(&len, 1, 4, Data);
-        
+
         ControllerTypes[0] = (unsigned char)Controllers::Port1->Type;
         ControllerTypes[1] = (unsigned char)Controllers::Port2->Type;
         ControllerTypes[2] = (unsigned char)Controllers::PortExp->Type;
@@ -839,7 +836,7 @@ int     Save (FILE *out)
         offset = ftell(Data);   // save old offset in movie file
 
         FindBlock();
- 
+
         fread(&tpc, 1, 1, Data);        writeByte(tpc);
         fread(&tpc, 1, 1, Data);        writeByte(tpc);
         fread(&tpc, 1, 1, Data);        writeByte(tpc);
@@ -856,7 +853,7 @@ int     Save (FILE *out)
         }
 
         fread(&tpl, 4, 1, Data);        writeLong(Pos);         // the MLEN field, which is NOT yet accurate
-        
+
         tpi = Pos;
         while (tpi > 0)
         {
@@ -882,7 +879,6 @@ int     Load (FILE *in, int version_id)
         if (Mode & MOV_RECORD)
         {       // zoom to the correct position and update the necessary fields along the way
                 FindBlock();
-                fseek(Data,0,SEEK_CUR);
                 readLong(tpl);  fwrite(&tpl, 4, 1, Data);       // CTRL0, CTRL1, CTEXT, EXTR
                 readLong(tpl);  fwrite(&tpl, 4, 1, Data);       // RREC
                 if (ReRecords < (int)tpl)

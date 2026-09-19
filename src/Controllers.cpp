@@ -2,44 +2,15 @@
  * Copyright (C) QMT Productions
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "MapperInterface.h"
 #include "Lang.h"
 #include "Theme.h"
-static void LocalizeControllerDialog(HWND hDlg, LangStringID caption,
-    LangStringID grp1, LangStringID grp2)
-{
-    SetWindowText(hDlg, Lang::GetString(caption));
-    // Groups - IDC_STATIC, iterate through all child windows
-    HWND hChild = GetWindow(hDlg, GW_CHILD);
-    int groupIdx = 0;
-    while (hChild)
-    {
-        TCHAR cls[32];
-        GetClassName(hChild, cls, 32);
-        if (_tcscmp(cls, _T("Button")) == 0)
-        {
-            TCHAR txt[64];
-            GetWindowText(hChild, txt, 64);
-            LONG style = GetWindowLong(hChild, GWL_STYLE);
-            if ((style & BS_GROUPBOX) == BS_GROUPBOX)
-            {
-                if (groupIdx == 0 && grp1 != LANG_STRING_COUNT)
-                    SetWindowText(hChild, Lang::GetString(grp1));
-                else if (groupIdx == 1 && grp2 != LANG_STRING_COUNT)
-                    SetWindowText(hChild, Lang::GetString(grp2));
-                groupIdx++;
-            }
-        }
-        hChild = GetWindow(hChild, GW_HWNDNEXT);
-    }
-}
 #include "Movie.h"
 #include "Controllers.h"
 #include "Kaillera.h"
-#include <commdlg.h>
 
 #pragma comment(lib, "dinput8.lib")
 #pragma comment(lib, "dxguid.lib")
@@ -408,7 +379,6 @@ BOOL CALLBACK   EnumJoystickObjectsCallback (LPCDIDEVICEOBJECTINSTANCE lpddoi, L
         }
         if (IsEqualGUID(lpddoi->guidType, GUID_Slider))
         {
-                // ItemNum = DIDFT_GETINSTANCE(lpddoi->dwType);
                 // Sliders are enumerated as axes, and this index
                 // starts where the other axes left off
                 // Thus, we need to ignore it and assign them incrementally
@@ -451,6 +421,8 @@ BOOL CALLBACK   EnumJoysticksCallback (LPCDIDEVICEINSTANCE lpddi, LPVOID pvRef)
 {
         HRESULT hr;
         int DevNum = NumDevices;
+        if (DevNum >= MAX_CONTROLLERS)
+                return DIENUM_STOP;     // no room for more devices
         TDeviceInfo &dev = Devices[DevNum];
         do
         {
@@ -561,7 +533,7 @@ BOOL    InitMouse (void)
 void    Init (void)
 {
         int i;
-        
+
         for (i = 0; i < MAX_CONTROLLERS; i++)
         {
                 TDeviceInfo &dev = Devices[i];
@@ -575,6 +547,7 @@ void    Init (void)
                 dev.NumButtons = 0;
                 dev.AxisFlags = 0;
                 dev.POVFlags = 0;
+                dev.NextAcquireRetryFrame = 0;
                 ZeroMemory(dev.ButtonNames, sizeof(dev.ButtonNames));
                 ZeroMemory(dev.AxisNames, sizeof(dev.AxisNames));
                 ZeroMemory(dev.POVNames, sizeof(dev.POVNames));
@@ -598,7 +571,7 @@ void    Init (void)
         FSPort3 = new StdPort_Unconnected(FSPort3_Buttons);
         FSPort4 = new StdPort_Unconnected(FSPort4_Buttons);
         PortExp = new ExpPort_Unconnected(PortExp_Buttons);
-        
+
         if (FAILED(DirectInput8Create(hInst, DIRECTINPUT_VERSION, IID_IDirectInput8, (LPVOID *)&DirectInput, NULL)))
         {
                 MessageBox(hMainWnd, Lang::GetString(LANG_ERR_CTRL_DEVICE_LEVEL), Lang::GetString(LANG_DLG_NINTENDULATOR), MB_OK | MB_ICONERROR);
@@ -659,8 +632,11 @@ void    Destroy (void)
                 }
         }
 
-        DirectInput->Release();
-        DirectInput = NULL;
+        if (DirectInput)
+        {
+                DirectInput->Release();
+                DirectInput = NULL;
+        }
 }
 
 void    Write (unsigned char Val)
@@ -806,7 +782,7 @@ void    LoadSettings (HKEY SettingsBase)
         if (Port1T == STD_FOURSCORE)
         {
                 SET_STDCONT(Port1, STD_FOURSCORE);
-                SET_STDCONT(Port1, STD_FOURSCORE2);
+                SET_STDCONT(Port2, STD_FOURSCORE2);
         }
         else
         {
@@ -843,7 +819,7 @@ void    LoadSettings (HKEY SettingsBase)
                         memcpy(&map_nums[i], b, sizeof(DWORD)); b += sizeof(DWORD);
                         memcpy(&map_guids[i], b, sizeof(GUID)); b += sizeof(GUID);
                 }
-                
+
                 int Lens[7] = { Port1->NumButtons, Port2->NumButtons, FSPort1->NumButtons, FSPort2->NumButtons, FSPort3->NumButtons, FSPort4->NumButtons, PortExp->NumButtons };
                 DWORD *Datas[7] = { Port1_Buttons, Port2_Buttons, FSPort1_Buttons, FSPort2_Buttons, FSPort3_Buttons, FSPort4_Buttons, PortExp_Buttons };
                 TCHAR *Descs[7] = { _T("Port 1"), _T("Port 2"), _T("Four-score Port 1"), _T("Four-score Port 2"), _T("Four-score Port 3"), _T("Four-score Port 4"), _T("Expansion Port") };
@@ -929,7 +905,7 @@ void    Acquire (void)
 {
         int i;
         for (i = 0; i < NumDevices; i++)
-                if (Devices[i].Used)
+                if (Devices[i].Used && Devices[i].DIDevice)
                         Devices[i].DIDevice->Acquire();
         Port1->SetMasks();
         Port2->SetMasks();
@@ -959,7 +935,7 @@ void    UnAcquire (void)
 {
         int i;
         for (i = 0; i < NumDevices; i++)
-                if (Devices[i].Used)
+                if (Devices[i].Used && Devices[i].DIDevice)
                         Devices[i].DIDevice->Unacquire();
         if (MaskMouse)
         {
@@ -1029,7 +1005,7 @@ void    UpdateInput (void)
         for (i = 0; i < NumDevices; i++)
         {
                 TDeviceInfo &dev = Devices[i];
-                if (!dev.Used)
+                if (!dev.Used || !dev.DIDevice)
                         continue;
                 if (i == 0)
                 {
@@ -1246,10 +1222,7 @@ int     GetConfigButton (HWND hWnd, int DevNum, BOOL AxesOnly = FALSE)
         }
         dev.DIDevice->Unacquire();
         if (FAILED(dev.DIDevice->SetCooperativeLevel(hMainWnd, DISCL_FOREGROUND | DISCL_NONEXCLUSIVE)))
-        {
                 MessageBox(hMainWnd, Lang::GetString(LANG_ERR_CTRL_DEVICE_RESTORE), Lang::GetString(LANG_DLG_NINTENDULATOR), MB_OK | MB_ICONERROR);
-                return Key;
-        }
         return Key;
 }
 
@@ -1489,7 +1462,7 @@ INT_PTR ParseConfigMessages (HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam,
                         for (j = 1; j < NumDevices; j++)
                                 SendDlgItemMessage(hDlg, dlgDevices[i], CB_ADDSTRING, 0, (LPARAM)Devices[j].Name);      // add each device
                         SendDlgItemMessage(hDlg, dlgDevices[i], CB_SETCURSEL, Buttons[i] >> 16, 0);     // select the one we want
-                        ConfigButton(&Buttons[i], Buttons[i] >> 16, GetDlgItem(hDlg, dlgButtons[i]), FALSE, i >= numAxes);
+                        ConfigButton(&Buttons[i], Buttons[i] >> 16, GetDlgItem(hDlg, dlgButtons[i]), FALSE, i >= numButtons);
                 }
                 SetDlgItemText(hDlg, IDOK, Lang::GetString(LANG_DLG_OK));
                 Theme::ApplyToDialog(hDlg);

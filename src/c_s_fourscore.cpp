@@ -2,7 +2,7 @@
  * Copyright (C) QMT Productions
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "Movie.h"
@@ -88,7 +88,7 @@ int     StdPort_FourScore2::Load (FILE *in, int version_id)
 
         return clen;
 }
-void    AllocMov1 (StdPort *Cont)
+static void     AllocMov1 (StdPort *Cont)
 {
         if (Cont->MovData)
                 delete[] Cont->MovData;
@@ -96,7 +96,7 @@ void    AllocMov1 (StdPort *Cont)
         Cont->MovData = new unsigned char[Cont->MovLen];
         ZeroMemory(Cont->MovData, Cont->MovLen);
 }
-void    AllocMov2 (StdPort *Cont)
+static void     AllocMov2 (StdPort *Cont)
 {
         if (Cont->MovData)
                 delete[] Cont->MovData;
@@ -109,19 +109,23 @@ void    StdPort_FourScore::Frame (unsigned char mode)
         int x, y = 0;
         if (mode & MOV_PLAY)
         {
+                // Playback: the movie file fills the wrapper's MovData,
+                // which is then distributed to each sub-port.
                 for (x = 0; x < FSPort1->MovLen; x++, y++)
-                        MovData[y] = FSPort1->MovData[x];
+                        FSPort1->MovData[x] = MovData[y];
                 for (x = 0; x < FSPort3->MovLen; x++, y++)
-                        MovData[y] = FSPort3->MovData[x];
+                        FSPort3->MovData[x] = MovData[y];
         }
         FSPort1->Frame(mode);
         FSPort3->Frame(mode);
         if (mode & MOV_RECORD)
         {
+                // Recording: each sub-port produced its own MovData,
+                // which is merged into the wrapper's MovData for saving.
                 for (x = 0; x < FSPort1->MovLen; x++, y++)
-                        FSPort1->MovData[x] = MovData[y];
+                        MovData[y] = FSPort1->MovData[x];
                 for (x = 0; x < FSPort3->MovLen; x++, y++)
-                        FSPort3->MovData[x] = MovData[y];
+                        MovData[y] = FSPort3->MovData[x];
         }
 }
 void    StdPort_FourScore2::Frame (unsigned char mode)
@@ -129,19 +133,23 @@ void    StdPort_FourScore2::Frame (unsigned char mode)
         int x, y = 0;
         if (mode & MOV_PLAY)
         {
+                // Playback: the movie file fills the wrapper's MovData,
+                // which is then distributed to each sub-port.
                 for (x = 0; x < FSPort2->MovLen; x++, y++)
-                        MovData[y] = FSPort2->MovData[x];
+                        FSPort2->MovData[x] = MovData[y];
                 for (x = 0; x < FSPort4->MovLen; x++, y++)
-                        MovData[y] = FSPort4->MovData[x];
+                        FSPort4->MovData[x] = MovData[y];
         }
         FSPort2->Frame(mode);
         FSPort4->Frame(mode);
         if (mode & MOV_RECORD)
         {
+                // Recording: each sub-port produced its own MovData,
+                // which is merged into the wrapper's MovData for saving.
                 for (x = 0; x < FSPort2->MovLen; x++, y++)
-                        FSPort2->MovData[x] = MovData[y];
+                        MovData[y] = FSPort2->MovData[x];
                 for (x = 0; x < FSPort4->MovLen; x++, y++)
-                        FSPort4->MovData[x] = MovData[y];
+                        MovData[y] = FSPort4->MovData[x];
         }
 }
 unsigned char   StdPort_FourScore::Read (void)

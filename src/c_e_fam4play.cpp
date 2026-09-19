@@ -2,7 +2,7 @@
  * Copyright (C) QMT Productions
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "resource.h"
 #include "Movie.h"
@@ -158,7 +158,6 @@ INT_PTR CALLBACK        ExpPort_Fami4Play_ConfigProc (HWND hDlg, UINT uMsg, WPAR
         ExpPort *Cont;
         if (uMsg == WM_INITDIALOG)
         {
-                SetWindowLongPtr(hDlg, GWLP_USERDATA, lParam);
                 SetWindowLongPtr(hDlg, GWLP_USERDATA, lParam);
 
                 SetWindowText(hDlg, Lang::GetString(LANG_DLG_CTRL_FAMI4PLAY));

@@ -2,7 +2,7 @@
  * Copyright (C) QMT Productions
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "MapperInterface.h"
 #include "NES.h"
@@ -171,8 +171,6 @@ int	MAPINT	ReadUnsafe (int Bank, int Addr)
 
 int	MAPINT	BusRead (int Bank, int Addr)
 {
-//	if (!Readable[Bank])
-//		return Addr & 0xFF;
 	return CHRPointer[Bank][Addr];
 }
 
@@ -523,7 +521,7 @@ inline void IncrementV ()
 {
 	if ((VRAMAddr & 0x7000) == 0x7000)
 	{
-		register int YScroll = VRAMAddr & 0x3E0;
+		int YScroll = VRAMAddr & 0x3E0;
 		VRAMAddr &= 0xFFF;
 		if (YScroll == 0x3A0)
 			VRAMAddr ^= 0xBA0;
@@ -547,14 +545,14 @@ unsigned char RenderData[4];
 
 void	RunNoSkip (int NumTicks)
 {
-	register unsigned long TL;
-	register unsigned char TC;
+	unsigned long TL;
+	unsigned char TC;
 
-	register int SprNum;
-	register unsigned char SprSL;
-	register unsigned char *CurTileData;
+	int SprNum;
+	unsigned char SprSL;
+	unsigned char *CurTileData;
 
-	register int i, y;
+	int i, y;
 	for (i = 0; i < NumTicks; i++)
 	{
 		if (Spr0Hit)
@@ -836,15 +834,15 @@ void	RunNoSkip (int NumTicks)
 			PPUCycle(VRAMAddr, SLnum, Clockticks, 0);
 		if ((Clockticks < 256) && (OnScreen))
 		{
-			register int PalIndex;
+			int PalIndex;
 			if ((Reg2001 & 0x08) && ((Clockticks >= 8) || (Reg2001 & 0x02)))
 				TC = TileData[Clockticks + IntX];
 			else	TC = 0;
 			if ((Reg2001 & 0x10) && ((Clockticks >= 8) || (Reg2001 & 0x04)))
 				for (y = 0; y < SprCount; y++)
 				{
-					register int SprPixel = Clockticks - SprData[y][9];
-					register unsigned char SprDat;
+					int SprPixel = Clockticks - SprData[y][9];
+					unsigned char SprDat;
 					if (SprPixel & ~7)
 						continue;
 					SprDat = SprData[y][SprPixel];
@@ -878,13 +876,13 @@ void	RunNoSkip (int NumTicks)
 }
 void	RunSkip (int NumTicks)
 {
-	register unsigned char TC;
+	unsigned char TC;
 
-	register int SprNum;
-	register unsigned char SprSL;
-	register unsigned char *CurTileData;
+	int SprNum;
+	unsigned char SprSL;
+	unsigned char *CurTileData;
 
-	register int i;
+	int i;
 	for (i = 0; i < NumTicks; i++)
 	{
 		if (Spr0Hit)
@@ -1175,7 +1173,7 @@ void	RunSkip (int NumTicks)
 			PPUCycle(VRAMAddr, SLnum, Clockticks, 0);
 		if ((Spr0InLine) && (Clockticks < 255) && (OnScreen) && ((Reg2001 & 0x18) == 0x18) && ((Clockticks >= 8) || ((Reg2001 & 0x06) == 0x06)))
 		{
-			register int SprPixel = Clockticks - SprData[0][9];
+			int SprPixel = Clockticks - SprData[0][9];
 			if (!(SprPixel & ~7) && (SprData[0][SprPixel] & TileData[Clockticks + IntX]))
 			{
 				Spr0Hit = TRUE;	// Trigger 1 pixel later
@@ -1189,7 +1187,7 @@ void	Run (void)
 {
 	if (PALRatio)
 	{
-		register int cycles = 3;
+		int cycles = 3;
 		if (++PALsubticks == 5)
 		{
 			PALsubticks = 0;
@@ -1214,7 +1212,7 @@ int	__fastcall	Read01356 (void)
 
 int	__fastcall	Read2 (void)
 {
-	register unsigned char tmp;
+	unsigned char tmp;
 	HVTog = TRUE;
 	tmp = Reg2002 | (readLatch & 0x1F);
 	if (tmp & 0x80)
@@ -1232,7 +1230,7 @@ int	__fastcall	Read2 (void)
 
 int	__fastcall	Read2Vs (void)
 {
-	register unsigned char tmp;
+	unsigned char tmp;
 	HVTog = TRUE;
 	tmp = Reg2002 | VsSecurity;
 	if (tmp & 0x80)
@@ -1375,7 +1373,7 @@ void	__fastcall	Write7 (int Val)
 {
 	if (((VRAMAddr & 0x3F00) == 0x3F00) && !IsRendering)
 	{
-		register unsigned char Addr = (unsigned char)VRAMAddr & 0x1F;
+		unsigned char Addr = (unsigned char)VRAMAddr & 0x1F;
 		Val = Val & 0x3F;
 #ifdef	ENABLE_DEBUGGER
 		if (Palette[Addr] != (unsigned char)Val)

@@ -2,7 +2,7 @@
  * Copyright (C) QMT Productions
  */
 
-#include "stdafx.h"
+#include "StdAfx.h"
 #include "Nintendulator.h"
 #include "Lang.h"
 #include "resource.h"
@@ -156,6 +156,7 @@ public:
                 nsamp = 0;
 
                 iserr = false;
+                WineHack = false;
         }
         ~AVIHandle ()
         {
@@ -212,7 +213,10 @@ public:
                 }
 
                 if (!CreateVideoStreamComp(&dibs, aopts[0]))
+                {
+                        AVISaveOptionsFree(1, aopts);
                         return false;
+                }
 
                 AVISaveOptionsFree(1, aopts);
                 return true;
@@ -469,8 +473,8 @@ void    AddVideo (void)
                 MessageBox(hMainWnd, Lang::GetString(LANG_ERR_AVI_FRAME_NOT_RECORDING), Lang::GetString(LANG_DLG_NINTENDULATOR), MB_OK);
                 return;
         }
-        register unsigned short *src = PPU::DrawArray;
-        register unsigned long *dst = videoBuffer + 256 * 240;
+        unsigned short *src = PPU::DrawArray;
+        unsigned long *dst = videoBuffer + 256 * 240;
         for (int y = 0; y < 240; y++)
         {
                 dst -= 256;
