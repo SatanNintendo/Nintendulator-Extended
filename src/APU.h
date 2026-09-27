@@ -85,6 +85,10 @@ long    GetAudioPrimeSlots (void);
 // window. Surfaced in the timing log so the netplay rate trim can be
 // verified (should stay at or near zero once the trim has converged).
 long    GetAudioNetplaySkips (void);
+// v4: number of drained-ring re-anchors performed by the netplay gate
+// (brief silence + fade-in - the audible recovery event). Surfaced next
+// to netplaySkips so the two recovery kinds can be told apart.
+long    GetAudioNetplayReanchors (void);
 #endif  /* !NSFPLAYER */
 
 int     MAPINT  IntRead (int, int);

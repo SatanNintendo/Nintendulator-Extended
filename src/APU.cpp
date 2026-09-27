@@ -218,12 +218,20 @@ static volatile LONG     g_AudioRestartPending = 0L;
 #define NETPLAY_REANCHOR_LEAD     3     // slots of silence re-established on a drained ring
 
 static volatile LONG g_AudioNetplaySkips = 0L;   // slots dropped by the netplay gate
+// v4: drained-ring re-anchors (Case 2 of the gate). Unlike drops (which
+// merely discard one frame's samples and keep the stream continuous), a
+// re-anchor inserts NETPLAY_REANCHOR_LEAD slots of silence + a fade-in -
+// i.e. it is the one audible recovery event. Counted separately so the
+// next log can tell "inaudible drops" from "heard dips", and each one is
+// written to the session event log with the fill/freq at the moment.
+static volatile LONG g_AudioNetplayReanchors = 0L; // drained-ring re-anchors (audible)
 // Netplay audio tracker state. Touched ONLY from the emulation thread:
 // NetplayRateTrim() runs from UpdateDRC() (called by GFX::DrawScreen(),
 // which PPU::Update invokes at the end of each emulated frame), and the
 // gate/counter in APU::Run() run on the same thread. Plain statics are
-// therefore safe; only g_AudioNetplaySkips is read elsewhere (diag log)
-// and stays Interlocked.
+// therefore safe; only g_AudioNetplaySkips (diag log) and
+// g_AudioNetplayReanchors (diag log) are read elsewhere and stay
+// Interlocked.
 static BOOL   g_NpActive = FALSE;      // TRUE once playback started and the tracker seeded
 static double g_NpAbsPlay = 0.0;       // absolute play position, in slots (fractional, PLL)
 static double g_NpLastNow = 0.0;       // QPC seconds of the last PLL update
@@ -2273,6 +2281,11 @@ static void NetplayRateTrim (void)
                 drc_applied_freq = newFreq;
                 g_NpRateSlots = (double)newFreq / (double)buflen;   // the PLL follows the new rate
                 g_NpTrimCool = NETPLAY_TRIM_COOLDOWN;
+                // v4: every applied step goes to the session event log -
+                // the convergence trajectory (fill + old->new freq) is then
+                // readable per session, not just as the final currentFreq.
+                Kaillera::LogDiagEvent(_T("AUDIOTRIM fill=%ld freq %ld->%lu"),
+                        fill, baseFreq, newFreq);
         }
 }
 #endif /* !NSFPLAYER - NetplayRateTrim */
@@ -2465,6 +2478,15 @@ long    GetAudioNetplaySkips (void)
 #endif
 }
 
+long    GetAudioNetplayReanchors (void)
+{
+#ifndef NSFPLAYER
+        return (long)InterlockedExchangeAdd(&g_AudioNetplayReanchors, 0L);
+#else
+        return 0;
+#endif
+}
+
 void    Run (void)
 {
 #ifndef NSFPLAYER
@@ -2597,6 +2619,13 @@ void    Run (void)
                                         // Case 1: live mix window -> drop, park
                                         // the write cursor (NO advance).
                                         InterlockedIncrement(&g_AudioNetplaySkips);
+                                        // v4: session-visible trace of every drop
+                                        // (fill + freq at the moment) so the
+                                        // periodicity of audio dips is readable
+                                        // from the event log timestamps.
+                                        Kaillera::LogDiagEvent(_T("AUDIODROP fill=%ld freq=%ld"),
+                                                (long)((double)g_NpAbsWritten - g_NpAbsPlay),
+                                                InterlockedExchangeAdd(&g_AudioCurrentFreq, 0L));
                                         goto netplay_skip_slot;
                                 }
                                 if (((long)next_pos < (long)fr) && g_NpActive &&
@@ -2653,6 +2682,15 @@ void    Run (void)
                                                         rem -= take;
                                                 }
                                                 Buffer->Unlock(p1, n1, p2, n2);
+                                                // v4: the re-anchor is the audible
+                                                // recovery event (brief silence +
+                                                // fade-in). Log the PRE-re-anchor
+                                                // fill (g_NpAbsWritten is overwritten
+                                                // two lines below).
+                                                InterlockedIncrement(&g_AudioNetplayReanchors);
+                                                Kaillera::LogDiagEvent(_T("AUDIOANCHOR fill=%ld freq=%ld"),
+                                                        (long)((double)g_NpAbsWritten - g_NpAbsPlay),
+                                                        InterlockedExchangeAdd(&g_AudioCurrentFreq, 0L));
                                                 // Continue from a healthy lead, and re-derive
                                                 // the absolute write counter from the PLL so
                                                 // the tracked fill is exactly LEAD+1.

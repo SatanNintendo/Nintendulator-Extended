@@ -644,6 +644,9 @@ struct FrameTimingEntry {
         LONG     fqSkipped; // queued frames skipped before this frame
         LONG     fqDepth;   // queue depth observed at consume time
         LONG     paceSource;// P67: 1=presentation anchor, 0=QPC fallback
+        // v4: lockstep wait (us) of the emulation frame this row renders -
+        // the discriminator for network-imported stalls (see FQ_Packet).
+        LONGLONG lockWaitUs;
         LONGLONG dwmDisplayed;
         LONGLONG dwmVBlank;
         LONGLONG dwmCompose;
@@ -729,6 +732,11 @@ struct FQ_Packet {
         LONG          fqSkipped;
         LONG          fqDepth;
         LONG          paceSource;
+        // v4: this frame's kailleraModifyPlayValues() wait in microseconds
+        // (latched by Kaillera::FrameInput earlier on this same thread, at
+        // scanline 241). Published with the frame so every timing-log row
+        // can attribute its publication gap to the lockstep or not.
+        LONG          lockWaitUs;
         // P71: diagnostic-only queue/thread hand-off timestamps.
         LONGLONG      fqProduceQPC;
         LONGLONG      fqProduceCsEnterQPC;
@@ -873,6 +881,9 @@ static void FQ_Produce(const unsigned char *src)
         s_FQ_Buf[slot].emuFrame = frameSeq;
         s_FQ_Buf[slot].fqSkipped = 0;
         s_FQ_Buf[slot].fqDepth = 0;
+        // v4: same-thread latch from Kaillera::FrameInput() - the lockstep
+        // wait that this frame's emulation actually paid at scanline 241.
+        s_FQ_Buf[slot].lockWaitUs = Kaillera::GetLockstepWaitLastUs();
         QueryPerformanceCounter(&qpc);
         s_FQ_Buf[slot].fqProduceCsLeaveQPC = qpc.QuadPart;
         s_FQ_Head = (s_FQ_Head + 1) % FQ_SLOTS;
@@ -1047,6 +1058,7 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                 s_diagBuf[idx].emuFrame = packet ? packet->emuFrame : 0;
                 s_diagBuf[idx].fqSkipped = packet ? packet->fqSkipped : 0;
                 s_diagBuf[idx].fqDepth = packet ? packet->fqDepth : 0;
+                s_diagBuf[idx].lockWaitUs = packet ? (LONGLONG)packet->lockWaitUs : 0;
                 s_diagBuf[idx].frameNum = s_diagFrameNum;
                 s_diagHead = (s_diagHead + 1) % DIAG_FRAMES;
         }
@@ -1627,7 +1639,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 (long)InterlockedExchangeAdd(&s_FQSkippedFrames, 0));
         _ftprintf(f, _T("PBO streaming: ready=%d count=%d\n"),
                 s_PBOReady ? 1 : 0, PBO_COUNT);
-        _ftprintf(f, _T("Audio MMR state: mode=deterministic workerPolls=%ld setFreq=%ld playStarts=%ld playPending=%ld primeSlots=%ld currentFreq=%ld safetyWaits=%ld notifyActive=0 notifySignals=0 playSlot=0 notifyPeriodUs=0 netplaySkips=%ld\n"),
+        _ftprintf(f, _T("Audio MMR state: mode=deterministic workerPolls=%ld setFreq=%ld playStarts=%ld playPending=%ld primeSlots=%ld currentFreq=%ld safetyWaits=%ld notifyActive=0 notifySignals=0 playSlot=0 notifyPeriodUs=0 netplaySkips=%ld reanchors=%ld\n"),
                 APU::GetAudioWorkerPolls(),
                 APU::GetAudioSetFreqCalls(),
                 APU::GetAudioPlayStarts(),
@@ -1635,8 +1647,24 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 APU::GetAudioPrimeSlots(),
                 APU::GetAudioCurrentFreq(),
                 APU::GetAudioSafetyWaits(),
-                APU::GetAudioNetplaySkips());
-        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | paceEnter | paceWait | pace->produce | postPaceCPU | postPaceWall | postPaceCycles | buildWall | buildCPU | buildCycles | swapCPU | swapCycles | pboOrphan | pboMap | pboCopy | pboUnmap | pboSubmit | safetyMs | safetyLoops | traceSeq | prodGap | renderGap | consume->present | presentInterval | presentErr | fqP2C | fqPcs | fqCcs | fqSched | fqCS2 | fqPHold | fqCHold | fqSigWait | render2t0 | submit2dwm | dwmDispInt | dwmFrameStep | dwmMissStep | dwmDropStep | dwmLateStep | dwmLate | dwmSrc | dwmHr | dwmFrame | dwmRefresh | dwmVBlankInt | dwmComposeInt | dwmLateCount | dwmOutstanding | dwmUnique | dwmAvail | dwmMiss | dwmDrop | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total\n\n"));
+                APU::GetAudioNetplaySkips(),
+                APU::GetAudioNetplayReanchors());
+        // v4: lockstep wait aggregate for the whole Kaillera session. This is
+        // the number the remaining micro-freeze investigation hinges on: a
+        // large mean/max here means the emulation thread regularly waits for
+        // the remote player(s) inside kailleraModifyPlayValues - i.e. the
+        // stall is imported through the lockstep (opponent on an old build,
+        // opponent-side hitch, or network jitter), NOT a local pipeline
+        // problem. Compare with the per-row lsWait column and the NETSTALL/
+        // PRESGAP lines in %TEMP%\nintendulator_events.log.
+        {
+                long lsN = 0; double lsMean = 0.0, lsMax = 0.0;
+                long ls8 = 0, ls20 = 0, ls50 = 0, ls100 = 0;
+                Kaillera::GetLockstepStats(&lsN, &lsMean, &lsMax, &ls8, &ls20, &ls50, &ls100);
+                _ftprintf(f, _T("Kaillera lockstep: n=%ld mean=%.2f max=%.2f ms  waits>8ms:%ld >20ms:%ld >50ms:%ld >100ms:%ld\n"),
+                        lsN, lsMean, lsMax, ls8, ls20, ls50, ls100);
+        }
+        _ftprintf(f, _T("Columns: frame | emuFrame | prod->consume | paceErr | paceSrc | paceEnter | paceWait | pace->produce | postPaceCPU | postPaceWall | postPaceCycles | buildWall | buildCPU | buildCycles | swapCPU | swapCycles | pboOrphan | pboMap | pboCopy | pboUnmap | pboSubmit | safetyMs | safetyLoops | traceSeq | prodGap | renderGap | consume->present | presentInterval | presentErr | fqP2C | fqPcs | fqCcs | fqSched | fqCS2 | fqPHold | fqCHold | fqSigWait | render2t0 | submit2dwm | dwmDispInt | dwmFrameStep | dwmMissStep | dwmDropStep | dwmLateStep | dwmLate | dwmSrc | dwmHr | dwmFrame | dwmRefresh | dwmVBlankInt | dwmComposeInt | dwmLateCount | dwmOutstanding | dwmUnique | dwmAvail | dwmMiss | dwmDrop | fqSkip/fqDepth | tex | swap | t2->t2b | ofe | drc | total | lockstep wait (lsWait, ms)\n\n"));
 
         // P43 (session 20): t0->t4 only spans GL_DrawFrame+OnFrameEnd+
         // UpdateDRC -- the video-draw slice of a frame. It does NOT cover
@@ -1806,7 +1834,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 bool presentStalled = (dpresent > 0.0 && fabs(presentErr) > 2.0);
 
                 _ftprintf(f,
-                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  paceEnter=%6.2f  paceWait=%6.2f  pace->prod=%6.2f  postPaceCPU=%6.2f  postPaceWall=%6.2f  postPaceCycles=%I64u  buildWall=%6.2f  buildCPU=%6.2f  buildCycles=%I64u  swapCPU=%6.2f  swapCycles=%I64u  pboOrphan=%6.3f  pboMap=%6.3f  pboCopy=%6.3f  pboUnmap=%6.3f  pboSubmit=%6.3f  safetyMs=%6.2f  safetyLoops=%d  traceSeq=%I64d  prodGap=%7.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fqP2C=%6.2f  fqPcs=%5.2f  fqCcs=%5.2f  fqSched=%6.2f  fqCS2=%5.2f  fqPHold=%5.2f  fqCHold=%5.2f  fqSigWait=%6.2f  render2t0=%6.2f  submit2dwm=%7.2f  dwmDisp=%7.2f  dwmFrameStep=%2lld  dwmMissStep=%2lld  dwmDropStep=%2lld  dwmLateStep=%2lld  dwmLate=%d  dwmSrc=%d  dwmHr=0x%08lX  dwmFrame=%I64u  dwmRefresh=%I64u  dwmVBlankInt=%7.2f  dwmComposeInt=%7.2f  dwmLateCount=%I64u  dwmOutstanding=%I64u  dwmUnique=%I64u  dwmAvail=%I64u  dwmMiss=%I64u  dwmDrop=%I64u  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s\n"),
+                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  paceEnter=%6.2f  paceWait=%6.2f  pace->prod=%6.2f  postPaceCPU=%6.2f  postPaceWall=%6.2f  postPaceCycles=%I64u  buildWall=%6.2f  buildCPU=%6.2f  buildCycles=%I64u  swapCPU=%6.2f  swapCycles=%I64u  pboOrphan=%6.3f  pboMap=%6.3f  pboCopy=%6.3f  pboUnmap=%6.3f  pboSubmit=%6.3f  safetyMs=%6.2f  safetyLoops=%d  traceSeq=%I64d  prodGap=%7.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fqP2C=%6.2f  fqPcs=%5.2f  fqCcs=%5.2f  fqSched=%6.2f  fqCS2=%5.2f  fqPHold=%5.2f  fqCHold=%5.2f  fqSigWait=%6.2f  render2t0=%6.2f  submit2dwm=%7.2f  dwmDisp=%7.2f  dwmFrameStep=%2lld  dwmMissStep=%2lld  dwmDropStep=%2lld  dwmLateStep=%2lld  dwmLate=%d  dwmSrc=%d  dwmHr=0x%08lX  dwmFrame=%I64u  dwmRefresh=%I64u  dwmVBlankInt=%7.2f  dwmComposeInt=%7.2f  dwmLateCount=%I64u  dwmOutstanding=%I64u  dwmUnique=%I64u  dwmAvail=%I64u  dwmMiss=%I64u  dwmDrop=%I64u  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s  lsWait=%6.2f\n"),
                         e.frameNum,
                         (unsigned __int64)e.emuFrame,
                         dprod,
@@ -1870,7 +1898,9 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                         d2b, (d2b > DIAG_STALL_MS ? _T("*") : _T(" ")),
                         d23, (d23 > DIAG_STALL_MS ? _T("*") : _T(" ")),
                         d34, (d34 > DIAG_STALL_MS ? _T("*") : _T(" ")),
-                        dtot, (dtot > DIAG_STALL_MS * 1.5 ? _T("*") : _T(" "))
+                        dtot, (dtot > DIAG_STALL_MS * 1.5 ? _T("*") : _T(" ")),
+                        // v4: the frame's kailleraModifyPlayValues() wait.
+                        (double)e.lockWaitUs / 1000.0
                 );
         }
         fclose(f);
@@ -1970,6 +2000,39 @@ static void DiagCompleteFrame(LONGLONG t3, LONGLONG t4)
         double ofeMs  = (s_diagBuf[idx].t3  - s_diagBuf[idx].t2b) * 1000.0 / freq;
         double drcMs  = (s_diagBuf[idx].t4  - s_diagBuf[idx].t3)  * 1000.0 / freq;
 
+        // v4: PRESENTATION-GAP stall detection. The v3 netplay log
+        // (F007736) caught the user-visible micro-freeze here: an 84 ms gap
+        // (5 vblanks) between consecutive presentation stamps while ALL of
+        // the per-stage durations above stayed at ~0.0 ms - the stall lived
+        // inside the emulation frame body (publication gap), which the
+        // checkpoint deltas above never see. This check measures exactly
+        // what the eye sees (the presentation cadence), fires a dump while
+        // the 6-second window still brackets the event, and writes a
+        // PRESGAP event line carrying the frame's lsWait so the timing log
+        // alone already answers "network-imported or local" per event.
+        static LONGLONG s_diagPrevPresentQPC = 0;
+        double presentGapMs = 0.0;
+        LONGLONG presentStamp = (s_diagBuf[idx].t2b > 0) ? s_diagBuf[idx].t2b : s_diagBuf[idx].t2;
+        if (presentStamp > 0)
+        {
+                if ((s_diagPrevPresentQPC != 0) && (presentStamp > s_diagPrevPresentQPC))
+                        presentGapMs = (double)(presentStamp - s_diagPrevPresentQPC) * 1000.0 / freq;
+                s_diagPrevPresentQPC = presentStamp;
+        }
+        // A gap over a second means a pause (menu/stop/start), not a stall:
+        // re-arm silently instead of logging a bogus event.
+        if (presentGapMs > 1000.0)
+                presentGapMs = 0.0;
+        bool presentGapStalled = (presentGapMs > DIAG_STALL_MS);
+        if (presentGapStalled)
+        {
+                Kaillera::LogDiagEvent(_T("PRESGAP F=%u emu=%I64u gap=%.2fms lsWait=%.2fms"),
+                        (unsigned)s_diagBuf[idx].frameNum,
+                        (unsigned __int64)s_diagBuf[idx].emuFrame,
+                        presentGapMs,
+                        (double)s_diagBuf[idx].lockWaitUs / 1000.0);
+        }
+
         // P35: ofeMs (OnFrameEnd duration) was computed for display in the
         // log columns but never included in the trigger condition below.
         // A frame where ONLY OnFrameEnd stalls (swap/tex/drc all fine) would
@@ -2017,7 +2080,7 @@ static void DiagCompleteFrame(LONGLONG t3, LONGLONG t4)
         bool periodicDue = (s_diagLastPeriodicQPC == 0) ||
                 ((double)(nowQPC - s_diagLastPeriodicQPC) / freq >= 10.0);
 
-        if (swapMs > DIAG_STALL_MS || texMs > DIAG_STALL_MS || mcrMs > DIAG_STALL_MS || ofeMs > DIAG_STALL_MS || drcMs > DIAG_STALL_MS || periodicDue)
+        if (swapMs > DIAG_STALL_MS || texMs > DIAG_STALL_MS || mcrMs > DIAG_STALL_MS || ofeMs > DIAG_STALL_MS || drcMs > DIAG_STALL_MS || presentGapStalled || periodicDue)
         {
                 if (periodicDue)
                         s_diagLastPeriodicQPC = nowQPC;

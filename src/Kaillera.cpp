@@ -57,6 +57,7 @@
 #include "Kaillera.h"
 #include "kailleraclient.h"
 #include "APU.h"
+#include <stdarg.h>
 
 namespace Kaillera
 {
@@ -762,6 +763,9 @@ void OnStartGame (void)
         syncFrames = KAILLERA_SYNC_FRAMES;
         frameCounter = 0;
         startupChecked = FALSE;
+        // v4: start this session's diagnostics from a clean sheet (truncates
+        // %TEMP%\nintendulator_events.log, zeroes the lockstep statistics).
+        ResetDiagCounters();
 
         // Hard-reset the NES so that every client begins the game from an
         // identical power-on state.  The emulation is stopped at this point
@@ -865,6 +869,156 @@ BOOL Guard (void)
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
+ * v4 netplay diagnostics: lockstep wait measurement + session event log
+ *
+ * The v3 timing log (F007736) showed the remaining micro-freeze as an
+ * 84 ms gap between emulation-frame publications while every measured
+ * stage (tex/swap/t2b/ofe/drc, audio gate, pacing wake) stayed fast.
+ * The only unmeasured code in that window is the lockstep wait inside
+ * kailleraModifyPlayValues(). The pieces below measure it:
+ *
+ *   1. A tiny thread-safe event logger -> %TEMP%\nintendulator_events.log.
+ *      Unlike the timing log (overwritten by a periodic dump every 10 s),
+ *      it survives the WHOLE session, so the periodicity of the stalls is
+ *      directly readable from the timestamps.
+ *   2. Per-frame wait statistics (n / mean / max / >8 / >20 / >50 / >100 ms
+ *      counts) surfaced in the timing log header by GFX.
+ *   3. GetLockstepWaitLastUs(): read by GFX's publication path on the SAME
+ *      emulation thread, later in the same frame - the timing rows get a
+ *      per-frame "lsWait" column with exact frame attribution.
+ *
+ * All writes come from the emulation thread (FrameInput/APU gate) and the
+ * render thread (GFX presentation-gap events), hence the critical section.
+ * The log is hard-capped at 1000 lines so a pathological session cannot
+ * flood the disk. The file is flushed per line so a crash loses nothing.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+#define KAILLERA_EVFILE_NAME   _T("nintendulator_events.log")
+#define KAILLERA_EV_MAXLINES   1000
+
+static CRITICAL_SECTION s_EvCS;
+static BOOL             s_EvCSInit = FALSE;
+static FILE            *s_EvFile  = NULL;
+static long             s_EvLines = 0;
+static LONGLONG         s_EvT0QPC = 0;     // session-elapsed base
+static double           s_EvQPF   = 0.0;
+
+static void EvInit (void)
+{
+        if (!s_EvCSInit)
+        {
+                InitializeCriticalSection(&s_EvCS);
+                s_EvCSInit = TRUE;
+        }
+}
+
+static void EvFilePath (TCHAR *path, DWORD cch)
+{
+        DWORD n = GetTempPath(cch - 32, path);
+        if (n == 0)
+                n = 0;
+        _sntprintf(path + n, cch - n, _T("%s"), KAILLERA_EVFILE_NAME);
+        path[cch - 1] = _T('\0');
+}
+
+void LogDiagEvent (LPCTSTR fmt, ...)
+{
+        va_list ap;
+
+        EvInit();
+        if (s_EvLines >= KAILLERA_EV_MAXLINES)        // hard cap
+                return;
+        EnterCriticalSection(&s_EvCS);
+        if (s_EvFile == NULL)
+        {
+                TCHAR path[MAX_PATH + 64];
+                EvFilePath(path, MAX_PATH + 64);
+                s_EvFile = _tfopen(path, _T("a"));
+                if (s_EvFile == NULL)
+                {
+                        LeaveCriticalSection(&s_EvCS);
+                        return;
+                }
+        }
+        if (s_EvT0QPC == 0)
+        {
+                LARGE_INTEGER qpc, qpf;
+                QueryPerformanceCounter(&qpc);
+                QueryPerformanceFrequency(&qpf);
+                s_EvT0QPC = qpc.QuadPart;
+                s_EvQPF   = (double)qpf.QuadPart;
+                _ftprintf(s_EvFile, _T("--- session start ---\n"));
+                s_EvLines++;
+        }
+        double elapsed = 0.0;
+        {
+                LARGE_INTEGER qpc;
+                QueryPerformanceCounter(&qpc);
+                elapsed = (double)(qpc.QuadPart - s_EvT0QPC) * 1000.0 / s_EvQPF;
+        }
+        _ftprintf(s_EvFile, _T("[%10.1fms] "), elapsed);
+        va_start(ap, fmt);
+        _vftprintf(s_EvFile, fmt, ap);
+        va_end(ap);
+        _ftprintf(s_EvFile, _T("\n"));
+        fflush(s_EvFile);
+        s_EvLines++;
+        LeaveCriticalSection(&s_EvCS);
+}
+
+// Lockstep wait statistics (written by FrameInput on the emulation thread,
+// snapshotted by the dump thread through GetLockstepStats).
+static long    s_LsN = 0;
+static double  s_LsSumMs = 0.0;
+static double  s_LsMaxMs = 0.0;
+static long    s_LsOver8 = 0, s_LsOver20 = 0, s_LsOver50 = 0, s_LsOver100 = 0;
+static volatile LONG s_LsLastUs = 0;       // per-frame latch read by GFX (same thread)
+
+void ResetDiagCounters (void)
+{
+        TCHAR path[MAX_PATH + 64];
+
+        EvInit();
+        EnterCriticalSection(&s_EvCS);
+        if (s_EvFile != NULL)
+        {
+                fclose(s_EvFile);
+                s_EvFile = NULL;
+        }
+        s_EvLines = 0;
+        s_EvT0QPC = 0;
+        s_EvQPF   = 0.0;
+        EvFilePath(path, MAX_PATH + 64);
+        DeleteFile(path);                    // start each session from an empty file
+        s_LsN = 0;
+        s_LsSumMs = 0.0;
+        s_LsMaxMs = 0.0;
+        s_LsOver8 = s_LsOver20 = s_LsOver50 = s_LsOver100 = 0;
+        s_LsLastUs = 0;
+        LeaveCriticalSection(&s_EvCS);
+}
+
+long GetLockstepWaitLastUs (void)
+{
+        return (long)InterlockedExchangeAdd(&s_LsLastUs, 0L);
+}
+
+void GetLockstepStats (long *n, double *meanMs, double *maxMs,
+                       long *over8ms, long *over20ms, long *over50ms, long *over100ms)
+{
+        EvInit();
+        EnterCriticalSection(&s_EvCS);
+        if (n)          *n = s_LsN;
+        if (meanMs)     *meanMs = (s_LsN > 0) ? (s_LsSumMs / (double)s_LsN) : 0.0;
+        if (maxMs)      *maxMs = s_LsMaxMs;
+        if (over8ms)    *over8ms = s_LsOver8;
+        if (over20ms)   *over20ms = s_LsOver20;
+        if (over50ms)   *over50ms = s_LsOver50;
+        if (over100ms)  *over100ms = s_LsOver100;
+        LeaveCriticalSection(&s_EvCS);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
  * Per-frame input exchange (NES emulation thread)
  * ────────────────────────────────────────────────────────────────────────── */
 
@@ -898,7 +1052,39 @@ void FrameInput (void)
         // 3. Exchange input with the other players.  This call blocks until
         //    every player has delivered their input for this frame - it is the
         //    lockstep barrier that keeps all clients synchronized.
-        ret = p_ModifyPlayValues(packet, 2);
+        // v4: time the barrier. Every wait is latched (for the timing log's
+        // per-frame lsWait column) and aggregated; waits over 10 ms go to
+        // the session event log as NETSTALL. This is the number that will
+        // tell a network-imported stall (opponent late / old build / jitter)
+        // apart from a local one.
+        {
+                LARGE_INTEGER ls0, ls1;
+                static double s_LsQPF = 0.0;
+                if (s_LsQPF <= 0.0)
+                {
+                        LARGE_INTEGER qpf;
+                        QueryPerformanceFrequency(&qpf);
+                        s_LsQPF = (double)qpf.QuadPart;
+                }
+                QueryPerformanceCounter(&ls0);
+                ret = p_ModifyPlayValues(packet, 2);
+                QueryPerformanceCounter(&ls1);
+                double lsMs = (double)(ls1.QuadPart - ls0.QuadPart) * 1000.0 / s_LsQPF;
+                InterlockedExchange(&s_LsLastUs, (LONG)(lsMs * 1000.0));
+                EvInit();
+                EnterCriticalSection(&s_EvCS);
+                s_LsN++;
+                s_LsSumMs += lsMs;
+                if (lsMs > s_LsMaxMs)
+                        s_LsMaxMs = lsMs;
+                if (lsMs > 8.0)   s_LsOver8++;
+                if (lsMs > 20.0)  s_LsOver20++;
+                if (lsMs > 50.0)  s_LsOver50++;
+                if (lsMs > 100.0) s_LsOver100++;
+                LeaveCriticalSection(&s_EvCS);
+                if (lsMs > 10.0)
+                        LogDiagEvent(_T("NETSTALL exch=%d wait=%.2fms"), frameCounter, lsMs);
+        }
 
         if (ret == -1)
         {
