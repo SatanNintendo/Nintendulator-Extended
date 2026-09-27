@@ -1717,7 +1717,6 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                                        (e.prodCpuEnd100ns - e.mmrPaceCpuWake100ns) / 10000.0 : 0.0;
                 ULONGLONG postPaceCycles = (e.prodCpuEndCycles > 0 && e.mmrPaceCpuWakeCycles > 0 && e.prodCpuEndCycles >= e.mmrPaceCpuWakeCycles) ?
                                              (e.prodCpuEndCycles - e.mmrPaceCpuWakeCycles) : 0;
-                double postPaceDeschedMs = postPaceWallMs > postPaceCpuMs ? (postPaceWallMs - postPaceCpuMs) : 0.0;
                 double buildWallMs = (e.buildEndQPC > e.buildStartQPC && e.buildStartQPC > 0) ?
                                      (e.buildEndQPC - e.buildStartQPC) * 1000.0 / freq : 0.0;
                 double buildCpuMs = (e.buildEndCPU100ns >= e.buildStartCPU100ns && e.buildStartCPU100ns > 0) ?

@@ -2102,6 +2102,13 @@ void    RestartForMonitorSync (void)
 #endif /* !NSFPLAYER */
 }
 
+// NSFPLAYER note: this helper (and its comment block) sits at file scope
+// and touches DirectSound-only state (Buffer, LockSize, next_pos, the DRC
+// rate variables and the g_Np* trackers above), all of which exist only
+// in the non-NSF builds - so the whole unit must stay inside an
+// #ifndef NSFPLAYER guard. UpdateDRC() calls it only from inside its own
+// non-NSF region, so the NSF (WinAmp plugin) build never needs it.
+#ifndef NSFPLAYER
 // ------------------------------------------------------------------
 // Kaillera netplay playback-rate trim (v2, simulation-validated).
 //
@@ -2279,6 +2286,7 @@ static void NetplayRateTrim (void)
                 g_NpTrimCool = NETPLAY_TRIM_COOLDOWN;
         }
 }
+#endif /* !NSFPLAYER - NetplayRateTrim */
 
 void    UpdateDRC (void)
 {
@@ -2738,6 +2746,9 @@ void    Run (void)
                         // the same stall costs nothing visible.
                 }
 netplay_skip_slot:     // netplay gate: this slot was dropped, nothing else to do
+                ;               // (C++ requires a statement after a label;
+                                //  this null statement satisfies it before
+                                //  the block's closing brace)
         }
 #define VolAdjust(pos, vol) ((volumes[vol] > 0) ? (((pos) * volumes[vol]) / 100) : 0)
 #else   /* NSFPLAYER */
