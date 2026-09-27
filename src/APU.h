@@ -60,6 +60,10 @@ void    SetRegion       (void);
 void    UpdateDRC       (void);
 void    ResetDRC        (void);
 void    RestartForMonitorSync (void); // posts one safe audio restart at frame end
+// Kaillera netplay: called by Kaillera::OnEnded() (UI thread, AFTER
+// NES::Stop) to end the netplay audio-rate trim and clear its state, so
+// single-player audio returns to the normal P103 discipline.
+void    ResetNetplayAudio (void);
 
 #ifndef NSFPLAYER
 // Tell the APU that the monitor sync module needs to be informed of the
@@ -76,6 +80,11 @@ long    GetAudioSafetyWaits (void);
 long    GetAudioCurrentFreq (void);
 long    GetAudioPlayPending (void);
 long    GetAudioPrimeSlots (void);
+// Kaillera netplay: number of audio slots dropped (never written) by the
+// netplay gate in APU::Run because the slot was inside the live mix
+// window. Surfaced in the timing log so the netplay rate trim can be
+// verified (should stay at or near zero once the trim has converged).
+long    GetAudioNetplaySkips (void);
 #endif  /* !NSFPLAYER */
 
 int     MAPINT  IntRead (int, int);

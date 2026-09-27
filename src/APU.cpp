@@ -22,6 +22,7 @@
 # include "Lang.h"
 # include "Theme.h"
 # include "MonitorSync.h"
+# include "Kaillera.h"
 
 # pragma comment(lib, "dsound.lib")
 # pragma comment(lib, "dxguid.lib")
@@ -159,6 +160,91 @@ static volatile LONG     g_AudioRestartPending = 0L;
 // emulation run that much behind the monitor and force a one-frame slip
 // every ~2.5 minutes).
 #define DRC_RATE_ONESHOT_MIN_DIFF      2     // Hz (~0.005%) before bothering
+
+// ------------------------------------------------------------------
+// Kaillera netplay audio discipline.
+//
+// During a netplay session the emulation thread's frame rate is
+// governed by the network lockstep (kailleraModifyPlayValues at scanline
+// 241 blocks until every player delivered their input for the frame),
+// i.e. by the pace of the SLOWEST participant - NOT by the local
+// monitor/audio clocks the single-player pacing machinery is calibrated
+// for. Two consequences, both observed as the reported "micro-freeze
+// every ~10 seconds":
+//
+//   1. The producer gate in APU::Run ("wait until the slot is outside the
+//      play..write window") is a SECOND clock master fighting the network
+//      clock. Whenever it engages it blocks the emulation thread for one
+//      to two slot-times (16-33 ms) in the middle of a frame; the frame's
+//      input exchange is then late and the delay propagates to every
+//      player through the lockstep. The NES-native frame clock (60.0988
+//      fps, 733.9 samples/frame) and the 735-sample slot clock at 44100 Hz
+//      (60.000 slots/s) differ by ~0.1%, so their phase beat (~10.1 s)
+//      periodically forces a double-slot frame that lands the producer
+//      exactly on the gate - the visible periodic hitch.
+//
+//   2. The ring has no runtime rate feedback anymore (P103 removed it for
+//      good single-player reasons), so ANY sustained difference between
+//      the session rate and the local audio clock accumulates in the
+//      6-slot ring until it hits a boundary: ring full -> blocking gate;
+//      ring dry -> the play cursor laps the write cursor (stale-slot
+//      crackle) and the re-lead wait.
+//
+// The netplay discipline therefore does two things:
+//
+//   A. APU::Run's gate NEVER blocks the emulation thread while
+//      Kaillera::Active: a slot that is inside the live mix window is
+//      DROPPED (skipped, counted) instead of waited for, and a slot that
+//      is provably outside it is written immediately. The network is the
+//      only frame-rate authority during a session.
+//
+//   B. A gentle playback-rate trim (NetplayRateTrim, run from UpdateDRC
+//      at the blessed post-presentation safe point) keeps the ring
+//      centered so drops/underruns stay rare instead of periodic: tiered
+//      steps (12/24/48 Hz = 0.027-0.11% pitch), hard bounds (+-250 Hz
+//      around 44100 = +-0.57% total), hysteresis and a cooldown so the
+//      law cannot hunt. This deliberately avoids the P102 failure mode
+//      (a wide control band plus +-0.1% swings that hunted across the
+//      ring): the steps are small, the bounds are tight, and the law
+//      only exists while a session is active. Validated in simulation
+//      against 0.15%-2% session/audio clock mismatches.
+// ------------------------------------------------------------------
+#define NETPLAY_TRIM_INTERVAL     12    // frames between ring-lead evaluations
+#define NETPLAY_TRIM_COOLDOWN     12    // frames to wait after applying a step
+#define NETPLAY_TRIM_STEP         12    // base Hz per step (0.027% pitch - inaudible)
+#define NETPLAY_TRIM_MIN_FREQ     (FREQ - 250)   // hard bound: -0.57%
+#define NETPLAY_TRIM_MAX_FREQ     (FREQ + 250)   // hard bound: +0.57%
+#define NETPLAY_REANCHOR_LEAD     3     // slots of lead re-established on a drained ring
+
+static volatile LONG g_AudioNetplaySkips = 0L;   // slots dropped by the netplay gate
+// Wrap-tracked absolute positions of the producer (next write slot) and the
+// consumer (play cursor), in slots since the trim started. next_pos and the
+// play cursor both wrap mod FRAMEBUF; both advance by at most ~2 slots per
+// frame, so a wrap-aware delta of +-FRAMEBUF/2 is exact. The DIFFERENCE of
+// the two absolute counters (the "fill") is the only unambiguous measure
+// of the ring's buffered lead - the raw slot indices alone cannot
+// distinguish "producer 4 slots ahead" from "producer lapped 2 slots
+// behind" (both read the same mod 6).
+static long  g_NpAbsNext = 0;  // absolute producer slot position
+static long  g_NpAbsPlay = 0;  // absolute consumer slot position
+static long  g_NpLastNext = 0; // last seen next_pos (raw slot index)
+static long  g_NpLastPlay = 0; // last seen play slot (raw slot index)
+static BOOL g_NpTrack = FALSE; // FALSE until the first sample (and after a reset)
+static long  g_NpTrimFrames = 0;         // frames since the last lead evaluation
+static long  g_NpTrimCool   = 0;         // frames left to wait after a SetFrequency
+static long  g_NpLowStreak  = 0;         // consecutive out-of-band (low) evaluations
+static long  g_NpHighStreak = 0;         // consecutive out-of-band (high) evaluations
+
+// Wrap-aware delta between two raw slot indices (both move <= 2 slots/frame).
+static long NpWrapDelta (long cur, long last)
+{
+        long d = cur - last;
+        if (d < -(FRAMEBUF / 2))
+                d += FRAMEBUF;
+        else if (d > (FRAMEBUF / 2))
+                d -= FRAMEBUF;
+        return d;
+}
 
 // Forward declaration: SoundON() appears before the definition below.
 static double GetEffectiveProducerSampleRate();
@@ -2016,6 +2102,184 @@ void    RestartForMonitorSync (void)
 #endif /* !NSFPLAYER */
 }
 
+// ------------------------------------------------------------------
+// Kaillera netplay playback-rate trim (v2, simulation-validated).
+//
+// Runs once per frame from UpdateDRC() (the post-presentation safe point
+// the P90 notes blessed - the CPU/PPU work for the frame is complete, so
+// even an audiodg stall here costs nothing visible) while a netplay
+// session is active. Wrap-tracks the producer (next_pos) and consumer
+// (play cursor) slot positions into absolute counters, so the ring's
+// buffered lead (their difference) is unambiguous even after the consumer
+// laps the producer. The law:
+//
+//   - fill <= 0 (drained/lapped): re-anchor the write position
+//     NETPLAY_REANCHOR_LEAD slots ahead of the play cursor and zero the
+//     slots the consumer will cross first (the SoftPause pattern) - the
+//     underrun becomes a brief silence instead of stale-slot crackle, and
+//     the emulation thread is never blocked.
+//   - fill <= 3 sustained: consumption too fast -> playback frequency down
+//   - fill >= 5 sustained: ring filling up  -> playback frequency up
+//   - otherwise: silent (no driver calls at all)
+//
+// "Sustained" = two consecutive evaluations (hysteresis) so the +-1-slot
+// flush-phase sawtooth and the periodic double-flush frame (the structural
+// 733.9-vs-735 samples-per-frame beat) cannot cause hunting. Steps are
+// tiered (12/24/48 Hz), hard-bounded to +-250 Hz (+-0.57% pitch), and a
+// cooldown enforces that each step is observed before the next one. The
+// whole law exists only while Kaillera::Active; ResetNetplayAudio() (at
+// session end) returns control to the single-player P103 discipline.
+//
+// Validated against a ring simulation (0.15%-2% session/audio mismatches):
+// realistic mismatches converge with zero dropped slots and a silent
+// steady state; a pathological out-of-bounds mismatch degrades to
+// occasional slot drops instead of ever blocking the emulation thread.
+// ------------------------------------------------------------------
+static void NetplayRateTrim (void)
+{
+        DWORD pr = 0, pw = 0;
+        if (FAILED(Buffer->GetCurrentPosition(&pr, &pw)) || (LockSize == 0))
+                return;
+
+        // Also refresh the P103 cursor-slot cache while we are here: with
+        // MMR active the single-player gate's cached fast path stays fresh,
+        // and with MMR off the cache simply stays unused, as before.
+        InterlockedExchange(&g_DSCacheRpos, (LONG)(pr / (DWORD)LockSize));
+        InterlockedExchange(&g_DSCacheWpos, (LONG)(pw / (DWORD)LockSize));
+        InterlockedExchange(&g_DSCacheAge,  0L);
+
+        long playSlot = (long)(pr / (DWORD)LockSize);
+        long nextSlot = (long)next_pos;
+
+        if (!g_NpTrack)
+        {
+                g_NpAbsNext = nextSlot;
+                g_NpAbsPlay = playSlot;
+                g_NpLastNext = nextSlot;
+                g_NpLastPlay = playSlot;
+                g_NpTrack = TRUE;
+        }
+        else
+        {
+                long dn = NpWrapDelta(nextSlot, g_NpLastNext);
+                long dp = NpWrapDelta(playSlot, g_NpLastPlay);
+                if ((dn < -(FRAMEBUF / 2)) || (dn > (FRAMEBUF / 2)) ||
+                    (dp < -(FRAMEBUF / 2)) || (dp > (FRAMEBUF / 2)))
+                {
+                        // Discontinuity (audio restart, region switch): the
+                        // absolute bookkeeping is invalid - resync silently.
+                        g_NpAbsNext = nextSlot;
+                        g_NpAbsPlay = playSlot;
+                        g_NpLastNext = nextSlot;
+                        g_NpLastPlay = playSlot;
+                        return;
+                }
+                g_NpLastNext = nextSlot;
+                g_NpLastPlay = playSlot;
+                g_NpAbsNext += dn;
+                g_NpAbsPlay += dp;
+        }
+
+        long fill = g_NpAbsNext - g_NpAbsPlay;
+
+        // RE-ANCHOR a drained ring: the producer at/behind the play cursor
+        // (the consumer lapped it). Place the next write a healthy lead
+        // ahead and silence the slots the consumer will cross first, so the
+        // underrun is heard as a brief fade-out instead of stale-slot
+        // crackle. Mirrors AudioReanchorRing, at a safe point.
+        if (fill <= 0)
+        {
+                DWORD slotBytes = (DWORD)LockSize;
+                DWORD ringBytes = slotBytes * FRAMEBUF;
+                if ((ringBytes > 0) && ((DWORD)playSlot < (DWORD)FRAMEBUF))
+                {
+                        DWORD zeroStart = (DWORD)playSlot * slotBytes;
+                        DWORD zeroLen = (DWORD)NETPLAY_REANCHOR_LEAD * slotBytes;
+                        LPVOID p1 = NULL, p2 = NULL;
+                        DWORD n1 = 0, n2 = 0;
+                        if (SUCCEEDED(Buffer->Lock(zeroStart, zeroLen, &p1, &n1, &p2, &n2, 0)))
+                        {
+                                if (p1 && n1)
+                                        ZeroMemory(p1, n1);
+                                if (p2 && n2)
+                                        ZeroMemory(p2, n2);
+                                Buffer->Unlock(p1, n1, p2, n2);
+                        }
+                }
+                next_pos = (unsigned long)((playSlot + NETPLAY_REANCHOR_LEAD) % FRAMEBUF);
+                g_NpAbsNext = g_NpAbsPlay + NETPLAY_REANCHOR_LEAD;
+                g_NpLastNext = (long)next_pos;
+                // Restart the fade-in so the first slot after the re-anchor
+                // ramps in from silence instead of clicking (P98 pattern),
+                // and invalidate the cursor cache until it is refreshed.
+                InterlockedExchange(&g_AudioPrimeSlots, 0L);
+                InterlockedExchange(&g_DSCacheRpos, -1L);
+                InterlockedExchange(&g_DSCacheWpos, -1L);
+                InterlockedExchange(&g_DSCacheAge,  99L);
+                g_NpLowStreak = 0;
+                g_NpHighStreak = 0;
+                return;         // skip the frequency decision on this frame
+        }
+
+        if (InterlockedExchangeAdd(&g_AudioPlayPending, 0L) != 0L)
+                return;         // still priming - the lead is meaningless yet
+
+        if (g_NpTrimCool > 0)
+        {
+                g_NpTrimCool--;
+                return;
+        }
+        if (++g_NpTrimFrames < NETPLAY_TRIM_INTERVAL)
+                return;
+        g_NpTrimFrames = 0;
+
+        // Hysteresis: act only on a SUSTAINED out-of-band lead (two
+        // consecutive evaluations), so the +-1-slot flush-phase sawtooth
+        // and the periodic double-flush frame cannot cause hunting.
+        if (fill <= 3)
+        {
+                g_NpLowStreak++;
+                g_NpHighStreak = 0;
+        }
+        else if (fill >= 5)
+        {
+                g_NpHighStreak++;
+                g_NpLowStreak = 0;
+        }
+        else
+        {
+                g_NpLowStreak = 0;
+                g_NpHighStreak = 0;
+                return;         // healthy - nothing to do, stay silent
+        }
+
+        long step = 0;
+        if ((g_NpLowStreak >= 2) && (fill <= 3))
+                step = (fill <= 1) ? -(2 * NETPLAY_TRIM_STEP) : -NETPLAY_TRIM_STEP;
+        else if ((g_NpHighStreak >= 2) && (fill >= 5))
+                step = (fill >= 7) ? (4 * NETPLAY_TRIM_STEP) : (fill >= 6) ? (2 * NETPLAY_TRIM_STEP) : NETPLAY_TRIM_STEP;
+        else
+                return;         // first out-of-band sample: wait for confirmation
+
+        long newFreqL = (long)drc_play_freq + step;
+        if (newFreqL < NETPLAY_TRIM_MIN_FREQ)
+                newFreqL = NETPLAY_TRIM_MIN_FREQ;
+        if (newFreqL > NETPLAY_TRIM_MAX_FREQ)
+                newFreqL = NETPLAY_TRIM_MAX_FREQ;
+        if (newFreqL == (long)drc_play_freq)
+                return;         // already at the bound - nothing to apply
+
+        DWORD newFreq = (DWORD)newFreqL;
+        if (SUCCEEDED(Buffer->SetFrequency(newFreq)))
+        {
+                InterlockedIncrement(&g_AudioSetFreqCalls);
+                InterlockedExchange(&g_AudioCurrentFreq, (LONG)newFreq);
+                drc_play_freq = newFreq;
+                drc_applied_freq = newFreq;
+                g_NpTrimCool = NETPLAY_TRIM_COOLDOWN;
+        }
+}
+
 void    UpdateDRC (void)
 {
 #ifndef NSFPLAYER
@@ -2033,6 +2297,19 @@ void    UpdateDRC (void)
         }
         if (!Buffer || !isEnabled)
                 return;
+
+        // Kaillera netplay owns the audio clock while a session is active:
+        // the ring lead is trimmed toward the actual (network-paced)
+        // producer rate, and the MMR one-shot below is skipped entirely -
+        // its target rates assume single-player clock mastering and would
+        // fight the session rate. ResetNetplayAudio() (Kaillera::OnEnded)
+        // returns control to the normal P103 path when the session ends.
+        if (Kaillera::Active)
+        {
+                NetplayRateTrim();
+                return;
+        }
+
         if (!MonitorSync::IsEnabled())
         {
                 drc_play_freq = FREQ;
@@ -2158,6 +2435,39 @@ void    ResetDRC (void)
 #endif /* !NSFPLAYER */
 }
 
+void    ResetNetplayAudio (void)
+{
+#ifndef NSFPLAYER
+        // Called from Kaillera::OnEnded() on the UI thread AFTER NES::Stop()
+        // has run (the emulation thread is gone and APU::SoundOFF has already
+        // stopped the secondary buffer). Ends the netplay rate trim and
+        // clears its state so single-player audio returns to the normal P103
+        // discipline. The trimmed playback frequency itself is restored by
+        // the next SoundON(): g_AudioCurrentFreq still holds the trimmed
+        // value, so SoundON's comparison against its freshly computed
+        // startFreq forces the SetFrequency that returns the buffer to the
+        // nominal (or MMR-derived) rate.
+        g_NpTrack = FALSE;
+        g_NpAbsNext = 0;
+        g_NpAbsPlay = 0;
+        g_NpLastNext = 0;
+        g_NpLastPlay = 0;
+        g_NpTrimFrames = 0;
+        g_NpTrimCool = 0;
+        g_NpLowStreak = 0;
+        g_NpHighStreak = 0;
+#endif /* !NSFPLAYER */
+}
+
+long    GetAudioNetplaySkips (void)
+{
+#ifndef NSFPLAYER
+        return (long)InterlockedExchangeAdd(&g_AudioNetplaySkips, 0L);
+#else
+        return 0;
+#endif
+}
+
 void    Run (void)
 {
 #ifndef NSFPLAYER
@@ -2229,6 +2539,55 @@ void    Run (void)
                         // cached check cannot prove the slot is free.
                         if (InterlockedExchangeAdd(&g_AudioPlayPending, 0L) != 0L)
                                 goto write_slot;   // still priming: never block
+                }
+
+                // ============================================================
+                // NETPLAY AUDIO GATE (Kaillera)
+                //
+                // While a netplay session is active the frame rate is owned
+                // by the network lockstep, so this gate must NEVER block the
+                // emulation thread: a block here delays the frame's input
+                // exchange (scanline 241) and the delay propagates to every
+                // player. Instead of the wait loop below, a slot that is
+                // inside the live mix window (play..write cursors) is simply
+                // dropped - one 16.7 ms audio slice lost, which the rate trim
+                // in UpdateDRC keeps rare - and a slot that is provably
+                // outside the window is written immediately. If the write
+                // position has already fallen behind the play cursor (a
+                // drained ring), the write lands a full ring behind: that is
+                // the immediate, wait-free "re-lead" P103 describes.
+                //
+                // A fresh GetCurrentPosition is used deliberately (one
+                // shared-memory read; the P103 cursor cache and its stale-
+                // window subtleties are single-player MMR machinery and are
+                // not consulted here).
+                // ============================================================
+                if (isEnabled && Buffer && Kaillera::Active)
+                {
+                        if (InterlockedExchangeAdd(&g_AudioPlayPending, 0L) != 0L)
+                                goto write_slot;   // still priming: never gate
+                        DWORD npr = 0, npw = 0;
+                        if (SUCCEEDED(Buffer->GetCurrentPosition(&npr, &npw)) && (LockSize > 0))
+                        {
+                                unsigned long fr = npr / (unsigned long)LockSize;
+                                unsigned long fw = npw / (unsigned long)LockSize;
+                                unsigned long np = (unsigned long)next_pos;
+                                if (fw < fr)
+                                        fw += FRAMEBUF;
+                                if (np < fr)
+                                        np += FRAMEBUF;
+                                if ((fr <= np) && (np <= fw))
+                                {
+                                        // Slot is inside the live mix window:
+                                        // drop it instead of blocking.
+                                        InterlockedIncrement(&g_AudioNetplaySkips);
+                                        next_pos = (next_pos + 1) % FRAMEBUF;
+                                        goto netplay_skip_slot;
+                                }
+                                goto write_slot;   // provably safe: write it now
+                        }
+                        // Position read failed (essentially never): fall
+                        // through to the original gate below as a fallback.
                 }
 
                 // ============================================================
@@ -2378,6 +2737,7 @@ void    Run (void)
                         // the CPU/PPU work for this frame is already complete, so
                         // the same stall costs nothing visible.
                 }
+netplay_skip_slot:     // netplay gate: this slot was dropped, nothing else to do
         }
 #define VolAdjust(pos, vol) ((volumes[vol] > 0) ? (((pos) * volumes[vol]) / 100) : 0)
 #else   /* NSFPLAYER */

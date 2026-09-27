@@ -56,6 +56,7 @@
 #include "Theme.h"
 #include "Kaillera.h"
 #include "kailleraclient.h"
+#include "APU.h"
 
 namespace Kaillera
 {
@@ -141,6 +142,24 @@ enum EndReason
 // in the game callback, so an approximation is fine.
 #define KAILLERA_POLL_MS        250
 
+// Auto-reset event that wakes the game callback thread the moment a
+// session ends. The callback thread is fully decoupled from the DLL's
+// network threads (verified against the SupraclientC client source: the
+// receive loop and the input exchange run on their own threads, and the
+// game callback is a fire-and-forth thread), so it never needs to poll
+// quickly DURING a game - but at session end it can now exit instantly
+// instead of up to KAILLERA_POLL_MS late, at zero CPU cost. This replaces
+// the old plain Sleep() poll loop and also dominates the "Sleep(1)"
+// suggestion found elsewhere: same instant wake-up, without waking the
+// thread 1000 times per second for the whole duration of every game.
+static HANDLE           hGameEndEvent = NULL;
+
+static void SignalGameEnd (void)
+{
+        if (hGameEndEvent != NULL)
+                SetEvent(hGameEndEvent);
+}
+
 static volatile BOOL    userDisconnecting = FALSE;      // TRUE: don't report "connection lost"
 static volatile BOOL    startPending = FALSE;           // game callback is waiting for the UI
 static volatile int     pendingPlayer = 0;                      // player number from the game callback
@@ -224,8 +243,19 @@ static int WINAPI GameCallback (char * /*game*/, int player, int numplayers)
         // return only when the game is over; modern builds (SupraClient etc.)
         // do not care, so staying here is the maximally compatible behavior
         // (FinalBurn Neo does exactly the same).
+        // NOTE: this loop has no effect on game timing whatsoever - the
+        // client DLL exchanges input on its own network thread, decoupled
+        // from this one (see the SupraclientC source: recvLoop + the
+        // kailleraModifyPlayValues wait run on separate threads).  It only
+        // keeps the session's callback contract alive, so the wait uses an
+        // event with a generous safety timeout instead of a short poll.
         while (Active)
-                Sleep(KAILLERA_POLL_MS);
+        {
+                if (hGameEndEvent != NULL)
+                        WaitForSingleObject(hGameEndEvent, KAILLERA_POLL_MS);
+                else
+                        Sleep(KAILLERA_POLL_MS);
+        }
 
         return 0;
 }
@@ -356,6 +386,11 @@ void Init (void)
         DWORD err;
         BOOL sawBadArch = FALSE;
 
+        // Create the game-callback wake event once (auto-reset: a single
+        // SetEvent releases the single waiting callback thread).
+        if (hGameEndEvent == NULL)
+                hGameEndEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+
         // Always load from the emulator's own directory (ProgPath has a trailing
         // backslash), independent of the current working directory.
         _sntprintf(dllPath, MAX_PATH, _T("%skailleraclient.dll"), ProgPath);
@@ -457,6 +492,7 @@ void Destroy (void)
         {
                 userDisconnecting = TRUE;
                 Active = FALSE;
+                SignalGameEnd();
                 if (p_EndGame != NULL)
                         p_EndGame();
         }
@@ -627,6 +663,7 @@ void Disconnect (void)
                 return;
         userDisconnecting = TRUE;
         Active = FALSE;
+        SignalGameEnd();
         if (p_EndGame != NULL)
                 p_EndGame();    // also unblocks a pending input exchange
         PostMessage(hMainWnd, WM_APP_KAILLERA_ENDED, END_USER, 0);
@@ -753,6 +790,7 @@ void OnEnded (WPARAM reason)
         BOOL wasActive = Active;
 
         Active = FALSE;
+        SignalGameEnd();
         startPending = FALSE;
 
         if (wasActive)
@@ -764,6 +802,13 @@ void OnEnded (WPARAM reason)
                 // cannot deadlock.
                 if (NES::Running)
                         NES::Stop();
+
+                // The emulation thread is gone and the DirectSound buffer is
+                // stopped (NES::Stop -> APU::SoundOFF): end the netplay audio
+                // rate trim now, so single-player audio returns to the normal
+                // P103 discipline and the next SoundON() restores the nominal
+                // (or MMR-derived) playback frequency.
+                APU::ResetNetplayAudio();
         }
 
         UpdateMenus();
@@ -859,6 +904,7 @@ void FrameInput (void)
         {
                 // Network error, or another player left the game.
                 Active = FALSE;
+                SignalGameEnd();
                 if (!userDisconnecting)
                         PostMessage(hMainWnd, WM_APP_KAILLERA_ENDED, END_LOST, 0);
                 return;
@@ -889,6 +935,7 @@ void FrameInput (void)
                                 if ((masterRegion != (int)NES::CurRegion) || (masterGenie != NES::GameGenie))
                                 {
                                         Active = FALSE;
+                                        SignalGameEnd();
                                         PostMessage(hMainWnd, WM_APP_KAILLERA_ENDED, END_SETTINGS, 0);
                                         return;
                                 }
