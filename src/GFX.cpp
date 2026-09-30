@@ -2033,11 +2033,15 @@ static void DiagCompleteFrame(LONGLONG t3, LONGLONG t4)
         bool presentGapStalled = (presentGapMs > DIAG_STALL_MS);
         if (presentGapStalled)
         {
-                Kaillera::LogDiagEvent(_T("PRESGAP F=%u emu=%I64u gap=%.2fms lsWait=%.2fms"),
+                // P1-E: append the per-stage times of this frame so a LOCAL
+                // hitch (lsWait~0) can be attributed from the events log alone
+                // (tex = texture/PBO upload, t2b = swap/present, ofe/drc as before).
+                Kaillera::LogDiagEvent(_T("PRESGAP F=%u emu=%I64u gap=%.2fms lsWait=%.2fms tex=%.2f t2b=%.2f ofe=%.2f drc=%.2f"),
                         (unsigned)s_diagBuf[idx].frameNum,
                         (unsigned __int64)s_diagBuf[idx].emuFrame,
                         presentGapMs,
-                        (double)s_diagBuf[idx].lockWaitUs / 1000.0);
+                        (double)s_diagBuf[idx].lockWaitUs / 1000.0,
+                        texMs, mcrMs, ofeMs, drcMs);
         }
 
         // P35: ofeMs (OnFrameEnd duration) was computed for display in the
