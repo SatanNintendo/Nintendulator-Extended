@@ -378,6 +378,13 @@ static BOOL GL_Init(int winW, int winH)
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         SwapBuffers(hGLDC);
+        {
+                // P1-C diagnostic: which GL implementation is this? (software
+                // "GDI Generic" would explain a driver that ignores swap intervals.)
+                const char *glr = (const char *)glGetString(GL_RENDERER);
+                const char *glv = (const char *)glGetString(GL_VENDOR);
+                EI.DbgOut(_T("OpenGL: %hs / %hs"), glv ? glv : "?", glr ? glr : "?");
+        }
         wglMakeCurrent(NULL, NULL);
         UsingOpenGL = TRUE;
         return TRUE;
@@ -2079,6 +2086,12 @@ static void DiagCompleteFrame(LONGLONG t3, LONGLONG t4)
         LONGLONG nowQPC = s_diagBuf[idx].t4;
         bool periodicDue = (s_diagLastPeriodicQPC == 0) ||
                 ((double)(nowQPC - s_diagLastPeriodicQPC) / freq >= 10.0);
+        // P1-A (experiment): no periodic snapshot during netplay. It is the only
+        // exact-10.0 s timer in the process; removing it either eliminates that
+        // variable or confirms it is not the cause. Dumps triggered by real
+        // stalls (>20 ms stages, PRESGAP; 3 s cooldown) are unaffected.
+        if (Kaillera::Active)
+                periodicDue = false;
 
         if (swapMs > DIAG_STALL_MS || texMs > DIAG_STALL_MS || mcrMs > DIAG_STALL_MS || ofeMs > DIAG_STALL_MS || drcMs > DIAG_STALL_MS || presentGapStalled || periodicDue)
         {
@@ -2787,6 +2800,11 @@ void    Start (void)
                                 MonitorSync::ResetState();
                                 StartRenderThread();
                         }
+                        else
+                        {
+                                // P1-C: MMR OFF -> deterministic unsynchronised presentation.
+                                MonitorSync::RequestUnsyncedPresentation();
+                        }
 
                         // Restore menu checkmarks (may have been reset)
                         SyncMenuChecks();
@@ -2872,6 +2890,17 @@ void    Start (void)
                         // race with the first frame draw → "fullscreen shows
                         // only part of screen" for the first 1-2 frames (or
                         // persistently if the race is lost).
+                }
+                else
+                {
+                        // P1-C: MMR OFF on a freshly created GL context (cold start
+                        // with the checkbox already off, or after a menu toggle).
+                        // GL_Init() never sets a swap interval, so without this the
+                        // context keeps the driver default (often vsync ON = a second
+                        // pacing governor on top of the audio gate). The interval is
+                        // applied by the thread that owns the context on its first
+                        // frame (MonitorSync::ApplyPendingVSync from GL_DrawFrame).
+                        MonitorSync::RequestUnsyncedPresentation();
                 }
 
                 if (Fullscreen)

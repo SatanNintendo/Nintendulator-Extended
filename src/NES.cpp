@@ -1175,7 +1175,7 @@ DWORD   WINAPI  Thread (void *param)
         //   thread can steal that slice. Risk is low: we spend nearly all our
         //   time blocked in SwapBuffers (vblank wait) or DS slot wait, so we
         //   don't actually consume much CPU at this priority. We revert to
-        //   ABOVE_NORMAL when MMR is disabled (checked every 60 frames below).
+        //   ABOVE_NORMAL when MMR is disabled (re-checked every ~10 frames in GFX::DrawScreen).
         {
                 int prio = GFX::MatchMonitorRate
                         ? THREAD_PRIORITY_TIME_CRITICAL

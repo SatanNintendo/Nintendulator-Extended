@@ -155,8 +155,11 @@ enum EndReason
 // thread 1000 times per second for the whole duration of every game.
 static HANDLE           hGameEndEvent = NULL;
 
+static void EvFlush (void);     // defined with the event log below
+
 static void SignalGameEnd (void)
 {
+        EvFlush();      // events log is flushed lazily; make sure it is complete at session end
         if (hGameEndEvent != NULL)
                 SetEvent(hGameEndEvent);
 }
@@ -896,7 +899,8 @@ BOOL Guard (void)
 #define KAILLERA_EVFILE_NAME   _T("nintendulator_events.log")
 #define KAILLERA_EV_MAXLINES   1000
 
-static CRITICAL_SECTION s_EvCS;
+static CRITICAL_SECTION s_EvCS;         // guards the events FILE only
+static CRITICAL_SECTION s_LsCS;         // guards the lockstep statistics only (never held during file I/O)
 static BOOL             s_EvCSInit = FALSE;
 static FILE            *s_EvFile  = NULL;
 static long             s_EvLines = 0;
@@ -908,6 +912,7 @@ static void EvInit (void)
         if (!s_EvCSInit)
         {
                 InitializeCriticalSection(&s_EvCS);
+                InitializeCriticalSection(&s_LsCS);
                 s_EvCSInit = TRUE;
         }
 }
@@ -961,8 +966,22 @@ void LogDiagEvent (LPCTSTR fmt, ...)
         _vftprintf(s_EvFile, fmt, ap);
         va_end(ap);
         _ftprintf(s_EvFile, _T("\n"));
-        fflush(s_EvFile);
+        // P1-B: no fflush per line. It ran on the emulation thread inside the
+        // same lock FrameInput() takes every frame, so a slow flush (disk/AV)
+        // lengthened an already-happened stall. Flush every 32 lines instead;
+        // EvFlush() (session end) and fclose() (next session) flush the rest.
         s_EvLines++;
+        if ((s_EvLines & 31) == 0)
+                fflush(s_EvFile);
+        LeaveCriticalSection(&s_EvCS);
+}
+
+static void EvFlush (void)
+{
+        EvInit();
+        EnterCriticalSection(&s_EvCS);
+        if (s_EvFile != NULL)
+                fflush(s_EvFile);
         LeaveCriticalSection(&s_EvCS);
 }
 
@@ -990,12 +1009,14 @@ void ResetDiagCounters (void)
         s_EvQPF   = 0.0;
         EvFilePath(path, MAX_PATH + 64);
         DeleteFile(path);                    // start each session from an empty file
+        LeaveCriticalSection(&s_EvCS);
+        EnterCriticalSection(&s_LsCS);
         s_LsN = 0;
         s_LsSumMs = 0.0;
         s_LsMaxMs = 0.0;
         s_LsOver8 = s_LsOver20 = s_LsOver50 = s_LsOver100 = 0;
         s_LsLastUs = 0;
-        LeaveCriticalSection(&s_EvCS);
+        LeaveCriticalSection(&s_LsCS);
 }
 
 long GetLockstepWaitLastUs (void)
@@ -1007,7 +1028,7 @@ void GetLockstepStats (long *n, double *meanMs, double *maxMs,
                        long *over8ms, long *over20ms, long *over50ms, long *over100ms)
 {
         EvInit();
-        EnterCriticalSection(&s_EvCS);
+        EnterCriticalSection(&s_LsCS);
         if (n)          *n = s_LsN;
         if (meanMs)     *meanMs = (s_LsN > 0) ? (s_LsSumMs / (double)s_LsN) : 0.0;
         if (maxMs)      *maxMs = s_LsMaxMs;
@@ -1015,7 +1036,7 @@ void GetLockstepStats (long *n, double *meanMs, double *maxMs,
         if (over20ms)   *over20ms = s_LsOver20;
         if (over50ms)   *over50ms = s_LsOver50;
         if (over100ms)  *over100ms = s_LsOver100;
-        LeaveCriticalSection(&s_EvCS);
+        LeaveCriticalSection(&s_LsCS);
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -1072,7 +1093,7 @@ void FrameInput (void)
                 double lsMs = (double)(ls1.QuadPart - ls0.QuadPart) * 1000.0 / s_LsQPF;
                 InterlockedExchange(&s_LsLastUs, (LONG)(lsMs * 1000.0));
                 EvInit();
-                EnterCriticalSection(&s_EvCS);
+                EnterCriticalSection(&s_LsCS);
                 s_LsN++;
                 s_LsSumMs += lsMs;
                 if (lsMs > s_LsMaxMs)
@@ -1081,7 +1102,7 @@ void FrameInput (void)
                 if (lsMs > 20.0)  s_LsOver20++;
                 if (lsMs > 50.0)  s_LsOver50++;
                 if (lsMs > 100.0) s_LsOver100++;
-                LeaveCriticalSection(&s_EvCS);
+                LeaveCriticalSection(&s_LsCS);
                 if (lsMs > 10.0)
                         LogDiagEvent(_T("NETSTALL exch=%d wait=%.2fms"), frameCounter, lsMs);
         }

@@ -38,6 +38,11 @@ namespace MonitorSync
         // When disabling: resets DRC frequency to standard 44100 Hz.
         void    Enable (BOOL on);
 
+        // MMR OFF: request swap interval 0 (unsynchronised presentation) on
+        // the current/fresh GL context. Applied by ApplyPendingVSync() on the
+        // thread that owns the context. Safe to call from GFX::Start().
+        void    RequestUnsyncedPresentation ();
+
         // Re-attempt vsync initialization. Called by GFX::Start after the
         // OpenGL context has been created, in case Enable(TRUE) was invoked
         // earlier when no context existed yet. Safe to call repeatedly.

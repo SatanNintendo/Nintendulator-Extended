@@ -752,6 +752,8 @@ case ID_PPU_BILINEAR:
     break;
 case ID_PPU_MATCHRATE:
 {
+        if (Kaillera::Guard())
+                break;  // toggling MMR stops the NES thread mid-lockstep and stalls the whole session
         // MMR owns a separate render thread and that thread owns the OpenGL
         // context. A hot toggle cannot safely transfer that context while the
         // emulation thread is still running.  Stop the NES first.  When turning

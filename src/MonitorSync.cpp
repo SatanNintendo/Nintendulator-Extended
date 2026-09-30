@@ -659,6 +659,13 @@ void Enable(BOOL on)
     }
 }
 
+void RequestUnsyncedPresentation()
+{
+    // Fresh GL contexts get no swap interval from GL_Init(); post 0 so the
+    // owning thread applies it on its first frame (see ApplyPendingVSync).
+    InterlockedExchange(&g_PendingVSyncInterval, 0L);
+}
+
 void ReinitVSync()
 {
     if (!g_Initialized || !IsEnabled())
@@ -1129,6 +1136,14 @@ void ApplyPendingVSync()
 
     if (interval == 0)
     {
+        // P1-C diagnostic (DebugView): what did the driver actually accept?
+        {
+            TCHAR dbg[128];
+            int rb = pfnWglGetSwapIntervalEXT ? pfnWglGetSwapIntervalEXT() : -99;
+            _sntprintf(dbg, 128, _T("Nintendulator: wglSwapIntervalEXT(0) ok=%d readback=%d\n"), (int)ok, rb);
+            dbg[127] = _T('\0');
+            OutputDebugString(dbg);
+        }
         // P84: interval=0 has two different synchronization meanings.
         //
         // DXGI mode:
