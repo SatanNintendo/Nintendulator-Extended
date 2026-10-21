@@ -394,6 +394,31 @@ static volatile ULONGLONG g_PresentationAnchorFrame = 0;
 static volatile LONG      g_PresentationAnchorGeneration = 0;
 
 // ------------------------------------------------------------------
+// Vblank grid (phase lock to the REAL display vblank).
+//
+// ROOT-CAUSE NOTE (timing-log audit): the previous QPC-epoch schedule had an
+// arbitrary, unmanaged phase relative to the display's vblank and a clock that
+// is independent of the display clock. Every frame was submitted at a random
+// point of the refresh period, so ANY render-thread hiccup (a 4..23 ms
+// glMapBuffer stall was observed) or phase wander near the DWM composition
+// deadline converted directly into a missed refresh (dwmFrameStep 0 followed
+// by 2 in the log). The grid below gives PaceSlot() the display's own clock
+// and phase, and a fixed submit phase that leaves most of a refresh period
+// as slack.
+//
+// Samples come from the render thread (DwmGetCompositionTimingInfo) once per
+// presented frame. All values are 64-bit Interlocked-accessed.
+// ------------------------------------------------------------------
+static volatile LONGLONG g_GridVBlankQPC   = 0;   // latest qpcVBlank sample
+static volatile LONGLONG g_GridSampleQPC   = 0;   // QPC when that sample arrived
+static volatile LONGLONG g_GridPeriodQ10   = 0;   // refresh period, QPC ticks * 1024
+static volatile LONG     g_GridStreak      = 0;   // consecutive valid, advancing samples
+static volatile LONG     g_GridGeneration  = 0;   // bumped by ResetState()
+static volatile LONG     g_GridLocked      = 0;   // PaceSlot currently on the grid
+static volatile LONG     g_GridResyncs     = 0;   // hard re-syncs (diagnostic)
+static volatile LONG     g_PacePhaseUs     = 3000; // submit phase after vblank, microseconds
+
+// ------------------------------------------------------------------
 // Deferred vsync interval (written by Enable/UI thread, applied by
 // NES thread in ApplyPendingVSync inside GL_DrawFrame).
 // ------------------------------------------------------------------
@@ -597,6 +622,11 @@ void OnDisplayChange()
     InterlockedExchange64(&g_LastPaceTargetQPC, 0);
     InterlockedExchange64(&g_LastPaceWakeQPC, 0);
     InterlockedExchange(&g_LastPaceSource, 0);
+    InterlockedExchange(&g_GridStreak, 0);
+    InterlockedExchange64(&g_GridVBlankQPC, 0);
+    InterlockedExchange64(&g_GridSampleQPC, 0);
+    InterlockedExchange(&g_GridLocked, 0);
+    InterlockedIncrement(&g_GridGeneration);
 }
 
 void Enable(BOOL on)
@@ -782,6 +812,11 @@ void ResetState()
     InterlockedExchange64(&g_LastPaceTargetQPC, 0);
     InterlockedExchange64(&g_LastPaceWakeQPC, 0);
     InterlockedExchange(&g_LastPaceSource, 0);
+    InterlockedExchange(&g_GridStreak, 0);
+    InterlockedExchange64(&g_GridVBlankQPC, 0);
+    InterlockedExchange64(&g_GridSampleQPC, 0);
+    InterlockedExchange(&g_GridLocked, 0);
+    InterlockedIncrement(&g_GridGeneration);
 }
 
 void SetDwmSyncMode(bool useDwm)
@@ -846,6 +881,129 @@ static void PaceSlot()
 
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
+
+    // ------------------------------------------------------------------
+    // Vblank-locked branch (preferred when the DWM grid is valid).
+    //
+    // target(n+1) = target(n) + displayPeriod   (the DISPLAY's own period)
+    // A slow PLL pulls target(n) toward  vblankEdge + phase  (phase ~3 ms),
+    // so submit time stays a constant distance after the vblank and the
+    // render thread has ~(period - phase) ms of slack before the next DWM
+    // composition. Wake-up jitter does not enter the loop (it steers the
+    // schedule, not the measured wake time).
+    // ------------------------------------------------------------------
+    {
+        static LONG     s_seenGridGeneration = 0;
+        static LONGLONG s_gridTarget = 0;
+
+        LONG gen = InterlockedExchangeAdd(&g_GridGeneration, 0);
+        if (gen != s_seenGridGeneration)
+        {
+            s_seenGridGeneration = gen;
+            s_gridTarget = 0;
+        }
+
+        const LONGLONG gV = InterlockedExchangeAdd64(&g_GridVBlankQPC, 0);
+        const LONGLONG gS = InterlockedExchangeAdd64(&g_GridSampleQPC, 0);
+        const double   gP = (double)InterlockedExchangeAdd64(&g_GridPeriodQ10, 0) / 1024.0;
+        const LONG     gN = InterlockedExchangeAdd(&g_GridStreak, 0);
+        const bool gridOk = (gN >= 3 && gV > 0 && gP > 0.0 &&
+                             (now.QuadPart - gS) < (g_QPCFreq.QuadPart / 4) &&
+                             (now.QuadPart - gS) >= -(g_QPCFreq.QuadPart / 100));
+
+        if (gridOk)
+        {
+            const LONGLONG periodTicks = (LONGLONG)(gP + 0.5);
+            const LONGLONG lead = (LONGLONG)((double)g_QPCFreq.QuadPart *
+                    (double)InterlockedExchangeAdd(&g_PacePhaseUs, 0) / 1000000.0 + 0.5);
+            const LONGLONG hardLimit = (LONGLONG)((double)g_QPCFreq.QuadPart * 0.002 + 0.5);
+            const LONGLONG maxSlew   = (LONGLONG)((double)g_QPCFreq.QuadPart * 0.0001 + 0.5);
+
+            bool resync = (s_gridTarget <= 0);
+            if (!resync)
+            {
+                // Nearest grid slot (+phase) to the current target.
+                double n = floor((double)(s_gridTarget - lead - gV) / gP + 0.5);
+                LONGLONG ideal = gV + (LONGLONG)(n * gP + 0.5) + lead;
+                LONGLONG err = s_gridTarget - ideal;
+                LONGLONG aerr = (err < 0) ? -err : err;
+                if (aerr > hardLimit)
+                    resync = true;
+                else
+                {
+                    LONGLONG corr = err / 8;
+                    if (corr >  maxSlew) corr =  maxSlew;
+                    if (corr < -maxSlew) corr = -maxSlew;
+                    s_gridTarget -= corr;
+                }
+            }
+            if (resync)
+            {
+                // First slot at least ~1.5 ms in the future, aligned to the grid.
+                double k = ceil((double)(now.QuadPart - lead - gV) / gP);
+                LONGLONG t = gV + (LONGLONG)(k * gP + 0.5) + lead;
+                const LONGLONG minAhead = (LONGLONG)((double)g_QPCFreq.QuadPart * 0.0015 + 0.5);
+                while (t < now.QuadPart + minAhead)
+                    t += periodTicks;
+                s_gridTarget = t;
+                InterlockedIncrement(&g_GridResyncs);
+            }
+
+            LONGLONG targetQPC = s_gridTarget;
+            // A host stall made the slot historical: skip stale slots but
+            // keep grid alignment (this call still consumes one slot).
+            while (targetQPC <= now.QuadPart)
+                targetQPC += periodTicks;
+
+            double remainMs = (double)(targetQPC - now.QuadPart) *
+                              1000.0 / (double)g_QPCFreq.QuadPart;
+            if (remainMs > 2.0)
+            {
+                if (g_PaceTimer == NULL)
+                {
+                    HANDLE ht = CreatePaceTimer();
+                    g_PaceTimer = ht ? ht : INVALID_HANDLE_VALUE;
+                }
+                if (g_PaceTimer != INVALID_HANDLE_VALUE)
+                {
+                    // Coarse wait to ~1 ms before the target, then spin: the
+                    // submit instant (and therefore its phase) stays within
+                    // ~0.1 ms instead of the 0.5..1 ms timer granularity.
+                    LARGE_INTEGER due;
+                    due.QuadPart = -(LONGLONG)((remainMs - 1.0) * 10000.0);
+                    SetWaitableTimer(g_PaceTimer, &due, 0, NULL, NULL, FALSE);
+                    WaitForSingleObject(g_PaceTimer, 30);
+                }
+                else
+                    Sleep(1);
+            }
+            {
+                // Bounded spin (max ~3 ms) to the exact target.
+                const LONGLONG spinCap = (LONGLONG)((double)g_QPCFreq.QuadPart * 0.003 + 0.5);
+                LARGE_INTEGER t0, cur;
+                QueryPerformanceCounter(&t0);
+                for (;;)
+                {
+                    QueryPerformanceCounter(&cur);
+                    if (cur.QuadPart >= targetQPC || cur.QuadPart - t0.QuadPart > spinCap)
+                        break;
+                    YieldProcessor();
+                }
+            }
+
+            LARGE_INTEGER paceWake;
+            QueryPerformanceCounter(&paceWake);
+            RecordPaceDiagnostic(targetQPC, paceWake.QuadPart, 2);
+            s_gridTarget = targetQPC + periodTicks;
+            InterlockedExchange(&g_GridLocked, 1);
+            return;
+        }
+
+        // Grid not (or no longer) valid: fall back to the previous schedule
+        // below and re-lock from scratch when samples resume.
+        s_gridTarget = 0;
+        InterlockedExchange(&g_GridLocked, 0);
+    }
 
     // P86: presentation feedback is a PHASE ANCHOR, not the cadence itself.
     // P85 recalculated lastCompose + period - lead on every call. If PaceSlot
@@ -984,6 +1142,86 @@ static void PaceSlot()
     RecordPaceDiagnostic(targetQPC, paceWake.QuadPart, 0);
 
     ++g_PaceFrameIndex;
+}
+
+void NotifyVBlankGrid(LONGLONG qpcVBlank, ULONGLONG qpcRefreshPeriod,
+                      unsigned numerator, unsigned denominator)
+{
+    if (qpcVBlank <= 0 || g_QPCFreq.QuadPart <= 0)
+        return;
+
+    double period = 0.0;
+    if (numerator != 0 && denominator != 0)
+        period = (double)g_QPCFreq.QuadPart * (double)denominator / (double)numerator;
+    else if (qpcRefreshPeriod > 0)
+        period = (double)qpcRefreshPeriod;
+
+    // The grid is only meaningful when the display period matches the
+    // emulation cadence (same window GetTargetHz() uses for MMR). A 75/120/
+    // 144 Hz desktop therefore never engages the lock.
+    const double th = GetTargetHz();
+    const double nominal = (th > 0.0) ? (double)g_QPCFreq.QuadPart / th : 0.0;
+    if (period <= 0.0 || nominal <= 0.0 || fabs(period - nominal) / nominal > 0.02)
+    {
+        InterlockedExchange(&g_GridStreak, 0);
+        InterlockedExchange64(&g_GridVBlankQPC, 0);
+        return;
+    }
+
+    LONGLONG prev = InterlockedExchangeAdd64(&g_GridVBlankQPC, 0);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+
+    if (qpcVBlank < prev)
+    {
+        // Went backwards (display change / bogus sample): restart qualification.
+        InterlockedExchange(&g_GridStreak, 0);
+        InterlockedExchange64(&g_GridVBlankQPC, qpcVBlank);
+        InterlockedExchange64(&g_GridSampleQPC, now.QuadPart);
+        InterlockedExchange64(&g_GridPeriodQ10, (LONGLONG)(period * 1024.0 + 0.5));
+        return;
+    }
+
+    InterlockedExchange64(&g_GridPeriodQ10, (LONGLONG)(period * 1024.0 + 0.5));
+    InterlockedExchange64(&g_GridSampleQPC, now.QuadPart);   // sample is fresh even if unchanged
+    if (qpcVBlank == prev)
+        return;                                              // same vblank observed again
+    InterlockedExchange64(&g_GridVBlankQPC, qpcVBlank);
+    if (InterlockedExchangeAdd(&g_GridStreak, 0) < 1000)
+        InterlockedIncrement(&g_GridStreak);
+}
+
+bool HasVBlankLock()
+{
+    return InterlockedExchangeAdd(&g_GridLocked, 0) != 0;
+}
+
+double GetVBlankPhaseMs(LONGLONG qpc)
+{
+    const LONGLONG gV = InterlockedExchangeAdd64(&g_GridVBlankQPC, 0);
+    const double   gP = (double)InterlockedExchangeAdd64(&g_GridPeriodQ10, 0) / 1024.0;
+    if (gV <= 0 || gP <= 0.0 || qpc <= 0 || g_QPCFreq.QuadPart <= 0)
+        return -1.0;
+    double x = fmod((double)(qpc - gV), gP);
+    if (x < 0.0) x += gP;
+    return x * 1000.0 / (double)g_QPCFreq.QuadPart;
+}
+
+void SetPacePhaseMs(double ms)
+{
+    if (ms < 0.5)  ms = 0.5;
+    if (ms > 12.0) ms = 12.0;
+    InterlockedExchange(&g_PacePhaseUs, (LONG)(ms * 1000.0 + 0.5));
+}
+
+double GetPacePhaseMs()
+{
+    return (double)InterlockedExchangeAdd(&g_PacePhaseUs, 0) / 1000.0;
+}
+
+long GetVBlankResyncs()
+{
+    return (long)InterlockedExchangeAdd(&g_GridResyncs, 0);
 }
 
 LONGLONG GetLastPaceTargetQPC()

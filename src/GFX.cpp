@@ -34,6 +34,8 @@
 
 #define _USE_MATH_DEFINES
 #include <math.h>
+#include <string.h>            // strstr (GL extension probe)
+#include <stdio.h>             // sscanf (GL version probe)
 
 #ifndef M_PI
 #define M_PI    3.14159265358979323846
@@ -197,6 +199,63 @@ static PFN_glBindBuffer    pfn_glBindBuffer    = NULL;
 static PFN_glBufferData    pfn_glBufferData    = NULL;
 static PFN_glMapBuffer     pfn_glMapBuffer     = NULL;
 static PFN_glUnmapBuffer   pfn_glUnmapBuffer   = NULL;
+
+// ------------------------------------------------------------------
+// Fence-managed PBO ring (no CPU/GPU synchronisation on the upload path).
+//
+// ROOT-CAUSE NOTE (timing-log audit, 360 consecutive frames): every starred
+// frame and every "present" outlier (21 / 23 / 40 ms) had tex ~= pboMap, i.e.
+// the render thread blocked 4..23 ms INSIDE glMapBuffer, and the DWM counters
+// show the matching skipped refresh (dwmFrameStep 0 then 2). The sessions that
+// had no netplay show the same thing in nintendulator_events.log (PRESGAP with
+// tex = gap - 16.7, growing from ~5 ms to ~30 ms over a 10-minute session).
+// glBufferData(NULL) (orphaning) on every frame AND a ring of four buffers is
+// redundant, and the driver-side allocation / "map waits for the in-flight
+// copy" is exactly what stalls.
+//
+// New scheme (needs GL 3.2 / ARB_sync + ARB_map_buffer_range, otherwise the
+// legacy path below is used unchanged):
+//   * after glTexSubImage2D a fence is inserted for that PBO;
+//   * before writing, the render thread polls the fences (timeout 0) and picks
+//     the first PBO whose upload already retired -> never waits in the normal
+//     case;
+//   * the buffer is mapped with GL_MAP_UNSYNCHRONIZED_BIT (no implicit wait,
+//     no orphan/reallocation);
+//   * if all four are still busy (GPU > 3 frames behind) the thread waits at
+//     most 6 ms on the oldest fence and otherwise skips this frame's upload
+//     (the previous texture is simply drawn again) - a bounded cost instead
+//     of an unbounded driver stall.
+// ------------------------------------------------------------------
+typedef void*  (WINAPI *PFN_glMapBufferRange)(GLenum, ptrdiff_t, ptrdiff_t, GLbitfield);
+typedef void*  (WINAPI *PFN_glFenceSync)     (GLenum, GLbitfield);
+typedef GLenum (WINAPI *PFN_glClientWaitSync)(void*, GLbitfield, unsigned long long);
+typedef void   (WINAPI *PFN_glDeleteSync)    (void*);
+static PFN_glMapBufferRange pfn_glMapBufferRange = NULL;
+static PFN_glFenceSync      pfn_glFenceSync      = NULL;
+static PFN_glClientWaitSync pfn_glClientWaitSync = NULL;
+static PFN_glDeleteSync     pfn_glDeleteSync     = NULL;
+#define NES_GL_MAP_WRITE_BIT          0x0002
+#define NES_GL_MAP_UNSYNCHRONIZED_BIT 0x0020
+#define NES_GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
+#define NES_GL_SYNC_FLUSH_COMMANDS_BIT    0x00000001
+#define NES_GL_TIMEOUT_EXPIRED        0x911B
+static void*          s_PBOFence[4] = {NULL, NULL, NULL, NULL};
+static BOOL           s_PBOFenceMode = FALSE;
+static volatile LONG  s_PboAllBusy = 0;       // all four PBOs still in flight
+static volatile LONG  s_PboSkippedUploads = 0;// upload skipped after bounded wait
+
+static BOOL GL_HasExt(const char *name)
+{
+        const char *e = (const char *)glGetString(GL_EXTENSIONS);
+        return (e && strstr(e, name)) ? TRUE : FALSE;
+}
+static BOOL GL_VersionAtLeast(int maj, int min)
+{
+        const char *v = (const char *)glGetString(GL_VERSION);
+        int a = 0, b = 0;
+        if (!v || sscanf(v, "%d.%d", &a, &b) < 2) return FALSE;
+        return (a > maj || (a == maj && b >= min)) ? TRUE : FALSE;
+}
 
 // PBO streaming buffers.
 //
@@ -363,6 +422,21 @@ static BOOL GL_Init(int winW, int winH)
                         ZeroMemory(s_PBO, sizeof(s_PBO));
                 }
         }
+        // Fence-managed ring (see comment above PFN_glMapBufferRange).
+        s_PBOFenceMode = FALSE;
+        ZeroMemory(s_PBOFence, sizeof(s_PBOFence));
+        if (s_PBOReady)
+        {
+                pfn_glMapBufferRange = (PFN_glMapBufferRange)wglGetProcAddress("glMapBufferRange");
+                pfn_glFenceSync      = (PFN_glFenceSync)     wglGetProcAddress("glFenceSync");
+                pfn_glClientWaitSync = (PFN_glClientWaitSync)wglGetProcAddress("glClientWaitSync");
+                pfn_glDeleteSync     = (PFN_glDeleteSync)    wglGetProcAddress("glDeleteSync");
+                const BOOL apiOk = (pfn_glMapBufferRange && pfn_glFenceSync &&
+                                    pfn_glClientWaitSync && pfn_glDeleteSync) ? TRUE : FALSE;
+                const BOOL glOk  = GL_VersionAtLeast(3, 2) ||
+                                   (GL_HasExt("GL_ARB_sync") && GL_HasExt("GL_ARB_map_buffer_range"));
+                s_PBOFenceMode = (apiOk && glOk && PBO_COUNT <= 4) ? TRUE : FALSE;
+        }
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_BLEND);
 
@@ -397,6 +471,12 @@ static void GL_Destroy(void)
                 wglMakeCurrent(hGLDC, hGLRC);
                 if (glTex) { glDeleteTextures(1, &glTex); glTex = 0; }
                 // Clean up PBOs if they were created.
+                if (s_PBOFenceMode && pfn_glDeleteSync)
+                {
+                        for (int i = 0; i < PBO_COUNT; i++)
+                                if (s_PBOFence[i]) { pfn_glDeleteSync(s_PBOFence[i]); s_PBOFence[i] = NULL; }
+                }
+                s_PBOFenceMode = FALSE;
                 if (s_PBOReady && pfn_glDeleteBuffers)
                 {
                         pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
@@ -1105,7 +1185,93 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
         }
 
         // Texture upload from the pre-filled buffer (no palette conversion).
-        if (s_PBOReady)
+        if (s_PBOReady && s_PBOFenceMode)
+        {
+                // Fence-managed, non-blocking path (see PFN_glMapBufferRange).
+                int  pick = -1;
+                bool skipUpload = false;
+                for (int k = 0; k < PBO_COUNT; k++)
+                {
+                        const int i = (s_PBOIndex + k) % PBO_COUNT;
+                        if (!s_PBOFence[i]) { pick = i; break; }
+                        GLenum r = pfn_glClientWaitSync(s_PBOFence[i], 0, 0ULL);
+                        if (r != NES_GL_TIMEOUT_EXPIRED) { pick = i; break; }
+                }
+                if (pick < 0)
+                {
+                        InterlockedIncrement(&s_PboAllBusy);
+                        pick = s_PBOIndex;
+                        GLenum r = pfn_glClientWaitSync(s_PBOFence[pick],
+                                NES_GL_SYNC_FLUSH_COMMANDS_BIT, 6000000ULL);   // 6 ms cap
+                        if (r == NES_GL_TIMEOUT_EXPIRED)
+                        {
+                                skipUpload = true;
+                                InterlockedIncrement(&s_PboSkippedUploads);
+                        }
+                }
+                if (MatchMonitorRate)
+                {
+                        LARGE_INTEGER qpc;
+                        QueryPerformanceCounter(&qpc);
+                        pboOrphanEndQPC = qpc.QuadPart;      // = fence poll / PBO pick
+                }
+
+                if (!skipUpload)
+                {
+                        if (s_PBOFence[pick])
+                        {
+                                pfn_glDeleteSync(s_PBOFence[pick]);
+                                s_PBOFence[pick] = NULL;
+                        }
+                        pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, s_PBO[pick]);
+                        void* pboMem = pfn_glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, PBO_SIZE,
+                                NES_GL_MAP_WRITE_BIT | NES_GL_MAP_UNSYNCHRONIZED_BIT);
+                        if (MatchMonitorRate)
+                        {
+                                LARGE_INTEGER qpc;
+                                QueryPerformanceCounter(&qpc);
+                                pboMapEndQPC = qpc.QuadPart;
+                        }
+                        if (pboMem)
+                        {
+                                memcpy(pboMem, packet->pixels, FQ_FRAME_SIZE);
+                                if (MatchMonitorRate)
+                                {
+                                        LARGE_INTEGER qpc;
+                                        QueryPerformanceCounter(&qpc);
+                                        pboCopyEndQPC = qpc.QuadPart;
+                                }
+                                pfn_glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+                                if (MatchMonitorRate)
+                                {
+                                        LARGE_INTEGER qpc;
+                                        QueryPerformanceCounter(&qpc);
+                                        pboUnmapEndQPC = qpc.QuadPart;
+                                }
+                                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 240,
+                                        GL_BGRA_EXT, GL_UNSIGNED_BYTE, NULL);
+                                s_PBOFence[pick] = pfn_glFenceSync(NES_GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                        }
+                        else
+                        {
+                                pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+                                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 240,
+                                        GL_BGRA_EXT, GL_UNSIGNED_BYTE, packet->pixels);
+                        }
+                        s_PBOIndex = (pick + 1) % PBO_COUNT;
+                }
+                pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+                if (MatchMonitorRate)
+                {
+                        LARGE_INTEGER qpc;
+                        QueryPerformanceCounter(&qpc);
+                        pboSubmitEndQPC = qpc.QuadPart;
+                        if (pboMapEndQPC == 0) pboMapEndQPC = pboOrphanEndQPC;
+                        if (pboCopyEndQPC == 0) pboCopyEndQPC = pboMapEndQPC;
+                        if (pboUnmapEndQPC == 0) pboUnmapEndQPC = pboCopyEndQPC;
+                }
+        }
+        else if (s_PBOReady)
         {
                 GLuint writePBO = s_PBO[s_PBOIndex];
                 pfn_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, writePBO);
@@ -1641,6 +1807,13 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
         _ftprintf(f, _T("Presentation clock: %s | Presentation Hz: %.6f | Last interval error: %.3f ms\n"),
                 MonitorSync::HasPresentationClock() ? _T("LOCKED") : _T("QPC FALLBACK"),
                 MonitorSync::GetPresentationHz(), MonitorSync::GetPresentationIntervalErrorMs());
+        _ftprintf(f, _T("Vblank lock: %s | submit phase target %.2f ms | hard resyncs=%ld | PBO fence mode=%d allBusy=%ld skippedUploads=%ld\n"),
+                MonitorSync::HasVBlankLock() ? _T("LOCKED") : _T("not locked (QPC epoch pacing)"),
+                MonitorSync::GetPacePhaseMs(),
+                MonitorSync::GetVBlankResyncs(),
+                s_PBOFenceMode ? 1 : 0,
+                (long)InterlockedExchangeAdd(&s_PboAllBusy, 0),
+                (long)InterlockedExchangeAdd(&s_PboSkippedUploads, 0));
         _ftprintf(f, _T("FrameQueue counters: overflow_drop=%ld, latest_wins_skip=%ld\n"),
                 (long)InterlockedExchangeAdd(&s_FQOverflowDrops, 0),
                 (long)InterlockedExchangeAdd(&s_FQSkippedFrames, 0));
@@ -1841,7 +2014,7 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                 bool presentStalled = (dpresent > 0.0 && fabs(presentErr) > 2.0);
 
                 _ftprintf(f,
-                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  paceEnter=%6.2f  paceWait=%6.2f  pace->prod=%6.2f  postPaceCPU=%6.2f  postPaceWall=%6.2f  postPaceCycles=%I64u  buildWall=%6.2f  buildCPU=%6.2f  buildCycles=%I64u  swapCPU=%6.2f  swapCycles=%I64u  pboOrphan=%6.3f  pboMap=%6.3f  pboCopy=%6.3f  pboUnmap=%6.3f  pboSubmit=%6.3f  safetyMs=%6.2f  safetyLoops=%d  traceSeq=%I64d  prodGap=%7.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fqP2C=%6.2f  fqPcs=%5.2f  fqCcs=%5.2f  fqSched=%6.2f  fqCS2=%5.2f  fqPHold=%5.2f  fqCHold=%5.2f  fqSigWait=%6.2f  render2t0=%6.2f  submit2dwm=%7.2f  dwmDisp=%7.2f  dwmFrameStep=%2lld  dwmMissStep=%2lld  dwmDropStep=%2lld  dwmLateStep=%2lld  dwmLate=%d  dwmSrc=%d  dwmHr=0x%08lX  dwmFrame=%I64u  dwmRefresh=%I64u  dwmVBlankInt=%7.2f  dwmComposeInt=%7.2f  dwmLateCount=%I64u  dwmOutstanding=%I64u  dwmUnique=%I64u  dwmAvail=%I64u  dwmMiss=%I64u  dwmDrop=%I64u  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s  lsWait=%6.2f\n"),
+                        _T("F%06u  emu=%-6I64u prod2cons=%6.2f  paceErr=%+6.2f  paceSrc=%d  paceEnter=%6.2f  paceWait=%6.2f  pace->prod=%6.2f  postPaceCPU=%6.2f  postPaceWall=%6.2f  postPaceCycles=%I64u  buildWall=%6.2f  buildCPU=%6.2f  buildCycles=%I64u  swapCPU=%6.2f  swapCycles=%I64u  pboOrphan=%6.3f  pboMap=%6.3f  pboCopy=%6.3f  pboUnmap=%6.3f  pboSubmit=%6.3f  safetyMs=%6.2f  safetyLoops=%d  traceSeq=%I64d  prodGap=%7.2f  renderGap=%7.2f%s  cons2pres=%6.2f  present=%7.2f%s  err=%+6.2f  fqP2C=%6.2f  fqPcs=%5.2f  fqCcs=%5.2f  fqSched=%6.2f  fqCS2=%5.2f  fqPHold=%5.2f  fqCHold=%5.2f  fqSigWait=%6.2f  render2t0=%6.2f  submit2dwm=%7.2f  dwmDisp=%7.2f  dwmFrameStep=%2lld  dwmMissStep=%2lld  dwmDropStep=%2lld  dwmLateStep=%2lld  dwmLate=%d  dwmSrc=%d  dwmHr=0x%08lX  dwmFrame=%I64u  dwmRefresh=%I64u  dwmVBlankInt=%7.2f  dwmComposeInt=%7.2f  dwmLateCount=%I64u  dwmOutstanding=%I64u  dwmUnique=%I64u  dwmAvail=%I64u  dwmMiss=%I64u  dwmDrop=%I64u  fq=%d/%d  tex=%5.2f%s  swap=%6.2f%s  t2b=%5.2f%s  ofe=%5.2f%s  drc=%5.2f%s  tot=%6.2f%s  lsWait=%6.2f  vph=%6.2f\n"),
                         e.frameNum,
                         (unsigned __int64)e.emuFrame,
                         dprod,
@@ -1907,7 +2080,11 @@ static void DiagWriteLogFile(const FrameTimingEntry *buf, int head)
                         d34, (d34 > DIAG_STALL_MS ? _T("*") : _T(" ")),
                         dtot, (dtot > DIAG_STALL_MS * 1.5 ? _T("*") : _T(" ")),
                         // v4: the frame's kailleraModifyPlayValues() wait.
-                        (double)e.lockWaitUs / 1000.0
+                        (double)e.lockWaitUs / 1000.0,
+                        // Phase of this frame's swap-done instant after the
+                        // real display vblank (ms, -1 = no grid). With the
+                        // vblank lock this should sit near the target phase.
+                        MonitorSync::GetVBlankPhaseMs(e.t2)
                 );
         }
         fclose(f);
@@ -2158,6 +2335,15 @@ static bool DiagQueryDwmTiming(FrameTimingEntry &e)
         e.dwmFramesMissed = (ULONGLONG)ti.cFramesMissed;
         e.dwmFramesDropped = (ULONGLONG)ti.cFramesDropped;
         e.dwmValid = 1;
+
+        // Real display clock + phase for MonitorSync's vblank-locked pacing.
+        // Exclusive fullscreen bypasses DWM (the data would be stale/global),
+        // so it keeps the deterministic QPC path.
+        if (!(Fullscreen && ExclusiveFullscreen))
+                MonitorSync::NotifyVBlankGrid((LONGLONG)ti.qpcVBlank,
+                        (ULONGLONG)ti.qpcRefreshPeriod,
+                        (unsigned)ti.rateRefresh.uiNumerator,
+                        (unsigned)ti.rateRefresh.uiDenominator);
 
         // P85: qpcCompose is still a sampled snapshot, so it is not safe to
         // treat every call as a new presentation. GL_DrawFrame uses the DWM
@@ -3379,6 +3565,10 @@ void    SaveSettings (HKEY SettingsBase)
         RegSetValueEx(SettingsBase, _T("NTSCsat")     , 0, REG_DWORD, (LPBYTE)&NTSCsat    , sizeof(DWORD));
         RegSetValueEx(SettingsBase, _T("PALsat")      , 0, REG_DWORD, (LPBYTE)&PALsat     , sizeof(DWORD));
         RegSetValueEx(SettingsBase, _T("PC10compat")  , 0, REG_DWORD, (LPBYTE)&PC10compat , sizeof(DWORD));
+        {
+                DWORD phaseTenthMs = (DWORD)(MonitorSync::GetPacePhaseMs() * 10.0 + 0.5);
+                RegSetValueEx(SettingsBase, _T("MMRPhaseTenthMs"), 0, REG_DWORD, (LPBYTE)&phaseTenthMs, sizeof(DWORD));
+        }
 
         RegSetValueEx(SettingsBase, _T("PaletteNTSC") , 0, REG_DWORD, (LPBYTE)&Palette[NES::REGION_NTSC] , sizeof(DWORD));
         RegSetValueEx(SettingsBase, _T("PalettePAL")  , 0, REG_DWORD, (LPBYTE)&Palette[NES::REGION_PAL]  , sizeof(DWORD));
@@ -3418,6 +3608,15 @@ void    LoadSettings (HKEY SettingsBase)
         Size = sizeof(BOOL);    RegQueryValueEx(SettingsBase, _T("aFSkip")      , 0, NULL, (LPBYTE)&aFSkip     , &Size);
 
         Size = sizeof(DWORD);   RegQueryValueEx(SettingsBase, _T("FSkip")       , 0, NULL, (LPBYTE)&FSkip      , &Size);
+        {
+                // MMR submit phase after the display vblank, in 0.1 ms units
+                // (default 30 = 3.0 ms; larger = more slack against GL/driver
+                // hiccups but ~1:1 more input latency, smaller = the opposite).
+                DWORD phaseTenthMs = 30;
+                Size = sizeof(DWORD);
+                if (RegQueryValueEx(SettingsBase, _T("MMRPhaseTenthMs"), 0, NULL, (LPBYTE)&phaseTenthMs, &Size) == ERROR_SUCCESS)
+                        MonitorSync::SetPacePhaseMs((double)phaseTenthMs / 10.0);
+        }
         Size = sizeof(DWORD);   RegQueryValueEx(SettingsBase, _T("NTSChue")     , 0, NULL, (LPBYTE)&NTSChue    , &Size);
         Size = sizeof(DWORD);   RegQueryValueEx(SettingsBase, _T("NTSCsat")     , 0, NULL, (LPBYTE)&NTSCsat    , &Size);
         Size = sizeof(DWORD);   RegQueryValueEx(SettingsBase, _T("PALsat")      , 0, NULL, (LPBYTE)&PALsat     , &Size);

@@ -206,4 +206,29 @@ namespace MonitorSync
         double  GetPresentationHz ();
         double  GetPresentationIntervalErrorMs ();
 
+
+        // ---- Vblank-locked presentation phase (windowed / borderless DWM) ----
+        //
+        // The render thread feeds every DwmGetCompositionTimingInfo() sample
+        // here. PaceFrame() then schedules each emulated frame at a fixed
+        // phase AFTER a real display vblank, steered by a slow PLL, instead of
+        // free-running from an arbitrary QPC epoch. This (a) removes the
+        // beat between the software clock and the real display clock and
+        // (b) leaves ~(period - phase) ms of slack, so a GL/driver hiccup on
+        // the render thread no longer turns into a missed DWM composition.
+        // When no valid samples exist (exclusive fullscreen, DWM off, gross
+        // rate mismatch) the previous QPC-epoch pacing is used unchanged.
+        void    NotifyVBlankGrid(LONGLONG qpcVBlank, ULONGLONG qpcRefreshPeriod,
+                                 unsigned numerator, unsigned denominator);
+        // TRUE while PaceFrame() is actually running on the vblank grid.
+        bool    HasVBlankLock();
+        // Phase (ms after the most recent vblank edge) of an arbitrary QPC
+        // timestamp, or -1.0 if no valid grid. Diagnostic only.
+        double  GetVBlankPhaseMs(LONGLONG qpc);
+        // Pacing phase after vblank, in ms (default 3.0). Clamped to 0.5..12.
+        void    SetPacePhaseMs(double ms);
+        double  GetPacePhaseMs();
+        // Diagnostics: number of hard phase re-syncs since MMR start.
+        long    GetVBlankResyncs();
+
 }
