@@ -241,6 +241,8 @@ static PFN_glDeleteSync     pfn_glDeleteSync     = NULL;
 #define NES_GL_TIMEOUT_EXPIRED        0x911B
 static void*          s_PBOFence[4] = {NULL, NULL, NULL, NULL};
 static BOOL           s_PBOFenceMode = FALSE;
+static BOOL           s_AllowPboFence = TRUE;   // registry MMRPboFence (0 = force legacy upload, for A/B tests)
+static BOOL           s_AllowVBlankLock = TRUE; // registry MMRVBlankLock (0 = force old QPC pacing, for A/B tests)
 static volatile LONG  s_PboAllBusy = 0;       // all four PBOs still in flight
 static volatile LONG  s_PboSkippedUploads = 0;// upload skipped after bounded wait
 
@@ -435,7 +437,7 @@ static BOOL GL_Init(int winW, int winH)
                                     pfn_glClientWaitSync && pfn_glDeleteSync) ? TRUE : FALSE;
                 const BOOL glOk  = GL_VersionAtLeast(3, 2) ||
                                    (GL_HasExt("GL_ARB_sync") && GL_HasExt("GL_ARB_map_buffer_range"));
-                s_PBOFenceMode = (apiOk && glOk && PBO_COUNT <= 4) ? TRUE : FALSE;
+                s_PBOFenceMode = (apiOk && glOk && PBO_COUNT <= 4 && s_AllowPboFence) ? TRUE : FALSE;
         }
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_BLEND);
@@ -2339,7 +2341,7 @@ static bool DiagQueryDwmTiming(FrameTimingEntry &e)
         // Real display clock + phase for MonitorSync's vblank-locked pacing.
         // Exclusive fullscreen bypasses DWM (the data would be stale/global),
         // so it keeps the deterministic QPC path.
-        if (!(Fullscreen && ExclusiveFullscreen))
+        if (s_AllowVBlankLock && !(Fullscreen && ExclusiveFullscreen))
                 MonitorSync::NotifyVBlankGrid((LONGLONG)ti.qpcVBlank,
                         (ULONGLONG)ti.qpcRefreshPeriod,
                         (unsigned)ti.rateRefresh.uiNumerator,
@@ -3568,6 +3570,9 @@ void    SaveSettings (HKEY SettingsBase)
         {
                 DWORD phaseTenthMs = (DWORD)(MonitorSync::GetPacePhaseMs() * 10.0 + 0.5);
                 RegSetValueEx(SettingsBase, _T("MMRPhaseTenthMs"), 0, REG_DWORD, (LPBYTE)&phaseTenthMs, sizeof(DWORD));
+                DWORD f1 = s_AllowPboFence ? 1 : 0, f2 = s_AllowVBlankLock ? 1 : 0;
+                RegSetValueEx(SettingsBase, _T("MMRPboFence"), 0, REG_DWORD, (LPBYTE)&f1, sizeof(DWORD));
+                RegSetValueEx(SettingsBase, _T("MMRVBlankLock"), 0, REG_DWORD, (LPBYTE)&f2, sizeof(DWORD));
         }
 
         RegSetValueEx(SettingsBase, _T("PaletteNTSC") , 0, REG_DWORD, (LPBYTE)&Palette[NES::REGION_NTSC] , sizeof(DWORD));
@@ -3616,6 +3621,16 @@ void    LoadSettings (HKEY SettingsBase)
                 Size = sizeof(DWORD);
                 if (RegQueryValueEx(SettingsBase, _T("MMRPhaseTenthMs"), 0, NULL, (LPBYTE)&phaseTenthMs, &Size) == ERROR_SUCCESS)
                         MonitorSync::SetPacePhaseMs((double)phaseTenthMs / 10.0);
+
+                // A/B switches (1 = on, default). Take effect at next start.
+                DWORD flag = 1;
+                Size = sizeof(DWORD);
+                if (RegQueryValueEx(SettingsBase, _T("MMRPboFence"), 0, NULL, (LPBYTE)&flag, &Size) == ERROR_SUCCESS)
+                        s_AllowPboFence = flag ? TRUE : FALSE;
+                flag = 1;
+                Size = sizeof(DWORD);
+                if (RegQueryValueEx(SettingsBase, _T("MMRVBlankLock"), 0, NULL, (LPBYTE)&flag, &Size) == ERROR_SUCCESS)
+                        s_AllowVBlankLock = flag ? TRUE : FALSE;
         }
         Size = sizeof(DWORD);   RegQueryValueEx(SettingsBase, _T("NTSChue")     , 0, NULL, (LPBYTE)&NTSChue    , &Size);
         Size = sizeof(DWORD);   RegQueryValueEx(SettingsBase, _T("NTSCsat")     , 0, NULL, (LPBYTE)&NTSCsat    , &Size);
