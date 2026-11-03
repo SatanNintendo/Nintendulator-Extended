@@ -2972,7 +2972,11 @@ void    Start (void)
                                         int scrH = GetSystemMetrics(SM_CYSCREEN);
                                         SetWindowLongPtr(hMainWnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
                                         SetMenu(hMainWnd, NULL);
-                                        HWND zOrder = (ExclusiveFullscreen || AlwaysOnTop) ? HWND_TOPMOST : HWND_TOP;
+                                        // The "Always on Top" menu option is the only thing that may make the window topmost.
+                                        // Exclusive fullscreen used to force HWND_TOPMOST here, so with the option unchecked the
+                                        // emulator still covered other topmost windows (e.g. a FailChat overlay) as soon as it was clicked.
+                                        // HWND_NOTOPMOST (instead of HWND_TOP) also drops a stale topmost state.
+                                        HWND zOrder = AlwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST;
                                         SetWindowPos(hMainWnd, zOrder, 0, 0, scrW, scrH, SWP_FRAMECHANGED);
                                         ShowWindow(hMainWnd, SW_MAXIMIZE);
                                         PostGLResize(scrW, scrH);
@@ -3148,7 +3152,11 @@ void    Start (void)
 
                         int scrW = GetSystemMetrics(SM_CXSCREEN);
                         int scrH = GetSystemMetrics(SM_CYSCREEN);
-                        HWND zOrder = (ExclusiveFullscreen || AlwaysOnTop) ? HWND_TOPMOST : HWND_TOP;
+                        // The "Always on Top" menu option is the only thing that may make the window topmost.
+                        // Exclusive fullscreen used to force HWND_TOPMOST here, so with the option unchecked the
+                        // emulator still covered other topmost windows (e.g. a FailChat overlay) as soon as it was clicked.
+                        // HWND_NOTOPMOST (instead of HWND_TOP) also drops a stale topmost state.
+                        HWND zOrder = AlwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST;
                         SetWindowPos(hMainWnd, zOrder,
                                 0, 0, scrW, scrH, SWP_FRAMECHANGED);
                         ShowWindow(hMainWnd, SW_MAXIMIZE);
