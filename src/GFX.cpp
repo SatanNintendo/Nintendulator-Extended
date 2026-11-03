@@ -126,6 +126,14 @@ HDC   hGLDC = NULL;
 static GLuint glTex  = 0;
 static int    glWinW = 0;
 static int    glWinH = 0;
+
+// Fullscreen (OpenGL) window is made this many pixels taller than the monitor.
+// A borderless window that matches the monitor rect exactly gets promoted by
+// DWM / the GPU driver to a direct-flip "fullscreen" surface as soon as frames
+// are presented, and in that state always-on-top windows of other programs
+// (e.g. a FailChat overlay) are hidden behind it. The extra row lies below the
+// screen, is never visible, and keeps the window out of that fast path.
+static const int FullscreenExtraPx = 1;
 static BOOL   UsingOpenGL = FALSE;
 
 // ------------------------------------------------------------------
@@ -2977,9 +2985,9 @@ void    Start (void)
                                         // emulator still covered other topmost windows (e.g. a FailChat overlay) as soon as it was clicked.
                                         // HWND_NOTOPMOST (instead of HWND_TOP) also drops a stale topmost state.
                                         HWND zOrder = AlwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST;
-                                        SetWindowPos(hMainWnd, zOrder, 0, 0, scrW, scrH, SWP_FRAMECHANGED);
-                                        ShowWindow(hMainWnd, SW_MAXIMIZE);
-                                        PostGLResize(scrW, scrH);
+                                        SetWindowPos(hMainWnd, zOrder, 0, 0, scrW, scrH + FullscreenExtraPx, SWP_FRAMECHANGED);
+                                        ShowWindow(hMainWnd, SW_SHOW);
+                                        PostGLResize(scrW, scrH + FullscreenExtraPx);
                                 }
                                 else
                                 {
@@ -3158,8 +3166,8 @@ void    Start (void)
                         // HWND_NOTOPMOST (instead of HWND_TOP) also drops a stale topmost state.
                         HWND zOrder = AlwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST;
                         SetWindowPos(hMainWnd, zOrder,
-                                0, 0, scrW, scrH, SWP_FRAMECHANGED);
-                        ShowWindow(hMainWnd, SW_MAXIMIZE);
+                                0, 0, scrW, scrH + FullscreenExtraPx, SWP_FRAMECHANGED);
+                        ShowWindow(hMainWnd, SW_SHOW);
 
                         // P49: force the GL viewport to the fullscreen
                         // dimensions immediately. Before this fix, GL_Init/
@@ -3176,7 +3184,7 @@ void    Start (void)
                         // false at this point — NES::Stop() was synchronous
                         // before GFX::Stop/GFX::Start), so there is no race
                         // with GL_DrawFrame and wglMakeCurrent is safe.
-                        GL_Resize(scrW, scrH);
+                        GL_Resize(scrW, scrH + FullscreenExtraPx);
 
                         if (dbgVisible)
                                 ShowWindow(hDebug, SW_MINIMIZE);
