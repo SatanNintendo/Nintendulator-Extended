@@ -132,8 +132,25 @@ static int    glWinH = 0;
 // DWM / the GPU driver to a direct-flip "fullscreen" surface as soon as frames
 // are presented, and in that state always-on-top windows of other programs
 // (e.g. a FailChat overlay) are hidden behind it. The extra row lies below the
-// screen, is never visible, and keeps the window out of that fast path.
+// screen and is never visible. The GL viewport is shifted so that it covers
+// exactly the visible monitor area (glViewOffY / glWinH below): the picture is
+// rendered 1:1, with no scaling or offset caused by the extra row.
 static const int FullscreenExtraPx = 1;
+static int    glViewOffY = 0;   // viewport Y offset (GL origin is bottom-left)
+
+// Splits a window client size into the visible GL area and the Y offset.
+static void GL_VisibleArea(int w, int h, int &visH, int &offY)
+{
+        visH = h;
+        offY = 0;
+        if (Fullscreen &&
+            w == GetSystemMetrics(SM_CXSCREEN) &&
+            h == GetSystemMetrics(SM_CYSCREEN) + FullscreenExtraPx)
+        {
+                visH = h - FullscreenExtraPx;
+                offY = FullscreenExtraPx;
+        }
+}
 static BOOL   UsingOpenGL = FALSE;
 
 // ------------------------------------------------------------------
@@ -450,12 +467,15 @@ static BOOL GL_Init(int winW, int winH)
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_BLEND);
 
+        int visH, offY;
+        GL_VisibleArea(winW, winH, visH, offY);
         glWinW = winW;
-        glWinH = winH;
-        glViewport(0, 0, winW, winH);
+        glWinH = visH;
+        glViewOffY = offY;
+        glViewport(0, glViewOffY, winW, visH);
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
-        glOrtho(0, winW, winH, 0, -1, 1);
+        glOrtho(0, winW, visH, 0, -1, 1);
         glMatrixMode(GL_MODELVIEW);
         glLoadIdentity();
 
@@ -504,6 +524,7 @@ static void GL_Destroy(void)
                 hGLDC = NULL;
         }
         glWinW = glWinH = 0;
+        glViewOffY = 0;
         UsingOpenGL = FALSE;
 }
 
@@ -605,12 +626,15 @@ static void GL_ResizeInternal(int w, int h)
         if (w <= 0) w = 1;
         if (h <= 0) h = 1;
 
+        int visH, offY;
+        GL_VisibleArea(w, h, visH, offY);
         glWinW = w;
-        glWinH = h;
+        glWinH = visH;
+        glViewOffY = offY;
 
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
-        glOrtho(0, w, h, 0, -1, 1);
+        glOrtho(0, w, visH, 0, -1, 1);
 
         glMatrixMode(GL_MODELVIEW);
         glLoadIdentity();
@@ -1174,7 +1198,7 @@ static void GL_DrawFrameFromBuffer(const FQ_Packet *packet)
                         Bilinear = (pendingBilinear != 0) ? TRUE : FALSE;
         }
 
-        glViewport(0, 0, glWinW, glWinH);
+        glViewport(0, glViewOffY, glWinW, glWinH);
         glBindTexture(GL_TEXTURE_2D, glTex);
 
         // P83: split the old broad "tex" measurement into the actual PBO
@@ -2435,7 +2459,7 @@ static void GL_DrawFrame(void)
                         Bilinear = (pendingBilinear != 0) ? TRUE : FALSE;
         }
 
-        glViewport(0, 0, glWinW, glWinH);
+        glViewport(0, glViewOffY, glWinW, glWinH);
 
         glBindTexture(GL_TEXTURE_2D, glTex);
 
